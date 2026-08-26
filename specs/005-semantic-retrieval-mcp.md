@@ -1,0 +1,62 @@
+# 005 — Semantic Retrieval and MCP
+
+## Problem
+
+A text-to-SQL agent needs a small, explainable semantic grounding packet rather than the entire schema or an opaque vector result.
+
+## Goal
+
+Retrieve relevant OKF objects using lexical/vector fusion and graph expansion, then expose them through HTTP and MCP.
+
+## Non-Goals
+
+- SQL generation or execution.
+- Persistent vector infrastructure.
+- Conversation memory or autonomous planning.
+
+## Functional Requirements
+
+- FR-401: Index title, ID, aliases, tags, descriptions, columns, and body in memory.
+- FR-402: Rank lexically and, when configured, embed with `text-embedding-3-small`; fuse rankings by reciprocal rank fusion with `k=60`.
+- FR-403: Expand one hop over typed edges and apply trust, status, policy, and classification filters.
+- FR-404: Fall back to lexical plus graph retrieval when embeddings are unavailable.
+- FR-405: Serve active bundle, graph, concept detail, and search HTTP endpoints.
+- FR-406: Expose MCP tools `retrieve_grounding`, `get_concept`, and `expand_neighborhood` over local Streamable HTTP.
+- FR-407: Grounding includes semantic version, mode, concepts, tables, columns, joins, grain, metrics, filters, warnings, classifications, provenance, and ranking evidence.
+
+## Acceptance Criteria
+
+- AC-401: Retrieval is deterministic for the same bundle and query.
+- AC-402: All ten golden questions return required concepts and joins within top 10.
+- AC-403: Missing embeddings never prevent server startup.
+- AC-404: MCP tool responses validate against the same schemas as HTTP responses.
+- AC-405: Unknown IDs and malformed parameters return typed errors.
+
+## Edge Cases
+
+- Empty query, disconnected graph, duplicate scores, zero vector norm, and restricted concepts.
+
+## Interfaces / Contracts
+
+HTTP: `GET /api/bundles/active`, `/api/graph`, `/api/concepts/{id}`, `/api/search?q=&types=`. MCP tools use JSON-compatible typed inputs/outputs.
+
+## Constraints
+
+No external database; active bundle is parsed at startup.
+
+## Assumptions
+
+Local callers can reach the MCP Streamable HTTP route without authentication during the demo.
+
+## Open Questions
+
+Production identity and tenant isolation are deferred.
+
+## Test Design
+
+| Test | Requirement | Verification |
+|---|---|---|
+| T-401 | FR-401–FR-404 | Unit tests lexical, fusion, graph expansion, and fallback. |
+| T-402 | FR-405 | API tests success, filtering, and typed errors. |
+| T-403 | FR-406, FR-407 | MCP client invokes all three tools and validates output. |
+| T-404 | AC-402 | Golden-question evaluation asserts required top-10 IDs. |

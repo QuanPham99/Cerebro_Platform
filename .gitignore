@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+node_modules/
+apps/web/node_modules/
+apps/web/dist/
+.env
+artifacts/
+knowledge/generated/
+

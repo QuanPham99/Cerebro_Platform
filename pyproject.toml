@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cerebro-semantic-layer"
+version = "0.1.0"
+description = "OKF semantic grounding prototype for banking data"
+requires-python = ">=3.10"
+dependencies = [
+  "duckdb>=1.0",
+  "fastapi>=0.115",
+  "httpx>=0.27",
+  "mcp>=1.0",
+  "pydantic>=2.0",
+  "pyyaml>=6.0",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+ai = ["openai>=1.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+cerebro = "cerebro.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
