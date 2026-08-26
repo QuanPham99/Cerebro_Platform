@@ -1,0 +1,6 @@
+name: bank-workshop
+version: 0.1.0
+generation_mode: fallback
+source: bank workshop DuckDB catalog plus declared manifest
+google_okf_repository: https://github.com/GoogleCloudPlatform/open-knowledge-format.git
+google_okf_commit: ad30107c31c06aec8a7d5636e0d1058118604e6f

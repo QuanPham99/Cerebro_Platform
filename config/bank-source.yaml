@@ -1,0 +1,96 @@
+name: bank-workshop
+version: 0.1.0
+database_path: /home/kwan/Documents/Code_Beavers_Txt2Sql_WS/data/workshop.duckdb
+csv_provenance_path: /home/kwan/Documents/Code_Beavers_Txt2Sql_WS/dataset
+schema_reference_path: /home/kwan/Documents/Code_Beavers_Txt2Sql_WS/schemas/BANK_DATASET_SCHEMA.md
+schema: main
+expected_table_count: 10
+expected_column_count: 75
+tables:
+  accounts:
+    primary_key: account_id
+    grain: one row per bank account
+    description: Bank accounts owned by customers and serviced by branches.
+    aliases: [bank accounts, account balance]
+  branches:
+    primary_key: branch_id
+    grain: one row per bank branch
+    description: Physical bank branches and routing identifiers.
+    aliases: [bank locations, branch network]
+  card_transactions:
+    primary_key: card_txn_id
+    grain: one purchase or withdrawal event per card
+    description: Card-level payment activity with fraud outcomes.
+    aliases: [card activity, card payments, fraud transactions]
+  cards:
+    primary_key: card_id
+    grain: one row per issued bank card
+    description: Cards issued to customers and linked to bank accounts.
+    aliases: [payment cards, debit cards, credit cards]
+  customers:
+    primary_key: customer_id
+    grain: one row per bank customer
+    description: Customer profile, demographics, income, and credit attributes.
+    aliases: [clients, account holders, customer demographics]
+  employees:
+    primary_key: employee_id
+    grain: one row per bank employee
+    description: Employees assigned to branches, including Loan Officers.
+    aliases: [staff, loan officers, branch employees]
+  loan_payments:
+    primary_key: payment_id
+    grain: one scheduled or received payment event per loan
+    description: Loan repayment events and late-payment outcomes.
+    aliases: [repayments, late payments, installments]
+  loans:
+    primary_key: loan_id
+    grain: one row per originated loan
+    description: Customer loans, principal, terms, rates, and performance status.
+    aliases: [credit facilities, lending, bad debt]
+  support_tickets:
+    primary_key: ticket_id
+    grain: one row per customer support case
+    description: Customer issues, status, resolution dates, and satisfaction.
+    aliases: [cases, customer service, open issues]
+  transactions:
+    primary_key: transaction_id
+    grain: one account-level ledger event
+    description: Account-level money movement with positive unsigned amounts.
+    aliases: [account activity, ledger, deposits, withdrawals]
+relationships:
+  - {id: account_customer, source_table: accounts, source_column: customer_id, target_table: customers, target_column: customer_id, cardinality: many-to-one}
+  - {id: account_branch, source_table: accounts, source_column: branch_id, target_table: branches, target_column: branch_id, cardinality: many-to-one}
+  - {id: transaction_account, source_table: transactions, source_column: account_id, target_table: accounts, target_column: account_id, cardinality: many-to-one}
+  - {id: card_customer, source_table: cards, source_column: customer_id, target_table: customers, target_column: customer_id, cardinality: many-to-one}
+  - {id: card_account, source_table: cards, source_column: account_id, target_table: accounts, target_column: account_id, cardinality: many-to-one}
+  - {id: card_transaction_card, source_table: card_transactions, source_column: card_id, target_table: cards, target_column: card_id, cardinality: many-to-one}
+  - {id: loan_customer, source_table: loans, source_column: customer_id, target_table: customers, target_column: customer_id, cardinality: many-to-one}
+  - {id: loan_branch, source_table: loans, source_column: branch_id, target_table: branches, target_column: branch_id, cardinality: many-to-one}
+  - {id: loan_payment_loan, source_table: loan_payments, source_column: loan_id, target_table: loans, target_column: loan_id, cardinality: many-to-one}
+  - {id: employee_branch, source_table: employees, source_column: branch_id, target_table: branches, target_column: branch_id, cardinality: many-to-one}
+  - {id: support_ticket_customer, source_table: support_tickets, source_column: customer_id, target_table: customers, target_column: customer_id, cardinality: many-to-one}
+classifications:
+  restricted:
+    - customers.name
+    - customers.date_of_birth
+    - customers.phone
+    - customers.email
+    - employees.name
+  confidential:
+    - customers.annual_income
+    - customers.credit_score
+    - accounts.balance
+    - employees.salary
+rules:
+  - id: positive-transaction-amount
+    description: Transaction amounts are positive; infer direction from txn_type.
+  - id: transaction-direction
+    inflow: [Deposit, Transfer In, Interest Credit]
+    outflow: [Withdrawal, Transfer Out, Fee Debit]
+  - id: distinct-transaction-grains
+    description: Do not directly UNION transactions and card_transactions because their grains differ.
+  - id: relative-time-anchor
+    description: Interpret recent periods relative to MAX(date) in the relevant table, not wall-clock time.
+  - id: synthetic-pii
+    description: Synthetic identity and contact fields remain restricted.
+

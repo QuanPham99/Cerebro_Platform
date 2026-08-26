@@ -6,6 +6,87 @@ Cerebro turns changing datasets into a living, machine-readable knowledge system
 
 > **The semantic layer is Cerebro's grounding foundation.** Every downstream agent retrieves from the same versioned definitions, relationships, constraints, and lineage before it plans, queries, validates, or explains an answer.
 
+## Implemented five-day prototype
+
+This branch contains a working, spec-driven semantic-layer slice for the bank workshop dataset:
+
+- Google Cloud's full Open Knowledge Format repository is vendored as an unmodified Git subtree at commit `ad30107c31c06aec8a7d5636e0d1058118604e6f`.
+- `DuckDBSource` implements Google's `Source` contract and reads only `information_schema` through a read-only connection.
+- The checked-in `knowledge/bank-workshop` golden bundle describes 10 tables, 75 columns, 11 declared relationships, 9 business concepts, 4 metrics, and a sensitive-data policy.
+- A bounded enrichment boundary supports two structured stages through a provider-neutral interface and an optional OpenAI Responses adapter.
+- The in-memory retriever uses lexical ranking, optional `text-embedding-3-small` vectors, reciprocal-rank fusion, and typed one-hop graph expansion.
+- FastAPI serves the bundle, graph, search, details, and grounding; MCP exposes the same grounding contract through local Streamable HTTP.
+- The React/Cytoscape explorer provides an Obsidian-inspired, read-only semantic constellation with search, filters, keyboard navigation, one-hop focus, and a detailed inspector.
+
+The production code traces to the seven contracts in [`specs/`](specs/README.md). Semantic definitions and design rationale remain in [`docs/semantic-layer-definition.md`](docs/semantic-layer-definition.md).
+
+### Quick start
+
+Requirements: Python 3.10 or newer, Node.js 20 or newer, and npm.
+
+```bash
+python3 -m pip install -e .
+cd apps/web
+npm install
+npm run build
+cd ../..
+cerebro validate
+cerebro evaluate
+cerebro serve
+```
+
+Open <http://127.0.0.1:8000>. The Streamable HTTP MCP endpoint is `http://127.0.0.1:8000/mcp/`.
+
+For live frontend development, install dependencies and run:
+
+```bash
+./scripts/dev.sh
+```
+
+This starts the API/MCP service on port 8000 and Vite on port 5173.
+
+### Core commands
+
+```bash
+# Catalog-only discovery against config/bank-source.yaml
+cerebro scan
+
+# Uses live two-stage enrichment when OPENAI_API_KEY and the ai extra are present;
+# otherwise reports the checked-in golden fallback without modifying it.
+cerebro generate
+
+# Validate Google OKF syntax plus Cerebro relationship/metric/link contracts
+cerebro validate
+
+# Evaluate all ten representative banking questions
+cerebro evaluate
+```
+
+To enable the first live provider adapter:
+
+```bash
+python3 -m pip install -e '.[ai]'
+export OPENAI_API_KEY=your_key
+cerebro generate
+```
+
+The default generation model is `gpt-5.4-mini`; the default embedding model is `text-embedding-3-small`. Override them with `CEREBRO_OPENAI_MODEL` and `CEREBRO_EMBEDDING_MODEL`. No database rows are included in model input. Without credentials or the optional package, generation and retrieval remain fully functional using the golden OKF bundle and lexical-plus-graph retrieval.
+
+### Runtime interfaces
+
+| Interface | Purpose |
+| --- | --- |
+| `GET /api/bundles/active` | Active semantic version and object counts |
+| `GET /api/graph` | Typed nodes and edges for visualization |
+| `GET /api/concepts/{id}` | Complete OKF/Cerebro object detail |
+| `GET /api/search?q=&types=` | Ranked semantic search |
+| `POST /api/grounding` | Structured grounding packet for application clients |
+| MCP `retrieve_grounding` | Concepts, tables, joins, metrics, warnings, classifications, and provenance |
+| MCP `get_concept` | Stable-ID lookup |
+| MCP `expand_neighborhood` | Typed graph expansion up to depth three |
+
+Text-to-SQL generation and query execution intentionally remain separate. Cerebro returns the semantic evidence needed to ground that downstream system.
+
 ## Why Cerebro
 
 Enterprise data is rarely self-explanatory. Tables change, business terms are ambiguous, joins encode institutional knowledge, and a syntactically valid query can still be wrong.
