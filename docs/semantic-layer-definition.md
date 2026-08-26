@@ -44,22 +44,67 @@ For Cerebro, the semantic layer is not merely a graph visualization or a collect
 
 Cerebro builds upon Google's maintained [Open Knowledge Format repository](https://github.com/GoogleCloudPlatform/open-knowledge-format) and the [OKF v0.2 specification](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md).
 
-An OKF bundle is a directory of Markdown documents with YAML frontmatter:
+An OKF bundle is a directory of Markdown documents with YAML frontmatter. Google OKF permits domain-specific directory structures, so Cerebro organizes the generated banking bundle as follows:
 
 ```text
-bank/
-|-- index.md
-|-- datasets/
-|   `-- retail_bank.md
-|-- tables/
-|   |-- customers.md
-|   |-- accounts.md
-|   `-- transactions.md
-|-- concepts/
-|   |-- customer.md
-|   `-- account.md
-`-- metrics/
-    `-- transaction_volume.md
+knowledge/bank-demo/
+├── index.md
+├── datasets/
+│   ├── index.md
+│   └── retail_bank.md
+├── tables/
+│   ├── index.md
+│   ├── customers.md
+│   ├── accounts.md
+│   ├── account_holders.md
+│   └── transactions.md
+├── concepts/
+│   ├── index.md
+│   ├── customer.md
+│   ├── account.md
+│   └── transaction.md
+├── relationships/
+│   ├── index.md
+│   ├── customer_account_ownership.md
+│   └── account_transactions.md
+├── metrics/
+│   ├── index.md
+│   └── outgoing_transaction_volume.md
+└── policies/
+    ├── index.md
+    └── restricted_customer_data.md
+```
+
+The directory taxonomy is Cerebro's convention; the documents inside it remain valid OKF v0.2 concepts.
+
+| Folder | Semantic purpose |
+| --- | --- |
+| `datasets/` | Data-source and schema-level knowledge |
+| `tables/` | Physical PostgreSQL tables, columns, keys, and grain |
+| `concepts/` | Business meanings independent of physical table names |
+| `relationships/` | Approved cardinalities and executable SQL join paths |
+| `metrics/` | Governed calculations, filters, grains, and aggregation rules |
+| `policies/` | Sensitivity classifications and usage restrictions |
+
+The bundle root is the progressive-disclosure entry point for people and agents:
+
+```markdown
+---
+okf_version: "0.2"
+---
+
+# Retail Banking Knowledge Bundle
+
+Semantic knowledge generated from the `bank-demo` PostgreSQL source.
+
+## Contents
+
+- [Retail bank dataset](datasets/retail_bank.md)
+- [Physical tables](tables/index.md)
+- [Business concepts](concepts/index.md)
+- [Approved relationships](relationships/index.md)
+- [Metrics](metrics/index.md)
+- [Policies](policies/index.md)
 ```
 
 A simplified table concept could look like this:
@@ -88,6 +133,8 @@ An account can have multiple holders through
 ```
 
 Standard Markdown links create graph connections between concepts. OKF v0.2 also defines fields for provenance, verification, trust, freshness, and lifecycle while deliberately avoiding a prescribed database, retrieval engine, or agent runtime.
+
+The normal OKF frontmatter and Markdown body provide portability. Cerebro's additional `cerebro` frontmatter block provides deterministic SQL-grounding details while remaining compatible with the format.
 
 Google's reference implementation currently supplies:
 
@@ -219,6 +266,143 @@ customers.customer_id = transactions.account_id
 
 The mapping can also warn that joint accounts may cause one transaction to be attributed to multiple customers.
 
+#### Business concept example
+
+`concepts/customer.md` separates the business meaning of a customer from the physical `customers` table:
+
+```markdown
+---
+type: Business Concept
+title: Customer
+description: A retail banking party recognized by the bank.
+status: stable
+tags: [retail-banking, party, customer]
+generated:
+  by: cerebro/openai
+  at: 2026-08-26T10:00:00Z
+verified:
+  - by: human:reviewer
+    at: 2026-08-26T11:00:00Z
+
+cerebro:
+  mappings:
+    primary:
+      table: tables/customers
+      key: [customer_id]
+
+  aliases:
+    - client
+    - account holder
+    - retail customer
+
+  classifications:
+    - target: full_name
+      sensitivity: pii
+    - target: date_of_birth
+      sensitivity: restricted
+
+  relationships:
+    - target: concepts/account
+      via: relationships/customer_account_ownership
+      type: many_to_many
+---
+
+# Customer
+
+A customer is an individual retail-banking party.
+
+A customer can hold multiple [Accounts](/concepts/account.md), and an account
+can be jointly held by multiple customers.
+
+The approved connection is described by
+[Customer Account Ownership](/relationships/customer_account_ownership.md).
+```
+
+This separation allows a business concept to map to multiple physical sources in a future version without changing how users ask questions.
+
+#### Approved relationship example
+
+`relationships/customer_account_ownership.md` converts a graph connection into an executable and reviewable join contract:
+
+```markdown
+---
+type: Semantic Relationship
+title: Customer Account Ownership
+description: Approved relationship connecting customers to their accounts.
+status: stable
+tags: [ownership, approved-join]
+
+cerebro:
+  source: tables/customers
+  target: tables/accounts
+  cardinality: many_to_many
+
+  bridge:
+    table: tables/account_holders
+
+  joins:
+    - left:
+        table: customers
+        column: customer_id
+      right:
+        table: account_holders
+        column: customer_id
+
+    - left:
+        table: account_holders
+        column: account_id
+      right:
+        table: accounts
+        column: account_id
+
+  warnings:
+    - Joint accounts can cause one transaction to be attributed to multiple customers.
+---
+
+# Customer Account Ownership
+
+Customers and accounts have a many-to-many relationship through the
+[Account Holders table](/tables/account_holders.md).
+```
+
+#### Simple metric example
+
+`metrics/outgoing_transaction_volume.md` demonstrates how a governed calculation links business language to query behavior:
+
+```markdown
+---
+type: Metric
+title: Outgoing Transaction Volume
+description: Total value of booked debit transactions.
+status: stable
+tags: [transaction, debit, volume]
+
+cerebro:
+  source: tables/transactions
+  expression: SUM(transactions.amount)
+  grain: Query-dependent
+  filter:
+    column: transactions.direction
+    operator: equals
+    value: DEBIT
+  time_column: transactions.booked_at
+  allowed_dimensions:
+    - concepts/customer
+    - concepts/account
+  warnings:
+    - Customer-level grouping can duplicate values for jointly owned accounts.
+---
+
+# Outgoing Transaction Volume
+
+The sum of transaction amounts where `direction = 'DEBIT'`.
+
+Use [Customer Account Ownership](/relationships/customer_account_ownership.md)
+when analyzing this metric by customer.
+```
+
+This is a simple demonstration metric. Complex metric authoring and validation remain outside the five-day prototype.
+
 ### 4. Retrieval layer
 
 Published OKF concepts are projected into three retrieval views:
@@ -267,6 +451,52 @@ Cerebro's MCP retrieval tool should return a grounding package similar to:
 ```
 
 The Text-to-SQL team consumes this grounding package and generates SQL from it. Its agent should not need to parse the whole knowledge graph or guess relationship meanings.
+
+## Complete semantic mapping example
+
+The full interpretation of a business question can be traced from language to physical SQL inputs:
+
+```text
+Question:
+"Which customers had the largest outgoing transaction volume?"
+                         |
+                         v
+Metric:
+Outgoing Transaction Volume
+SUM(transactions.amount)
+WHERE direction = 'DEBIT'
+                         |
+                         v
+Business concepts:
+Customer -> Account -> Transaction
+                         |
+                         v
+Approved semantic relationship:
+Customer <-> Account through account_holders
+                         |
+                         v
+Physical join path:
+customers.customer_id
+    = account_holders.customer_id
+
+account_holders.account_id
+    = accounts.account_id
+
+accounts.account_id
+    = transactions.account_id
+                         |
+                         v
+Policy and warning:
+Customer PII is restricted.
+Joint ownership may duplicate transaction attribution.
+```
+
+The generated OKF bundle is therefore simultaneously:
+
+- A human-readable knowledge repository.
+- A machine-readable semantic contract.
+- A navigable knowledge graph.
+- A grounding source for Text-to-SQL agents.
 
 ## Five-day prototype mapping
 
