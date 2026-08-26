@@ -32,6 +32,49 @@ const shapes: Record<string, cytoscape.Css.NodeShape> = {
   policy: 'tag',
 }
 
+function cardinalityEndpoint(edge: cytoscape.EdgeSingular, endpoint: 0 | 1) {
+  const value = String(edge.data('label') ?? '').split('-to-')[endpoint]
+  return value === 'one' || value === 'many' ? value : ''
+}
+
+export const physicalRelationshipRule = {
+  selector: 'edge[type = "physical_fk"]',
+  style: {
+    width: 1.4,
+    'line-color': '#3EA6B8AA',
+    'target-arrow-color': '#3EA6B8',
+    'target-arrow-shape': 'triangle',
+    'arrow-scale': 0.72,
+    'source-label': (edge: cytoscape.EdgeSingular) => cardinalityEndpoint(edge, 0),
+    'target-label': (edge: cytoscape.EdgeSingular) => cardinalityEndpoint(edge, 1),
+    'source-text-offset': 13,
+    'target-text-offset': 13,
+    color: '#BFEAF1',
+    'font-family': 'JetBrains Mono',
+    'font-size': 7,
+    'text-background-color': '#0B1020',
+    'text-background-opacity': 0.96,
+    'text-background-shape': 'roundrectangle',
+    'text-background-padding': 3,
+    'text-border-color': '#3EA6B8',
+    'text-border-width': 1,
+    'text-border-opacity': 0.7,
+  },
+} as const
+
+export function GraphLegend() {
+  return (
+    <div className="legend" aria-label="Graph edge legend">
+      <span className="cardinality-legend">
+        <code aria-label="Table join cardinality example: many to one">many → one</code>
+        <span>table join</span>
+      </span>
+      <span><i className="line semantic" /> semantic path</span>
+      <span><i className="line policy" /> governance</span>
+    </div>
+  )
+}
+
 export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphView(
   { graph, visibleIds, selectedId, onSelect },
   ref,
@@ -91,6 +134,7 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
             opacity: 0.62,
           },
         },
+        physicalRelationshipRule,
         {
           selector: 'node.focused',
           style: {
@@ -117,6 +161,15 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
             'text-background-color': '#151D30',
             'text-background-opacity': 0.9,
             'text-background-padding': 3,
+          },
+        },
+        {
+          selector: 'edge[type = "physical_fk"].focused',
+          style: {
+            'line-color': '#58C7D9',
+            'target-arrow-color': '#58C7D9',
+            'text-border-color': '#58C7D9',
+            label: '',
           },
         },
         { selector: '.dimmed', style: { opacity: 0.1 } },

@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Filter, Focus, Network, RefreshCw, Search, Sparkles, X } from 'lucide-react'
 import { getBundle, getConcept, getGraph } from './api'
-import { GraphView, type GraphHandle } from './GraphView'
+import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
+import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import type { BundleInfo, GraphResponse, NodeType, SemanticObject } from './types'
-
-const nodeTypes: NodeType[] = ['dataset', 'table', 'concept', 'relationship', 'metric', 'policy']
 
 export default function App() {
   const [graph, setGraph] = useState<GraphResponse | null>(null)
@@ -76,11 +75,8 @@ export default function App() {
           {nodeTypes.map((type) => <label key={type}><input type="checkbox" checked={types.has(type)} onChange={() => toggleType(type)} /><span className={`type-symbol ${type}`} /><span>{type}</span><em>{graph.nodes.filter((node) => node.type === type).length}</em></label>)}
         </div>
         <div className="navigator-heading"><Box size={13} /> Keyboard navigator</div>
-        <div className="node-navigator" role="list" aria-label="Visible semantic objects">
-          {graph.nodes.filter((node) => visibleIds.has(node.id)).map((node) => <button role="listitem" className={selectedId === node.id ? 'active' : ''} key={node.id} onClick={() => select(node.id)}><span className={`type-dot ${node.type}`} /><span>{node.label}</span></button>)}
-          {visibleIds.size === 0 && <p>No objects match this view.</p>}
-        </div>
-        <div className="legend"><span><i className="line physical" /> physical join</span><span><i className="line semantic" /> semantic path</span><span><i className="line policy" /> governance</span></div>
+        <NodeNavigator nodes={graph.nodes} visibleIds={visibleIds} selectedId={selectedId} onSelect={select} />
+        <GraphLegend />
       </aside>
 
       <section className="canvas-wrap">
@@ -94,4 +90,3 @@ export default function App() {
     </main>
   )
 }
-

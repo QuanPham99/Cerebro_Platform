@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/GraphView.tsx","./src/Inspector.test.tsx","./src/Inspector.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/test/setup.ts"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/GraphView.test.tsx","./src/GraphView.tsx","./src/Inspector.test.tsx","./src/Inspector.tsx","./src/NodeNavigator.test.tsx","./src/NodeNavigator.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/test/setup.ts"],"version":"5.9.3"}

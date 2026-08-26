@@ -66,8 +66,10 @@ Use this area to narrow the graph:
 - **Object layers** show or hide whole object types.
 - **Object count** beside each filter shows how many objects of that type are
   in the active bundle.
-- **Navigator** lists the currently visible objects. Select an item with a
-  pointer, or use `Tab` and `Enter` from the keyboard.
+- **Keyboard navigator** groups the currently visible objects into collapsible,
+  color-coded sections such as **Tables**, **Concepts**, and **Metrics**. Each
+  section shows its visible count. Select an item with a pointer, or use `Tab`
+  and `Enter` from the keyboard.
 
 Search and filters only change the visible projection. They do not modify the
 OKF bundle.
@@ -81,6 +83,9 @@ The canvas shows objects and their relationships:
 - Select a node to focus its one-hop neighborhood.
 - Unrelated nodes and edges fade after selection.
 - The focused edges display their labels.
+- Physical table joins always label each endpoint **one** or **many** from the
+  declared cardinality. The teal arrow shows source → target; the endpoint
+  words—not the arrow alone—identify the one/many sides.
 - Use **Fit graph** in the top-right corner to fit the visible graph.
 - Use **Reset view** to clear search, filters, selection, and graph position.
 
@@ -127,7 +132,7 @@ OKF file.
 
 | Edge type | Connects | Source declaration | How to interpret it |
 | --- | --- | --- | --- |
-| `physical_fk` | Table to table | A relationship's `source_table` and `target_table` | These tables have an approved join path; the selected edge label shows cardinality such as `many-to-one`. |
+| `physical_fk` | Table to table | A relationship's `source_table`, `target_table`, and `cardinality` | These tables have an approved join path. Persistent endpoint labels derive from cardinality; for `many-to-one`, they read source **many** → target **one**. |
 | `relationship_endpoint` | Relationship node to each table | The same relationship endpoints | This join-contract object governs these two tables. |
 | `semantic_mapping` | Dataset or concept to another object | `links` and concept `maps_to` | This business or source-level object is grounded in the connected object. |
 | `metric_dependency` | Metric to a table or semantic object | Metric `links` and `dependencies` | The metric requires this object to be calculated correctly. |
@@ -135,7 +140,10 @@ OKF file.
 
 Graph connections are treated as bidirectional for neighborhood exploration,
 even when an arrow communicates the declared semantic direction. Selecting a
-node therefore reveals both what it points to and what points to it.
+node therefore reveals both what it points to and what points to it. This
+bidirectional exploration does not change physical cardinality: the table-join
+arrow still points from source to target, and its endpoint words remain the
+source of truth for **one** versus **many**.
 
 Some reverse table links are deliberately omitted when the same connection is
 already represented by the dataset, relationship, or policy object. This
@@ -155,8 +163,8 @@ Use this path to learn how the layers work together:
 5. Select **Card Transaction Card**
    (`relationship.card_transaction_card`). Its definition identifies the
    approved `card_transactions.card_id = cards.card_id` join. Then select
-   **Card Transactions** and read `many-to-one` on the focused physical edge to
-   **Cards**.
+   **Card Transactions** and follow the persistent **many** → **one** physical
+   edge to **Cards**.
 6. Select **Card fraud rate** (`metric.card-fraud-rate`). Read its formula,
    dependency, aggregate grain, and safe-division warning.
 7. Select **Sensitive banking data**

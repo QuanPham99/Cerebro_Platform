@@ -67,8 +67,10 @@ Dùng khu vực này để thu hẹp graph:
 - **Object layers** hiển thị hoặc ẩn toàn bộ một loại đối tượng.
 - **Số lượng đối tượng** bên cạnh mỗi bộ lọc cho biết có bao nhiêu đối tượng
   thuộc loại đó trong bundle đang hoạt động.
-- **Navigator** liệt kê các đối tượng đang hiển thị. Chọn bằng chuột hoặc dùng
-  `Tab` và `Enter` từ bàn phím.
+- **Keyboard navigator** nhóm các đối tượng đang hiển thị vào những mục thu gọn
+  có mã màu như **Tables**, **Concepts** và **Metrics**. Mỗi mục hiển thị số
+  lượng đối tượng đang thấy. Chọn một đối tượng bằng chuột hoặc dùng `Tab` và
+  `Enter` từ bàn phím.
 
 Tìm kiếm và bộ lọc chỉ thay đổi hình chiếu đang hiển thị. Chúng không sửa đổi
 bundle OKF.
@@ -82,6 +84,9 @@ Canvas hiển thị các đối tượng và quan hệ giữa chúng:
 - Chọn một node để tập trung vào các đối tượng cách nó một bước kết nối.
 - Các node và edge không liên quan sẽ mờ đi sau khi chọn.
 - Các edge đang được tập trung sẽ hiển thị nhãn.
+- Physical join giữa các table luôn ghi **one** hoặc **many** tại mỗi endpoint
+  theo cardinality đã khai báo. Mũi tên teal biểu thị source → target; chính
+  các nhãn endpoint, không phải riêng mũi tên, xác định phía one/many.
 - Dùng **Fit graph** ở góc trên bên phải để đưa toàn bộ graph đang hiển thị vào
   khung nhìn.
 - Dùng **Reset view** để xóa tìm kiếm, bộ lọc, lựa chọn và đặt lại khung nhìn.
@@ -128,7 +133,7 @@ trong mỗi file OKF.
 
 | Loại edge | Kết nối | Khai báo nguồn | Cách hiểu |
 | --- | --- | --- | --- |
-| `physical_fk` | Table với table | `source_table` và `target_table` của relationship | Hai bảng có một đường join được phê duyệt; nhãn edge khi được chọn hiển thị cardinality như `many-to-one`. |
+| `physical_fk` | Table với table | `source_table`, `target_table` và `cardinality` của relationship | Hai bảng có một đường join được phê duyệt. Nhãn endpoint được tạo từ cardinality; với `many-to-one`, chúng hiển thị source **many** → target **one**. |
 | `relationship_endpoint` | Node relationship với từng table | Hai endpoint của cùng relationship | Đối tượng hợp đồng join này quản trị hai bảng được nối. |
 | `semantic_mapping` | Dataset hoặc concept với đối tượng khác | `links` và `maps_to` của concept | Đối tượng nghiệp vụ hoặc cấp nguồn này được grounding bằng đối tượng kết nối. |
 | `metric_dependency` | Metric với table hoặc đối tượng semantic | `links` và `dependencies` của metric | Metric cần đối tượng này để được tính đúng. |
@@ -136,7 +141,10 @@ trong mỗi file OKF.
 
 Khi khám phá neighborhood, các kết nối graph được xử lý theo hai chiều, ngay cả
 khi mũi tên thể hiện hướng semantic đã khai báo. Vì vậy, khi chọn một node, bạn
-sẽ thấy cả những đối tượng nó trỏ đến và những đối tượng trỏ đến nó.
+sẽ thấy cả những đối tượng nó trỏ đến và những đối tượng trỏ đến nó. Cách khám
+phá hai chiều này không thay đổi cardinality vật lý: mũi tên table join vẫn chỉ
+trỏ từ source đến target, còn nhãn endpoint mới là nguồn xác định phía **one**
+và **many**.
 
 Một số liên kết ngược từ table được chủ ý lược bỏ khi dataset, relationship hoặc
 policy đã biểu diễn cùng kết nối đó. Việc này giảm các đường trùng lặp trên
@@ -156,8 +164,8 @@ Dùng đường dẫn sau để hiểu cách các layer hoạt động cùng nha
 5. Chọn **Card Transaction Card**
    (`relationship.card_transaction_card`). Định nghĩa của nó xác định join được
    phê duyệt `card_transactions.card_id = cards.card_id`. Sau đó chọn lại
-   **Card Transactions** và đọc nhãn `many-to-one` trên physical edge nối đến
-   **Cards**.
+   **Card Transactions** và đi theo physical edge luôn hiển thị **many** →
+   **one** đến **Cards**.
 6. Chọn **Card fraud rate** (`metric.card-fraud-rate`). Đọc công thức,
    dependency, grain tổng hợp và cảnh báo chia an toàn.
 7. Chọn **Sensitive banking data**
