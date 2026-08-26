@@ -1,5 +1,9 @@
 # Cerebro Semantic Layer Definition
 
+> **Status:** Final prototype design baseline
+>
+> **Scope:** PostgreSQL retail-banking semantic foundation grounded in Google OKF v0.2
+
 ## What a semantic layer is
 
 A semantic layer is a governed translation between physical database structures and business language.
@@ -156,6 +160,63 @@ It does not supply:
 - A production knowledge-serving API.
 
 Cerebro adds these capabilities around the portable OKF contract.
+
+## Four-layer ownership: Google and Cerebro
+
+Google provides the OKF foundation and proof-of-concept production and visualization tools. It does not provide a complete four-layer semantic system.
+
+| Layer | Google currently provides | Cerebro must develop |
+| --- | --- | --- |
+| **1. Physical** | BigQuery source abstraction, metadata reading, concept listing, and optional row sampling | PostgreSQL scanning, normalized snapshots, and deterministic PK/FK extraction |
+| **2. Business concepts** | Gemini/Google ADK enrichment that writes general OKF documents from BigQuery metadata and optional web sources | Banking concepts, aliases, classifications, OpenAI integration, and human review |
+| **3. Query semantics** | Extensible OKF documents, Markdown links, provenance, trust, and lifecycle fields | Structured grain, dimensions, measures, join contracts, cardinalities, warnings, and validators |
+| **4. Retrieval** | Static Cytoscape viewer, basic title/ID/tag search, type filtering, and backlinks | Hybrid search, typed graph expansion, active versions, policy filtering, MCP tools, and grounding responses |
+
+### What Cerebro reuses directly
+
+- OKF v0.2 document and bundle conventions.
+- Markdown with YAML frontmatter.
+- Concept paths and progressive `index.md` navigation.
+- Standard provenance, generation, verification, trust, freshness, and lifecycle fields.
+- Bundle parsing, writing, path handling, and relevant validation tests.
+- Markdown-link graph extraction and Cytoscape viewer concepts.
+- Example bundles as conformance and visualization references.
+
+### What Cerebro adapts
+
+- Replace the BigQuery source with a normalized PostgreSQL scanner.
+- Replace Google-specific model invocation with a provider-neutral interface whose first adapter uses the OpenAI Responses API.
+- Replace general enrichment prompts with retail-banking semantic instructions.
+- Disable row sampling and web enrichment for the metadata-only prototype.
+- Replace the static viewer with a React-based graph review workspace.
+- Preserve standard OKF fields while adding the namespaced `cerebro` query-semantics contract.
+
+### What Cerebro builds as new functionality
+
+- PostgreSQL schema snapshots and physical metadata models.
+- Banking concept, classification, relationship, and metric proposal schemas.
+- Deterministic physical-reference, grain, join, and link validation.
+- Human review, editing, approval, rejection, and publication.
+- Full-text, vector, and typed-graph retrieval projections.
+- MCP tools that return Text-to-SQL grounding packages.
+- Golden banking questions for retrieval evaluation.
+
+The implementation boundary is:
+
+```text
+Google
+  OKF format
+  + BigQuery/Gemini reference producer
+  + static graph viewer
+
+Cerebro
+  PostgreSQL ingestion
+  + banking business semantics
+  + deterministic query contracts
+  + human review
+  + hybrid retrieval
+  + MCP grounding
+```
 
 ## How Cerebro maps the semantic layer
 
@@ -451,6 +512,69 @@ Cerebro's MCP retrieval tool should return a grounding package similar to:
 ```
 
 The Text-to-SQL team consumes this grounding package and generates SQL from it. Its agent should not need to parse the whole knowledge graph or guess relationship meanings.
+
+## Agent allocation
+
+Cerebro should not create one agent for every layer. Layers 1 and 4 are deterministic system responsibilities; only Layers 2 and 3 require semantic judgment.
+
+| Layer | Component | LLM agent? | Reason |
+| --- | --- | --- | --- |
+| Physical | `PostgreSQLScanner` | No | Database metadata is ground truth and must not be invented |
+| Business concepts | `SemanticEnrichmentAgent` | Yes | Definitions, aliases, and conceptual mappings require semantic judgment |
+| Query semantics | `SemanticEnrichmentAgent` plus `OKFValidator` | Partly | The agent proposes grain and guidance; deterministic code verifies physical claims |
+| Retrieval | `SemanticRetriever` and MCP server | No | Ranking, graph traversal, filtering, and response construction should be reproducible |
+
+For the prototype, one bounded semantic-enrichment agent handles two structured stages:
+
+```text
+Stage 1: Business enrichment
+  concepts
+  definitions
+  aliases
+  table purpose
+  classifications
+
+Stage 2: Query enrichment
+  grain
+  dimensions and measures
+  joins derived from discovered keys
+  query guidance
+  ambiguity and fan-out warnings
+```
+
+The stages may use separate prompts, but they share one workflow and one structured output contract. The agent can propose semantics but cannot publish them directly.
+
+The complete control flow is:
+
+```text
+PostgreSQLScanner
+  deterministic metadata
+        |
+        v
+SchemaSnapshot
+        |
+        v
+SemanticEnrichmentAgent
+  proposes business and query semantics
+        |
+        v
+OKFValidator
+  verifies schema references, joins, links, and required fields
+        |
+        v
+Human reviewer
+  corrects and approves business meaning
+        |
+        v
+BundlePublisher
+  activates an immutable reviewed bundle
+        |
+        v
+SemanticRetriever + MCP
+  supplies grounding to the Text-to-SQL team
+```
+
+A future production version may split concept, relationship, metric, and policy enrichment into specialist agents. That split should follow semantic responsibilities and measured workflow needs rather than mirroring the four architectural layers.
 
 ## Complete semantic mapping example
 
