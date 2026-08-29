@@ -11,3 +11,13 @@ apps/web/dist/
 artifacts/
 knowledge/generated/
 
+# Phase 2: source data and materialized database
+archive/
+data/
+*.duckdb
+*.duckdb.wal
+
+# Phase 2: local model artifacts
+models/
+adapters/
+
