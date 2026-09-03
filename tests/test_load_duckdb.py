@@ -1,0 +1,670 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError
+from importlib import import_module
+from pathlib import Path
+from typing import Any
+
+import duckdb
+import pytest
+
+from cerebro.bundle import BundleLoader
+from cerebro.models import SemanticBundle, SourceManifest, SourceTableManifest
+from cerebro.paths import DEFAULT_BUNDLE
+from cerebro.provenance import (
+    canonical_json_bytes,
+    manifest_table_id,
+    sha256_file,
+    source_manifest_sha256,
+)
+
+SOURCE_VALUE = "SOURCE_ROW_VALUE_THAT_MUST_NOT_ENTER_A_RECEIPT"
+
+
+@pytest.fixture()
+def bundle() -> SemanticBundle:
+    return BundleLoader().load(DEFAULT_BUNDLE)
+
+
+def _loader() -> Any:
+    return import_module("scripts.load_duckdb")
+
+
+def _active_tables(bundle: SemanticBundle) -> list[Any]:
+    return sorted(
+        (
+            obj
+            for obj in bundle.objects
+            if obj.type == "table" and obj.status == "active"
+        ),
+        key=lambda obj: obj.id,
+    )
+
+
+def _raw_name(table: Any) -> str:
+    prefix, separator, raw_name = table.id.partition(".")
+    assert (prefix, separator, raw_name) == ("table", ".", raw_name)
+    return raw_name
+
+
+def _synthetic_value(data_type: str, table_name: str, column_name: str) -> str:
+    if data_type == "BIGINT":
+        return "17"
+    if data_type == "DOUBLE":
+        return "17.25"
+    if data_type == "DATE":
+        return "2026-08-27"
+    if data_type == "VARCHAR":
+        return f"{SOURCE_VALUE}_{table_name}_{column_name}"
+    raise AssertionError(f"fixture has no synthetic value for {data_type}")
+
+
+def _write_rows(path: Path, rows: list[list[str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as destination:
+        csv.writer(destination, lineterminator="\n").writerows(rows)
+
+
+def _read_rows(path: Path) -> list[list[str]]:
+    with path.open(encoding="utf-8", newline="") as source:
+        return list(csv.reader(source))
+
+
+def write_bundle_csv_fixture(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> tuple[Path, SourceManifest]:
+    csv_dir = tmp_path / "csv"
+    csv_dir.mkdir()
+    tables: list[SourceTableManifest] = []
+    for table in _active_tables(bundle):
+        name = _raw_name(table)
+        columns = table.cerebro["columns"]
+        source_file = csv_dir / f"{name}.csv"
+        _write_rows(
+            source_file,
+            [
+                [str(column["name"]) for column in columns],
+                [
+                    _synthetic_value(
+                        str(column["data_type"]), name, str(column["name"])
+                    )
+                    for column in columns
+                ],
+            ],
+        )
+        tables.append(
+            SourceTableManifest(
+                name=name,
+                file_name=source_file.name,
+                sha256=sha256_file(source_file),
+                row_count=1,
+            )
+        )
+    return csv_dir, SourceManifest(tables=tuple(tables))
+
+
+def _rehash_manifest(
+    manifest: SourceManifest,
+    csv_dir: Path,
+) -> SourceManifest:
+    return SourceManifest(
+        tables=tuple(
+            SourceTableManifest(
+                name=table.name,
+                file_name=table.file_name,
+                sha256=sha256_file(csv_dir / table.file_name),
+                row_count=table.row_count,
+            )
+            for table in manifest.tables
+        )
+    )
+
+
+def _replace_manifest_table(
+    manifest: SourceManifest,
+    table_name: str,
+    **updates: Any,
+) -> SourceManifest:
+    return SourceManifest(
+        tables=tuple(
+            SourceTableManifest(
+                **(
+                    {
+                        "name": table.name,
+                        "file_name": table.file_name,
+                        "sha256": table.sha256,
+                        "row_count": table.row_count,
+                    }
+                    | (updates if table.name == table_name else {})
+                )
+            )
+            for table in manifest.tables
+        )
+    )
+
+
+def _assert_no_invocation_temps(target: Path, receipt_dir: Path | None = None) -> None:
+    assert not list(target.parent.glob(f".{target.name}.*.tmp*"))
+    if receipt_dir is not None and receipt_dir.exists():
+        assert not list(receipt_dir.glob(".*.tmp*"))
+
+
+def _quote(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def test_preflight_returns_immutable_name_aligned_inventory(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    reordered_bundle = bundle.model_copy(deep=True)
+    reordered_bundle.objects.reverse()
+    reordered_manifest = SourceManifest(tables=tuple(reversed(manifest.tables)))
+
+    inventory = loader.preflight_csvs(
+        csv_dir,
+        reordered_bundle,
+        reordered_manifest,
+    )
+
+    expected_names = sorted(table.name for table in manifest.tables)
+    assert [table.name for table in inventory.tables] == expected_names
+    assert isinstance(inventory.tables, tuple)
+    assert all(isinstance(table.columns, tuple) for table in inventory.tables)
+    with pytest.raises(FrozenInstanceError):
+        inventory.tables = ()
+    with pytest.raises(FrozenInstanceError):
+        inventory.tables[0].name = "changed"
+
+
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_preflight_requires_exact_csv_basename_set(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    change: str,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    if change == "missing":
+        (csv_dir / manifest.tables[0].file_name).unlink()
+    else:
+        (csv_dir / "unexpected.csv").write_text("value\n1\n", encoding="utf-8")
+
+    with pytest.raises(loader.LoadError, match="CSV file set"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+@pytest.mark.parametrize("change", ["reordered", "missing", "extra"])
+def test_preflight_requires_exact_utf8_header_order(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    change: str,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    table = manifest.tables[0]
+    source_file = csv_dir / table.file_name
+    rows = _read_rows(source_file)
+    if change == "reordered":
+        rows[0][0], rows[0][1] = rows[0][1], rows[0][0]
+    elif change == "missing":
+        rows = [row[:-1] for row in rows]
+    else:
+        rows = [row + ["unexpected_column"] for row in rows]
+    _write_rows(source_file, rows)
+    manifest = _rehash_manifest(manifest, csv_dir)
+
+    with pytest.raises(loader.LoadError, match="header"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+def test_preflight_rejects_non_utf8_header(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    table = manifest.tables[0]
+    (csv_dir / table.file_name).write_bytes(b"\xff,broken\n1,2\n")
+    manifest = _rehash_manifest(manifest, csv_dir)
+
+    with pytest.raises(loader.LoadError, match="UTF-8"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+def test_preflight_requires_manifest_file_hash(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    source_file = csv_dir / manifest.tables[0].file_name
+    source_file.write_bytes(source_file.read_bytes() + b"\n")
+
+    with pytest.raises(loader.LoadError, match="SHA-256"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+def test_preflight_requires_exact_row_count(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    first = manifest.tables[0]
+    manifest = _replace_manifest_table(
+        manifest,
+        first.name,
+        row_count=first.row_count + 1,
+    )
+
+    with pytest.raises(loader.LoadError, match="row count"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+def test_preflight_requires_manifest_to_match_all_active_bundle_tables(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    removed = manifest.tables[-1]
+    (csv_dir / removed.file_name).unlink()
+    manifest = SourceManifest(tables=manifest.tables[:-1])
+
+    with pytest.raises(loader.LoadError, match="active bundle table set"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+def test_preflight_rejects_duplicate_active_bundle_tables(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    invalid = bundle.model_copy(deep=True)
+    invalid.objects.append(_active_tables(invalid)[0].model_copy(deep=True))
+
+    with pytest.raises(loader.LoadError, match="duplicate active table"):
+        loader.preflight_csvs(csv_dir, invalid, manifest)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda columns: columns.append(dict(columns[0])),
+            "duplicate column",
+        ),
+        (
+            lambda columns: columns[0].pop("data_type"),
+            "data type",
+        ),
+        (
+            lambda columns: columns[0].update(data_type="BIGINT; DROP TABLE x"),
+            "data type",
+        ),
+        (
+            lambda columns: columns[0].update(name='unsafe"column'),
+            "column name",
+        ),
+    ],
+)
+def test_preflight_rejects_ambiguous_or_unsafe_bundle_columns(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    mutation: Callable[[list[dict[str, Any]]], None],
+    message: str,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    invalid = bundle.model_copy(deep=True)
+    columns = _active_tables(invalid)[0].cerebro["columns"]
+    mutation(columns)
+
+    with pytest.raises(loader.LoadError, match=message):
+        loader.preflight_csvs(csv_dir, invalid, manifest)
+
+
+def test_preflight_rejects_value_not_castable_to_bundle_declared_type(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    table = next(
+        table
+        for table in _active_tables(bundle)
+        if any(column["data_type"] == "BIGINT" for column in table.cerebro["columns"])
+    )
+    column_index = next(
+        index
+        for index, column in enumerate(table.cerebro["columns"])
+        if column["data_type"] == "BIGINT"
+    )
+    source_file = csv_dir / f"{_raw_name(table)}.csv"
+    rows = _read_rows(source_file)
+    rows[1][column_index] = "not-an-integer"
+    _write_rows(source_file, rows)
+    manifest = _rehash_manifest(manifest, csv_dir)
+
+    with pytest.raises(loader.LoadError, match="cast"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+
+def test_invalid_preflight_never_opens_or_mutates_target_database(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    before = target.read_bytes()
+    source_file = csv_dir / manifest.tables[0].file_name
+    source_file.write_bytes(source_file.read_bytes() + b"changed")
+    real_connect = duckdb.connect
+    opened: list[str] = []
+
+    def tracking_connect(database: str = ":memory:", *args: Any, **kwargs: Any):
+        opened.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(loader.duckdb, "connect", tracking_connect)
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert target.read_bytes() == before
+    assert str(target) not in opened
+    assert not any(Path(path).name.startswith(f".{target.name}.") for path in opened)
+    _assert_no_invocation_temps(target)
+
+
+def test_load_materializes_exact_schema_and_value_free_content_addressed_receipt(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+
+    receipt, receipt_path = loader.load_csvs(
+        csv_dir,
+        target,
+        bundle,
+        manifest,
+        receipt_dir=receipt_dir,
+    )
+
+    assert receipt.source_manifest_sha256 == source_manifest_sha256(manifest)
+    assert receipt.database_sha256 == sha256_file(target)
+    assert receipt.engine == "duckdb"
+    assert [table.table_id for table in receipt.tables] == [
+        manifest_table_id(table.name) for table in manifest.tables
+    ]
+    assert [table.source_file_sha256 for table in receipt.tables] == [
+        table.sha256 for table in manifest.tables
+    ]
+    receipt_bytes = canonical_json_bytes(receipt)
+    assert receipt_path.read_bytes() == receipt_bytes
+    assert receipt_path.name == f"{hashlib.sha256(receipt_bytes).hexdigest()}.json"
+    assert receipt_path.parent == receipt_dir
+    assert SOURCE_VALUE.encode() not in receipt_bytes
+    assert str(tmp_path).encode() not in receipt_bytes
+    assert str(csv_dir).encode() not in receipt_bytes
+
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        actual_tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main' AND table_type = 'BASE TABLE' "
+                "ORDER BY table_name"
+            ).fetchall()
+        ]
+        expected_tables = [_raw_name(table) for table in _active_tables(bundle)]
+        assert actual_tables == expected_tables
+        for table in _active_tables(bundle):
+            table_name = _raw_name(table)
+            actual_columns = connection.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = 'main' AND table_name = ? "
+                "ORDER BY ordinal_position",
+                [table_name],
+            ).fetchall()
+            assert actual_columns == [
+                (column["name"], column["data_type"])
+                for column in table.cerebro["columns"]
+            ]
+            count = connection.execute(
+                f"SELECT count(*) FROM {_quote(table_name)}"
+            ).fetchone()[0]
+            assert count == 1
+    finally:
+        connection.close()
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_late_load_failure_preserves_existing_database(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    target = tmp_path / "workshop.duckdb"
+    connection = duckdb.connect(str(target))
+    connection.execute("CREATE TABLE sentinel(value INTEGER)")
+    connection.execute("INSERT INTO sentinel VALUES (7)")
+    connection.close()
+    before = target.read_bytes()
+
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    real = loader._load_table
+    calls = {"count": 0}
+
+    def fail_on_fifth(*args: Any, **kwargs: Any) -> int:
+        calls["count"] += 1
+        if calls["count"] == 5:
+            raise loader.LoadError("injected late failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_load_table", fail_on_fifth)
+    with pytest.raises(loader.LoadError, match="injected late failure"):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert calls["count"] == 5
+    assert target.read_bytes() == before
+    _assert_no_invocation_temps(target)
+
+
+def test_receipt_is_finalized_immediately_before_database_replace(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+    real_link = loader.os.link
+    real_replace = loader.os.replace
+    events: list[tuple[str, Path]] = []
+
+    def recording_link(source: Any, destination: Any) -> None:
+        events.append(("receipt", Path(destination)))
+        real_link(source, destination)
+
+    def recording_replace(source: Any, destination: Any) -> None:
+        events.append(("database", Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(loader.os, "link", recording_link)
+    monkeypatch.setattr(loader.os, "replace", recording_replace)
+
+    _receipt, receipt_path = loader.load_csvs(
+        csv_dir,
+        target,
+        bundle,
+        manifest,
+        receipt_dir=receipt_dir,
+    )
+
+    assert events[-2:] == [("receipt", receipt_path), ("database", target)]
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_receipt_finalize_failure_preserves_target_and_cleans_temps(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+
+    def fail_receipt_link(source: Any, destination: Any) -> None:
+        raise OSError("injected receipt finalize failure")
+
+    monkeypatch.setattr(loader.os, "link", fail_receipt_link)
+
+    with pytest.raises(loader.LoadError, match="receipt finalize failure"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == before
+    assert not list(receipt_dir.glob("*.json"))
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_concurrent_preexisting_receipt_is_never_overwritten_or_deleted(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    preexisting = b"concurrently published receipt bytes"
+    real_link = loader.os.link
+
+    def competing_link(source: Any, destination: Any) -> None:
+        Path(destination).write_bytes(preexisting)
+        real_link(source, destination)
+
+    monkeypatch.setattr(loader.os, "link", competing_link)
+
+    with pytest.raises(loader.LoadError, match="content-addressed receipt collision"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == target_before
+    receipt_files = list(receipt_dir.glob("*.json"))
+    assert len(receipt_files) == 1
+    assert receipt_files[0].read_bytes() == preexisting
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_database_replace_failure_removes_only_new_receipt(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    real_replace = loader.os.replace
+
+    def fail_database_replace(source: Any, destination: Any) -> None:
+        if Path(destination) == target:
+            raise OSError("injected database replace failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(loader.os, "replace", fail_database_replace)
+
+    with pytest.raises(loader.LoadError, match="database replace failure"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == before
+    assert not list(receipt_dir.glob("*.json"))
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_database_replace_failure_never_deletes_preexisting_receipt(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+    _receipt, receipt_path = loader.load_csvs(
+        csv_dir,
+        target,
+        bundle,
+        manifest,
+        receipt_dir=receipt_dir,
+    )
+    receipt_before = receipt_path.read_bytes()
+    target_before = target.read_bytes()
+    receipt_files_before = {
+        path.name: path.read_bytes() for path in receipt_dir.glob("*.json")
+    }
+    real_replace = loader.os.replace
+
+    def fail_database_replace(source: Any, destination: Any) -> None:
+        if Path(destination) == target:
+            raise OSError("injected database replace failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(loader.os, "replace", fail_database_replace)
+
+    with pytest.raises(loader.LoadError, match="database replace failure"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == target_before
+    assert receipt_path.read_bytes() == receipt_before
+    assert {
+        path.name: path.read_bytes() for path in receipt_dir.glob("*.json")
+    } == receipt_files_before
+    _assert_no_invocation_temps(target, receipt_dir)
