@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import os
 import re
+import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from hashlib import sha256
@@ -385,14 +387,170 @@ def _unique_temp_path(directory: Path, *, prefix: str, suffix: str) -> Path:
     return Path(raw_path)
 
 
-def _remove_database_temp(path: Path | None) -> None:
-    if path is None:
+def _create_private_workspace(target: Path) -> Path:
+    try:
+        workspace = Path(
+            tempfile.mkdtemp(
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+            )
+        )
+    except OSError as exc:
+        raise LoadError("could not create private materialization workspace") from exc
+
+    try:
+        workspace_mode = workspace.lstat().st_mode
+        if not stat.S_ISDIR(workspace_mode) or stat.S_ISLNK(workspace_mode):
+            raise LoadError("private materialization workspace is not a directory")
+        os.chmod(workspace, 0o700)
+        if stat.S_IMODE(workspace.lstat().st_mode) != 0o700:
+            raise LoadError("private materialization workspace is not mode 0700")
+        return workspace
+    except Exception:
+        shutil.rmtree(workspace, ignore_errors=True)
+        raise
+
+
+def _remove_private_workspace(workspace: Path | None) -> None:
+    if workspace is None:
         return
-    path.unlink(missing_ok=True)
-    Path(f"{path}.wal").unlink(missing_ok=True)
+    # rmtree refuses to traverse a symlink, so cleanup remains scoped to the
+    # invocation-owned directory even if the path is unexpectedly disturbed.
+    try:
+        shutil.rmtree(workspace)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Cleanup must not mask the materialization result or original failure.
+        pass
+
+
+def _open_regular_source(source_file: Path) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+    try:
+        descriptor = os.open(source_file, flags)
+    except OSError as exc:
+        raise LoadError(f"could not securely open source {source_file.name}") from exc
+
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise LoadError(f"source is not a regular file: {source_file.name}")
+        if no_follow == 0:
+            path_stat = os.stat(source_file, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_dev != descriptor_stat.st_dev
+                or path_stat.st_ino != descriptor_stat.st_ino
+            ):
+                raise LoadError(
+                    f"source path is not the opened regular file: {source_file.name}"
+                )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _copy_verified_snapshot(
+    table: SourceTableInventory,
+    workspace: Path,
+    index: int,
+) -> Path:
+    snapshot = workspace / f"source-{index:04d}.csv"
+    source_descriptor = _open_regular_source(table.source_file)
+    destination_descriptor: int | None = None
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    digest = sha256()
+    try:
+        destination_descriptor = os.open(snapshot, flags, 0o600)
+        with os.fdopen(source_descriptor, "rb") as source:
+            source_descriptor = -1
+            with os.fdopen(destination_descriptor, "wb") as destination:
+                destination_descriptor = None
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+    except OSError as exc:
+        raise LoadError(
+            f"could not create verified snapshot for {table.source_file.name}"
+        ) from exc
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+
+    if digest.hexdigest() != table.source_file_sha256:
+        raise LoadError(f"source changed after preflight: {table.source_file.name}")
+
+    try:
+        os.chmod(snapshot, 0o400)
+        snapshot_mode = snapshot.lstat().st_mode
+        if not stat.S_ISREG(snapshot_mode) or stat.S_ISLNK(snapshot_mode):
+            raise LoadError("verified source snapshot is not a regular file")
+        if sha256_file(snapshot) != table.source_file_sha256:
+            raise LoadError("verified source snapshot hash changed after copying")
+    except OSError as exc:
+        raise LoadError(
+            f"could not validate source snapshot for {table.source_file.name}"
+        ) from exc
+    return snapshot
+
+
+def _snapshot_inventory(
+    inventory: SourceInventory,
+    workspace: Path,
+) -> SourceInventory:
+    snapshot_tables: list[SourceTableInventory] = []
+    for index, table in enumerate(inventory.tables):
+        snapshot_tables.append(
+            SourceTableInventory(
+                name=table.name,
+                table_id=table.table_id,
+                source_file=_copy_verified_snapshot(table, workspace, index),
+                source_file_sha256=table.source_file_sha256,
+                row_count=table.row_count,
+                columns=table.columns,
+                ddl=table.ddl,
+            )
+        )
+    return SourceInventory(
+        source_manifest_sha256=inventory.source_manifest_sha256,
+        bundle_sha256=inventory.bundle_sha256,
+        tables=tuple(snapshot_tables),
+    )
 
 
 def _build_database(path: Path, inventory: SourceInventory) -> None:
+    workspace_mode = path.parent.lstat().st_mode
+    if (
+        not stat.S_ISDIR(workspace_mode)
+        or stat.S_ISLNK(workspace_mode)
+        or stat.S_IMODE(workspace_mode) != 0o700
+    ):
+        raise LoadError("database workspace is not a private mode-0700 directory")
+    if os.path.lexists(path):
+        raise LoadError("private database path already exists")
+    for table in inventory.tables:
+        snapshot_mode = table.source_file.lstat().st_mode
+        if (
+            table.source_file.parent != path.parent
+            or not stat.S_ISREG(snapshot_mode)
+            or stat.S_ISLNK(snapshot_mode)
+        ):
+            raise LoadError("source snapshot escaped the private workspace")
+
     connection: duckdb.DuckDBPyConnection | None = None
     transaction_open = False
     try:
@@ -401,9 +559,7 @@ def _build_database(path: Path, inventory: SourceInventory) -> None:
         transaction_open = True
         for table in inventory.tables:
             if sha256_file(table.source_file) != table.source_file_sha256:
-                raise LoadError(
-                    f"source changed after preflight: {table.source_file.name}"
-                )
+                raise LoadError(f"verified source snapshot changed: {table.name}")
             loaded_count = _load_table(
                 connection,
                 table.source_file,
@@ -418,7 +574,7 @@ def _build_database(path: Path, inventory: SourceInventory) -> None:
         for table in inventory.tables:
             if sha256_file(table.source_file) != table.source_file_sha256:
                 raise LoadError(
-                    f"source changed while loading: {table.source_file.name}"
+                    f"verified source snapshot changed while loading: {table.name}"
                 )
         connection.execute("COMMIT")
         transaction_open = False
@@ -471,21 +627,14 @@ def load_csvs(
         raise LoadError(f"database target directory does not exist: {target_dir}")
     receipts = Path(receipt_dir) if receipt_dir is not None else target_dir
 
-    database_temp: Path | None = None
+    workspace: Path | None = None
     receipt_temp: Path | None = None
     receipt_path: Path | None = None
-    receipt_bytes: bytes | None = None
-    receipt_created = False
     try:
-        database_temp = _unique_temp_path(
-            target_dir,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-        )
-        # DuckDB creates a new database but rejects a pre-created empty file.
-        # mkstemp claims a collision-resistant name before we release it here.
-        database_temp.unlink()
-        _build_database(database_temp, inventory)
+        workspace = _create_private_workspace(target)
+        snapshot_inventory = _snapshot_inventory(inventory, workspace)
+        database_temp = workspace / "database.duckdb"
+        _build_database(database_temp, snapshot_inventory)
         database_hash = sha256_file(database_temp)
 
         receipt = MaterializationReceipt(
@@ -525,30 +674,20 @@ def load_csvs(
             receipt_temp.unlink()
             receipt_temp = None
         else:
-            receipt_created = True
             receipt_temp.unlink()
             receipt_temp = None
 
-        # The receipt is finalized immediately before the database replacement.
+        # Publication makes this immutable path shared evidence. If database
+        # replacement fails, leave the harmless orphan in place: its database
+        # hash cannot validate against a mismatched target, and another
+        # invocation may already have adopted it.
         os.replace(database_temp, target)
-        database_temp = None
         return receipt, receipt_path
     except Exception as exc:
-        if (
-            receipt_created
-            and receipt_path is not None
-            and receipt_bytes is not None
-            and receipt_path.exists()
-        ):
-            try:
-                if receipt_path.read_bytes() == receipt_bytes:
-                    receipt_path.unlink()
-            except OSError:
-                pass
         if isinstance(exc, LoadError):
             raise
         raise LoadError(f"DuckDB materialization failed: {exc}") from exc
     finally:
         if receipt_temp is not None:
             receipt_temp.unlink(missing_ok=True)
-        _remove_database_temp(database_temp)
+        _remove_private_workspace(workspace)

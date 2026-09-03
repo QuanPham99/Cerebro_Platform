@@ -486,6 +486,197 @@ def test_late_load_failure_preserves_existing_database(
     _assert_no_invocation_temps(target)
 
 
+def test_source_aba_swap_cannot_change_verified_snapshot_bytes(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+    selected_table = next(
+        table
+        for table in _active_tables(bundle)
+        if any(column["data_type"] == "VARCHAR" for column in table.cerebro["columns"])
+    )
+    selected_name = _raw_name(selected_table)
+    selected_index = (
+        sorted(table.name for table in manifest.tables).index(selected_name) + 1
+    )
+    selected_column_index = next(
+        index
+        for index, column in enumerate(selected_table.cerebro["columns"])
+        if column["data_type"] == "VARCHAR"
+    )
+    selected_column = selected_table.cerebro["columns"][selected_column_index]["name"]
+    source_file = csv_dir / f"{selected_name}.csv"
+    original_bytes = source_file.read_bytes()
+    original_rows = _read_rows(source_file)
+    unchecked_value = "UNCHECKED_ABA_SOURCE_VALUE"
+    changed_rows = [row.copy() for row in original_rows]
+    changed_rows[1][selected_column_index] = unchecked_value
+    changed_file = tmp_path / "changed.csv"
+    _write_rows(changed_file, changed_rows)
+    changed_bytes = changed_file.read_bytes()
+    changed_file.unlink()
+    real_load_table = loader._load_table
+    calls = {"count": 0}
+
+    def swap_original_while_table_loads(
+        connection: duckdb.DuckDBPyConnection,
+        load_source: Path,
+        ddl: str,
+    ) -> int:
+        calls["count"] += 1
+        if calls["count"] != selected_index:
+            return real_load_table(connection, load_source, ddl)
+        source_file.write_bytes(changed_bytes)
+        try:
+            return real_load_table(connection, load_source, ddl)
+        finally:
+            source_file.write_bytes(original_bytes)
+
+    monkeypatch.setattr(loader, "_load_table", swap_original_while_table_loads)
+
+    receipt, receipt_path = loader.load_csvs(
+        csv_dir,
+        target,
+        bundle,
+        manifest,
+        receipt_dir=receipt_dir,
+    )
+
+    assert calls["count"] == len(manifest.tables)
+    assert source_file.read_bytes() == original_bytes
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        loaded_value = connection.execute(
+            f"SELECT {_quote(selected_column)} FROM {_quote(selected_name)}"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert loaded_value == original_rows[1][selected_column_index]
+    assert loaded_value != unchecked_value
+    assert [table.source_file_sha256 for table in receipt.tables] == [
+        table.sha256 for table in manifest.tables
+    ]
+    assert unchecked_value.encode() not in receipt_path.read_bytes()
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_post_preflight_source_symlink_is_rejected_before_database_open(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    backing_file = tmp_path / "verified-source-copy.csv"
+    real_preflight = loader.preflight_csvs
+    real_connect = loader.duckdb.connect
+    opened_databases: list[Path] = []
+
+    def preflight_then_substitute_symlink(*args: Any, **kwargs: Any) -> Any:
+        inventory = real_preflight(*args, **kwargs)
+        source_file = inventory.tables[0].source_file
+        backing_file.write_bytes(source_file.read_bytes())
+        source_file.unlink()
+        source_file.symlink_to(backing_file)
+        return inventory
+
+    def tracking_connect(database: str = ":memory:", *args: Any, **kwargs: Any):
+        if str(database) != ":memory:":
+            opened_databases.append(Path(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "preflight_csvs", preflight_then_substitute_symlink)
+    monkeypatch.setattr(loader.duckdb, "connect", tracking_connect)
+
+    with pytest.raises(loader.LoadError, match="securely open source"):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert not opened_databases
+    assert target.read_bytes() == target_before
+    assert (csv_dir / manifest.tables[0].file_name).is_symlink()
+    _assert_no_invocation_temps(target)
+
+
+def test_database_temp_uses_private_workspace_not_claimable_parent_path(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    connection = duckdb.connect(str(target))
+    connection.execute("CREATE TABLE sentinel(value INTEGER)")
+    connection.execute("INSERT INTO sentinel VALUES (7)")
+    connection.close()
+    target_before = target.read_bytes()
+    claimant = target.parent / "database.duckdb"
+    claimant.symlink_to(target)
+    real_connect = loader.duckdb.connect
+    observed: list[dict[str, Any]] = []
+    loaded_sources: list[Path] = []
+
+    def tracking_connect(database: str = ":memory:", *args: Any, **kwargs: Any):
+        if str(database) != ":memory:":
+            database_path = Path(database)
+            snapshots = tuple(database_path.parent.glob("*.csv"))
+            observed.append(
+                {
+                    "path": database_path,
+                    "path_existed": loader.os.path.lexists(database_path),
+                    "parent_is_symlink": database_path.parent.is_symlink(),
+                    "parent_mode": database_path.parent.stat().st_mode & 0o777,
+                    "snapshots": tuple(
+                        (snapshot, snapshot.is_file(), snapshot.is_symlink())
+                        for snapshot in snapshots
+                    ),
+                }
+            )
+        return real_connect(database, *args, **kwargs)
+
+    def fail_first_load(
+        _connection: duckdb.DuckDBPyConnection,
+        source_file: Path,
+        _ddl: str,
+    ) -> int:
+        loaded_sources.append(Path(source_file))
+        raise loader.LoadError("injected private-path failure")
+
+    monkeypatch.setattr(loader.duckdb, "connect", tracking_connect)
+    monkeypatch.setattr(loader, "_load_table", fail_first_load)
+
+    with pytest.raises(loader.LoadError, match="injected private-path failure"):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert len(observed) == 1
+    database = observed[0]
+    database_path = database["path"]
+    assert database_path.name == "database.duckdb"
+    assert database_path.parent.parent == target.parent
+    assert database_path.parent != target.parent
+    assert not database["path_existed"]
+    assert not database["parent_is_symlink"]
+    assert database["parent_mode"] == 0o700
+    assert len(database["snapshots"]) == len(manifest.tables)
+    assert all(
+        is_file and not is_symlink for _, is_file, is_symlink in database["snapshots"]
+    )
+    assert loaded_sources[0].parent == database_path.parent
+    assert database_path != claimant
+    assert claimant.is_symlink()
+    assert claimant.resolve() == target.resolve()
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target)
+
+
 def test_receipt_is_finalized_immediately_before_database_replace(
     tmp_path: Path,
     bundle: SemanticBundle,
@@ -589,7 +780,7 @@ def test_concurrent_preexisting_receipt_is_never_overwritten_or_deleted(
     _assert_no_invocation_temps(target, receipt_dir)
 
 
-def test_database_replace_failure_removes_only_new_receipt(
+def test_database_replace_failure_preserves_published_receipt_for_adopter(
     tmp_path: Path,
     bundle: SemanticBundle,
     monkeypatch: pytest.MonkeyPatch,
@@ -601,15 +792,34 @@ def test_database_replace_failure_removes_only_new_receipt(
     before = target.read_bytes()
     receipt_dir = tmp_path / "receipts"
     real_replace = loader.os.replace
+    adopted: dict[str, Any] = {}
 
-    def fail_database_replace(source: Any, destination: Any) -> None:
+    def adopt_receipt_then_fail_database_replace(
+        source: Any,
+        destination: Any,
+    ) -> None:
         if Path(destination) == target:
-            raise OSError("injected database replace failure")
+            published = list(receipt_dir.glob("*.json"))
+            assert len(published) == 1
+            adopted_bytes = published[0].read_bytes()
+            adopted_receipt = loader.MaterializationReceipt.model_validate_json(
+                adopted_bytes
+            )
+            assert canonical_json_bytes(adopted_receipt) == adopted_bytes
+            adopted["path"] = published[0]
+            adopted["bytes"] = adopted_bytes
+            raise OSError("injected database replace failure after adoption")
         real_replace(source, destination)
 
-    monkeypatch.setattr(loader.os, "replace", fail_database_replace)
+    monkeypatch.setattr(
+        loader.os,
+        "replace",
+        adopt_receipt_then_fail_database_replace,
+    )
 
-    with pytest.raises(loader.LoadError, match="database replace failure"):
+    with pytest.raises(
+        loader.LoadError, match="database replace failure after adoption"
+    ):
         loader.load_csvs(
             csv_dir,
             target,
@@ -619,7 +829,8 @@ def test_database_replace_failure_removes_only_new_receipt(
         )
 
     assert target.read_bytes() == before
-    assert not list(receipt_dir.glob("*.json"))
+    assert adopted["path"].read_bytes() == adopted["bytes"]
+    assert list(receipt_dir.glob("*.json")) == [adopted["path"]]
     _assert_no_invocation_temps(target, receipt_dir)
 
 
