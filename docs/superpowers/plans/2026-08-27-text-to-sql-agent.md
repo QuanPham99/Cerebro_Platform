@@ -1,2363 +1,1792 @@
-# Text-to-SQL Agent Implementation Plan
+# Text-to-SQL Agent Option B Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an agent that turns a banking question plus an OKF grounding packet into a verified `QueryPlan`, dialect-correct DuckDB SQL, and an executed aggregate result, where every check that gates execution is deterministic and runs without a model. Generation runs against a hosted provider using an organizer-supplied API key.
+**Revision:** 2026-08-30 Option B plan replacing the unconditional two-provider-stage design; amended to separate generation provenance from cache serving, add typed clarification and value-free literal references, and harden local typing/budgets/provider boundaries.
 
-**Architecture:** Two structured stages behind the existing `GenerationProvider` interface. Stage one produces a `QueryPlan`; stage two produces SQL. Between and after them, a model-free checker (`selfcheck.py`) verifies containment against the grounding packet, warning coverage, statement shape, verbatim metric formula by AST comparison, bounded sensitive disclosure, and engine validity via `EXPLAIN`. Execution is injected as a callable so the agent is testable without a database. Retry budgets are per-stage and bounded.
+**Goal:** Build a production-balanced Text-to-SQL path in which an authorized metadata snapshot and versioned canonical question ground a value-free relational IR, the organizer model never emits SQL or physical literal values, local code deterministically resolves literal references and compiles parameterized SQL, and every query passes existing semantic, disclosure, engine, and execution gates.
 
-**Tech Stack:** Python 3.10+, Pydantic v2, DuckDB (read-only at query time), `sqlglot` for AST work, `httpx` against an OpenAI-compatible chat-completions endpoint, `pytest`. No new package is added; `httpx` is already a project dependency.
+**Architecture:** A normal cache miss starts with semantic-call capacity one and makes one schema-bound organizer/BTC call returning `RelationalQueryIR`, `GroundingRefusal`, `ClarificationRequest`, or `ComplexQueryPlan`. Only local validation of the complex plan produces `AcceptedComplexRoute`, performs the one-way budget transition to capacity two, and permits one `planned_ir` call. `GenerationRoute` is only `default_ir` or `planned_ir`; `cache_status` independently records disabled/miss/hit, so a cache hit preserves and revalidates the original generation route. A deterministic compiler resolves canonical-question/governed literal refs locally and creates SQL, while post-compile AST checks remain defense in depth. Scoped caching, cumulative call/transport/token/cost/deadline budgets, mandatory read-only `EXPLAIN`, and bounded execution apply to both generation routes and cache hits.
+
+**Tech Stack:** Python 3.10+, Pydantic 2.13.5-compatible contracts, DuckDB `1.5.5`, `sqlglot` `30.17.0`, httpx 0.28.x, MCP `>=1.0,<2`, pytest 8.x. `sqlglot` is the only SQL parser and SQL AST builder.
 
 **Spec:** [`specs/008-text-to-sql-agent.md`](../../../specs/008-text-to-sql-agent.md)
 
 ## Global Constraints
 
-- Generation goes through a hosted provider with an organizer-supplied key, read from the environment and never committed (FR-702).
-- Both stages bind the output schema at the API level rather than asking the model to behave (FR-703).
-- Prompt egress is bounded: no source row reaches the provider, enforced at a single choke point (FR-703a).
-- Transport faults are retried with bounded backoff and never consume the semantic retry budget (FR-703b).
-- The whole suite runs with no key and no network, replaying recorded responses (FR-703c, AC-707).
-- Temperature is zero for both stages; reasoning modes are off where the provider exposes the choice.
-- The key is shared and quota-bearing. Iterating on the checker must not require live calls.
-- `sqlglot` is the only SQL parser. No regular-expression SQL analysis (spec Constraints).
-- All DuckDB connections used for query execution are opened read-only (FR-718).
-- `knowledge/bank-workshop/` is read-only input. No task modifies the bundle.
-- Module layout stays flat under `src/cerebro/`. No subpackages.
-- Classification is read from the grounding packet at runtime, never hard-coded.
-- Disclosure cap default is 50 rows; row cap default 1000; statement timeout default 30 s. All configuration, not literals (FR-713, FR-719).
-- `status = ok` is the only status that may carry a result, and the only one a caller may execute (FR-706, FR-717).
+- The organizer model never emits SQL, embedded physical literal values, or free-form IR intent. No provider output model or prompt schema contains a SQL field or arbitrary literal-value field.
+- A normal cache miss starts at semantic-call capacity one and makes exactly one `default_ir` call. Only local `AcceptedComplexRoute` can authorize the one-time transition to capacity two and exactly one `planned_ir` call. A valid cache hit makes zero calls; no path exceeds two.
+- `GenerationRoute = Literal["default_ir", "planned_ir"]`. Cache service is represented only by `cache_status = disabled | miss | hit`; `"cache"` is never a generation route, and a hit preserves the original route.
+- No semantic retry, execution-driven repair, parallel candidate generation, ensemble, or tournament selection is enabled by default. Transport may retry once within each semantic call's two-attempt cap.
+- Every production request starts from raw question plus trusted `AuthorizationScope`; unauthorized objects are removed before ranking and graph expansion. Caller-supplied `GroundingResponse` or snapshot is rejected.
+- `canonicalize_question` version `008.question.v1` applies Unicode NFC, Unicode-whitespace trim/collapse to one ASCII space, no case-folding, and no literal rewriting. Canonicalization version and canonical-question hash are cache/provenance inputs.
+- `GroundingSnapshot`, value-free IR, compiler output, cache identity, and evidence hashes use canonical JSON helpers from `cerebro.provenance`. Governed literal values are explicitly authored semantic constants, never sampled/discovered database values.
+- Provider output never authorizes execution. Clarification, snapshot, IR shape/type, router, literal resolution, compiler, AST, warning, metric, assumption, disclosure, `EXPLAIN`, and executor gates are local.
+- A valid `ClarificationRequest` has exact canonical-question spans and at least two distinct relevant grounded/allowlisted candidates and terminates without fallback or engine contact. Invalid ambiguity is `invalid_clarification_request`.
+- `sqlglot==30.17.0` is the only SQL parser/builder. Regex-based SQL authorization and string-concatenated identifiers are prohibited.
+- DuckDB is pinned to `1.5.5`; do not use nonexistent `SET statement_timeout`.
+- Every model-requested SQL literal—including expression/`IN`/`CASE` operands, relative-time amount, IR limit, and physical assumption operands—is a `QuestionLiteralRef` or `GovernedLiteralRef`. Only local resolution creates internal bound values.
+- Compiler aliases, CTE names, SQL rendering, and parameter order are deterministic. `BoundParameter.value` remains executor-local and excluded from serialization.
+- A cache hit revalidates canonical spans, snapshot membership, original generation-route restrictions, full IR type rules, recompiles locally, then reruns AST, policy, `EXPLAIN`, and execution checks. Cache payloads contain no canonical question text, resolved values, compiled SQL, parameters, results, or credentials.
+- Hosted egress contains the canonical question and authorized metadata only. Source rows, sampled/discovered values, result values, resolved literals, raw SQL, raw exceptions, and credentials never enter prompts.
+- `status = ok` always contains accepted value-free IR, concrete original generation route, independent cache status, a value-free `SQLArtifact`, successful `QueryResult`, lineage, disclosures, and budget usage.
+- Text-to-SQL uses consumer-owned `Text2SQLGenerationProvider`/`ProviderGeneration` contracts. `text2sql.py`, `hosted_provider.py`, and `GoldenProvider` do not import `cerebro.enrichment`; existing enrichment `GenerationProvider` and `tests/test_enrichment.py` remain unchanged.
+- Existing `src/cerebro/api.py` stays grounding-only: `/api/grounding` and MCP are advisory, metadata-only, and non-executable. This plan adds no unauthenticated SQL endpoint.
+- Deployment budget defaults are exactly: semantic capacity `1` then at most `2` after accepted complex routing; `2` transport attempts per semantic call; `20_000 ms` provider timeout per attempt; `32_000` total input tokens; `8_000` total output tokens; `Decimal("0.50")` total USD; `120_000 ms` end-to-end.
+- `knowledge/bank-workshop/` remains read-only. Do not implement specs 009 or 010 beyond their typed handoff contracts.
+- Offline tests run without provider keys and with IPv4/IPv6 disabled; no path silently falls back to live mode.
+- Real CSVs and the live organizer API remain explicit external gates; absence blocks live evidence but never weakens offline tests.
+- Preserve the current dirty working tree. Before code execution, obtain owner approval for a branch or checkpoint; never use `reset --hard`, `clean`, force push, or an implicit stash.
+- Commit steps below are executed only after explicit owner authorization. Without that authorization, stop at the verified diff for each task.
 
 ## File Structure
 
-| File | Responsibility | Model? |
-|---|---|---|
-| `scripts/load_duckdb.py` | Build DuckDB from CSVs using DDL derived from the bundle | no |
-| `src/cerebro/models.py` (modify) | Contract types shared by agent, checker, callers | no |
-| `src/cerebro/selfcheck.py` | Every deterministic gate: containment, warnings, shape, formula, disclosure, engine | no |
-| `src/cerebro/hosted_provider.py` | Hosted `GenerationProvider`, egress guard, cassette replay, scripted double | no |
-| `src/cerebro/text2sql.py` | Two stages, retry budgets, status assembly | yes |
-| `src/cerebro/executor.py` | Read-only DuckDB execution with row cap and timeout | no |
-| `src/cerebro/cli.py` (modify) | `cerebro ask` and `cerebro baseline` | no |
-| `src/cerebro/evaluation.py` (modify) | Golden-set harness producing the baseline artifact | no |
-
-Everything except `text2sql.py` is model-free, and `text2sql.py` is tested against the scripted double. Every task in this plan is therefore testable with no key and no network; exactly two steps in Task 6 make a live call, and both are one-off confirmations.
+| File | Responsibility |
+|---|---|
+| `pyproject.toml` | exact DuckDB/sqlglot pins and existing dependency ranges |
+| `scripts/text2sql_preflight.py` | offline/data/organizer readiness without claiming blocked capabilities |
+| `scripts/load_duckdb.py` | atomic CSV materialization and value-free receipts |
+| `src/cerebro/provenance.py` | canonical question/JSON helpers, content hashes, raw-name to semantic-table namespace helper |
+| `src/cerebro/models.py` | strict scope, snapshot/governed literals, ambiguity, value-free IR, response, budget, lineage, and evidence contracts |
+| `src/cerebro/retrieval.py` | authorization-first retrieval, graph expansion, governed semantic constants, snapshot freeze/hash |
+| `src/cerebro/api.py` | existing advisory `/api/grounding` and MCP metadata retrieval; remains non-executable and never constructs `SQLGenerationRequest` |
+| `src/cerebro/text2sql_provider.py` | consumer-owned generic `Text2SQLGenerationProvider` protocol and `ProviderGeneration[OutputT]` |
+| `src/cerebro/enrichment.py` | existing enrichment-only provider contract; explicitly unchanged and not imported by Text-to-SQL |
+| `src/cerebro/prompting.py` | strict metadata-only envelope construction and membership authorization |
+| `src/cerebro/hosted_provider.py` | internal organizer gateway plus protocol-conforming guarded/cassette/scripted adapters; no enrichment dependency |
+| `src/cerebro/complexity.py` | guarded complex-plan validation and opaque `AcceptedComplexRoute` decision |
+| `src/cerebro/sql_compiler.py` | canonical-question/snapshot literal resolution and deterministic IR-to-parameterized-DuckDB-SQL compilation |
+| `src/cerebro/text2sql_cache.py` | exact scoped cache keys and integrity-checked value-free IR plus original generation route |
+| `src/cerebro/selfcheck.py` | clarification, snapshot/IR shape/type, post-compile AST, metric, warning, lineage, and disclosure gates |
+| `src/cerebro/executor.py` | parameter-aware mandatory `EXPLAIN` and bounded read-only execution |
+| `src/cerebro/text2sql.py` | request budget, generation-route/cache orchestration, gate ordering, and strict response assembly |
+| `src/cerebro/evaluation.py` | trusted-scope/resolver composition, offline reference, and evidence-bound live baseline runners |
+| `src/cerebro/cli.py` | trusted-scope `ask`, explicit `reference`, and explicit `baseline` composition |
+| `tests/test_retrieval_api_mcp.py` | proves grounding-only HTTP/MCP output is advisory and cannot authorize execution |
+| `tests/test_enrichment.py` | unchanged enrichment contract regression; verifies provider decoupling did not alter enrichment |
+| `tests/text2sql_factories.py` | validated scope, canonical question/snapshot, value-free IR, compiled-query, and response builders shared by tests |
 
 ---
 
-### Task 1: Materialize DuckDB from bundle-derived DDL
+### Task 0: Lock compatibility and expose external readiness
 
-Implements FR-700, FR-701. Verifies T-700.
+Implements FR-701, FR-702, FR-703c, FR-724.
 
 **Files:**
-- Create: `scripts/load_duckdb.py`
-- Create: `tests/test_load_duckdb.py`
-- Modify: `config/bank-source.yaml` (the `database_path` value only)
+- Modify: `pyproject.toml`
+- Modify: `src/cerebro/models.py` (receipt models only)
+- Create: `src/cerebro/provenance.py`
+- Create or modify: `scripts/text2sql_preflight.py`
+- Create or modify: `tests/test_text2sql_preflight.py`
 
 **Interfaces:**
-- Consumes: `cerebro.bundle.load_validated_bundle`, `cerebro.models.SemanticBundle`
-- Produces:
-  - `ddl_from_bundle(bundle: SemanticBundle) -> dict[str, str]`
-  - `columns_from_bundle(bundle: SemanticBundle) -> dict[str, list[str]]`
-  - `load_csvs(csv_dir: Path, db_path: Path, bundle: SemanticBundle) -> dict[str, int]`
-  - `class LoadError(RuntimeError)`
+- `canonical_json_bytes(model: BaseModel, *, exclude: set[str] = frozenset()) -> bytes`
+- `sha256_file(path: Path) -> str`
+- `source_manifest_sha256(manifest: SourceManifest) -> str`
+- `manifest_table_id(raw_name: str) -> TableId`
+- `check_preflight(...) -> PreflightReport`
+- `ProviderCapabilityReceipt` records organizer provider/model/revision/schema mechanism and never a credential or response body.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Assert exact dependency versions**
 
-Create `tests/test_load_duckdb.py`:
+Add or update the dependency test:
 
 ```python
-from __future__ import annotations
-
-import csv
-from pathlib import Path
-
-import duckdb
-import pytest
-
-from cerebro.bundle import load_validated_bundle
-from cerebro.paths import DEFAULT_BUNDLE
-from scripts.load_duckdb import LoadError, columns_from_bundle, ddl_from_bundle, load_csvs
-
-SAMPLE = {
-    "BIGINT": "1",
-    "VARCHAR": "x",
-    "DOUBLE": "1.5",
-    "DATE": "2020-01-01",
-}
-
-
-def _write_fixture_csvs(directory: Path, bundle) -> None:
-    """One header row plus one data row per table, driven by the bundle itself."""
-    for table, names in columns_from_bundle(bundle).items():
-        declared = {
-            column["name"]: column["data_type"]
-            for obj in bundle.objects
-            if obj.id == f"table.{table}"
-            for column in obj.cerebro["columns"]
-        }
-        path = directory / f"{table}.csv"
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(names)
-            writer.writerow([SAMPLE[declared[name]] for name in names])
-
-
-def test_ddl_covers_every_declared_table_and_column():
-    bundle = load_validated_bundle(DEFAULT_BUNDLE)
-    ddl = ddl_from_bundle(bundle)
-    assert len(ddl) == 10
-    assert sum(len(names) for names in columns_from_bundle(bundle).values()) == 75
-
-
-def test_load_applies_declared_types_not_inferred_types(tmp_path):
-    bundle = load_validated_bundle(DEFAULT_BUNDLE)
-    _write_fixture_csvs(tmp_path, bundle)
-    db_path = tmp_path / "workshop.duckdb"
-
-    counts = load_csvs(tmp_path, db_path, bundle)
-
-    assert counts["transactions"] == 1
-    connection = duckdb.connect(str(db_path), read_only=True)
-    actual = dict(
-        connection.execute(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_name = 'transactions'"
-        ).fetchall()
-    )
-    connection.close()
-    assert actual["txn_date"] == "DATE"
-    assert actual["amount"] == "DOUBLE"
-
-
-def test_header_divergence_fails_closed(tmp_path):
-    bundle = load_validated_bundle(DEFAULT_BUNDLE)
-    _write_fixture_csvs(tmp_path, bundle)
-    path = tmp_path / "transactions.csv"
-    rows = list(csv.reader(path.open(newline="", encoding="utf-8")))
-    rows[0][0] = "renamed_column"
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        csv.writer(handle).writerows(rows)
-
-    with pytest.raises(LoadError, match="transactions"):
-        load_csvs(tmp_path, tmp_path / "bad.duckdb", bundle)
+def test_text2sql_dependency_versions_are_exact():
+    assert importlib.metadata.version("duckdb") == "1.5.5"
+    assert importlib.metadata.version("sqlglot") == "30.17.0"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+Run:
 
-Run: `python -m pytest tests/test_load_duckdb.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'scripts'`
+```bash
+.venv/bin/python -m pytest tests/test_text2sql_preflight.py::test_text2sql_dependency_versions_are_exact -v
+```
 
-- [ ] **Step 3: Make `scripts` importable**
+Expected: fail until `pyproject.toml` and the environment use the exact pins.
 
-Create `scripts/__init__.py` as an empty file, and add `scripts` to the test path so the module resolves. Modify `pyproject.toml`:
+- [ ] **Step 2: Pin only the required compatibility surface**
+
+Use these entries and preserve the existing MCP 1.x range:
 
 ```toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src", "."]
+"duckdb==1.5.5",
+"sqlglot==30.17.0",
+"mcp>=1.0,<2",
 ```
 
-- [ ] **Step 4: Write minimal implementation**
-
-Create `scripts/load_duckdb.py`:
-
-```python
-"""Build the demo DuckDB from CSVs using DDL derived from the OKF bundle.
-
-Build-time tooling. The bundle is the single source of column names, order, and
-types, so the physical schema cannot drift from the semantic contract.
-"""
-
-from __future__ import annotations
-
-import argparse
-import csv
-from pathlib import Path
-
-import duckdb
-
-from cerebro.bundle import load_validated_bundle
-from cerebro.models import SemanticBundle
-from cerebro.paths import DEFAULT_BUNDLE, ROOT
-
-
-class LoadError(RuntimeError):
-    """Raised when source CSVs diverge from the bundle declaration."""
-
-
-def _tables(bundle: SemanticBundle):
-    for obj in sorted(bundle.objects, key=lambda item: item.id):
-        if obj.type == "table":
-            yield obj.id.split(".", 1)[1], obj.cerebro.get("columns", [])
-
-
-def columns_from_bundle(bundle: SemanticBundle) -> dict[str, list[str]]:
-    return {table: [column["name"] for column in columns] for table, columns in _tables(bundle)}
-
-
-def ddl_from_bundle(bundle: SemanticBundle) -> dict[str, str]:
-    statements = {}
-    for table, columns in _tables(bundle):
-        fields = ", ".join(f'"{column["name"]}" {column["data_type"]}' for column in columns)
-        statements[table] = f'CREATE TABLE "{table}" ({fields})'
-    return statements
-
-
-def load_csvs(csv_dir: Path, db_path: Path, bundle: SemanticBundle) -> dict[str, int]:
-    expected = columns_from_bundle(bundle)
-    statements = ddl_from_bundle(bundle)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    counts: dict[str, int] = {}
-    connection = duckdb.connect(str(db_path))
-    try:
-        for table, statement in statements.items():
-            source = Path(csv_dir) / f"{table}.csv"
-            if not source.is_file():
-                raise LoadError(f"{table}: missing source file {source}")
-            with source.open(newline="", encoding="utf-8") as handle:
-                header = next(csv.reader(handle), [])
-            if header != expected[table]:
-                raise LoadError(
-                    f"{table}: CSV header does not match bundle declaration; "
-                    f"expected {expected[table]}, found {header}"
-                )
-            connection.execute(f'DROP TABLE IF EXISTS "{table}"')
-            connection.execute(statement)
-            connection.execute(
-                f'INSERT INTO "{table}" '
-                "SELECT * FROM read_csv(?, header = true, all_varchar = true)",
-                [str(source)],
-            )
-            counts[table] = connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-    finally:
-        connection.close()
-    return counts
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Materialize the demo DuckDB from CSVs")
-    parser.add_argument("--csv-dir", type=Path, default=ROOT / "archive")
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "workshop.duckdb")
-    args = parser.parse_args(argv)
-    counts = load_csvs(args.csv_dir, args.database, load_validated_bundle(DEFAULT_BUNDLE))
-    for table, rows in counts.items():
-        print(f"{table:<20} {rows:>10,} rows")
-    print(f"total{' ' * 15} {sum(counts.values()):>10,} rows -> {args.database}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-Reading every column as `VARCHAR` and letting `INSERT` cast into the declared
-types is deliberate: it makes the bundle's declaration authoritative rather
-than DuckDB's inference, which is the whole point of FR-700.
-
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `python -m pytest tests/test_load_duckdb.py -v`
-Expected: 3 passed
-
-- [ ] **Step 6: Load the real data and confirm counts**
-
-Run: `python scripts/load_duckdb.py`
-Expected output ends with `total 5,868,950 rows`, made up of:
-
-```
-accounts             95,000     branches            150      cards              65,000
-card_transactions 3,000,000     customers        60,000      employees           1,800
-loan_payments       600,000     loans            22,000      support_tickets    25,000
-transactions      2,000,000
-```
-
-If any count differs, stop: the CSVs are not the set this plan was written against.
-
-- [ ] **Step 7: Point the config at the local database**
-
-Modify `config/bank-source.yaml`, changing only the `database_path` value to `data/workshop.duckdb`. Leave `expected_table_count`, `expected_column_count`, relationships, and rules untouched.
-
-- [ ] **Step 8: Verify the existing scan contract still holds**
-
-Run: `python -m pytest tests/ -v`
-Expected: all tests pass, including the previously unrunnable `test_upstream_and_source.py` which needs a real database.
-
-- [ ] **Step 9: Commit**
+Run:
 
 ```bash
-git add scripts/__init__.py scripts/load_duckdb.py tests/test_load_duckdb.py pyproject.toml config/bank-source.yaml
-git commit -m "feat: materialize DuckDB from bundle-derived DDL"
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -c 'import duckdb, sqlglot; print(duckdb.__version__, sqlglot.__version__)'
+```
+
+Expected: `1.5.5 30.17.0`.
+
+- [ ] **Step 3: Write readiness tests that distinguish offline, data, and organizer gates**
+
+```python
+def test_missing_live_inputs_block_live_but_not_offline(tmp_path):
+    report = check_preflight(
+        csv_dir=tmp_path / "archive",
+        manifest_path=None,
+        bundle_path=None,
+        environ={},
+        database_path=None,
+        materialization_receipt_path=None,
+        provider_capability_receipt_path=None,
+    )
+    assert report.offline_ready is True
+    assert report.live_prerequisites_ready is False
+    assert {item.code for item in report.blockers} == {
+        "missing_api_key",
+        "missing_model",
+        "missing_provider_capability",
+        "missing_data_manifest",
+        "missing_bundle",
+        "missing_csv_directory",
+        "missing_materialization_receipt",
+    }
+```
+
+Run: `.venv/bin/python -m pytest tests/test_text2sql_preflight.py -v`
+
+Expected: fail until typed readiness reporting exists.
+
+- [ ] **Step 4: Implement canonical evidence helpers and sanitized preflight**
+
+Use canonical JSON with sorted keys, UTF-8, `ensure_ascii=False`, and separators `(",", ":")`. `SourceManifest.tables` keeps raw bundle names; receipt tables use `table.<name>` only through `manifest_table_id`. Preflight checks existence and hash identity without printing path contents, keys, headers, prompts, or response bodies.
+
+- [ ] **Step 5: Verify local blocked state honestly**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_text2sql_preflight.py -v
+.venv/bin/python scripts/text2sql_preflight.py
+```
+
+Expected locally: tests pass; command reports offline ready and names missing live prerequisites without exposing secrets.
+
+- [ ] **Step 6: Commit only if authorized**
+
+```bash
+git add pyproject.toml src/cerebro/models.py src/cerebro/provenance.py scripts/text2sql_preflight.py tests/test_text2sql_preflight.py
+git commit -m "chore: lock text-to-sql runtime prerequisites"
 ```
 
 ---
 
-### Task 2: Contract types
+### Task 1: Preserve atomic DuckDB materialization
 
-Implements FR-704 to FR-708 type surface. Verifies T-702.
-
-**Files:**
-- Modify: `src/cerebro/models.py` (append after `GroundingResponse`)
-- Create: `tests/test_text2sql_contract.py`
-
-**Interfaces:**
-- Consumes: `GroundingResponse` from Task 0 baseline (already in the repo)
-- Produces: `QueryPlan`, `CheckViolation`, `ViolationCode`, `QueryResult`, `SQLGenerationRequest`, `SQLGenerationResponse`
-
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/test_text2sql_contract.py`:
-
-```python
-from __future__ import annotations
-
-import pytest
-from pydantic import ValidationError
-
-from cerebro.models import (
-    CheckViolation,
-    QueryPlan,
-    QueryResult,
-    SQLGenerationRequest,
-    SQLGenerationResponse,
-)
-
-
-def _plan() -> QueryPlan:
-    return QueryPlan(
-        intent="fraud rate by card type",
-        grain="one row per card type",
-        tables=["table.card_transactions", "table.cards"],
-        columns=["card_type", "is_fraud"],
-        metric_ids=["metric.card-fraud-rate"],
-        joins=["relationship.card_transaction_card"],
-        group_by=["card_type"],
-        warnings_addressed=["Use card transaction grain; do not mix directly with account transactions."],
-    )
-
-
-def test_ok_response_carries_plan_and_result():
-    response = SQLGenerationResponse(
-        status="ok",
-        semantic_version="0.1.0",
-        dialect="duckdb",
-        sql="SELECT 1",
-        plan=_plan(),
-        result=QueryResult(
-            columns=["card_type"],
-            column_types=["VARCHAR"],
-            rows=[["Debit"]],
-            row_count=1,
-            truncated=False,
-            elapsed_ms=3,
-        ),
-        used_grounding_ids=["table.cards"],
-    )
-    assert response.result.row_count == 1
-    assert response.violations == []
-
-
-def test_refused_response_names_unmet_needs_and_emits_no_sql():
-    response = SQLGenerationResponse(
-        status="refused",
-        semantic_version="0.1.0",
-        dialect="duckdb",
-        unmet_needs=["no ATM entity in the bundle"],
-    )
-    assert response.sql == ""
-    assert response.plan is None
-    assert response.result is None
-
-
-def test_check_failed_response_carries_violations():
-    response = SQLGenerationResponse(
-        status="check_failed",
-        semantic_version="0.1.0",
-        dialect="duckdb",
-        sql="SELECT * FROM atms",
-        violations=[CheckViolation(code="unknown_table", message="atms", subject="atms")],
-    )
-    assert response.violations[0].code == "unknown_table"
-    assert response.result is None
-
-
-def test_unknown_violation_code_is_rejected():
-    with pytest.raises(ValidationError):
-        CheckViolation(code="totally_made_up", message="nope")
-
-
-def test_request_defaults_to_duckdb_and_a_row_cap():
-    request = SQLGenerationRequest.model_construct(question="q", grounding=None)
-    assert request.dialect == "duckdb"
-    assert request.max_rows == 1000
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_text2sql_contract.py -v`
-Expected: FAIL with `ImportError: cannot import name 'CheckViolation'`
-
-- [ ] **Step 3: Write minimal implementation**
-
-Append to `src/cerebro/models.py`:
-
-```python
-ViolationCode = Literal[
-    "unknown_table",
-    "unknown_column",
-    "undeclared_join",
-    "unknown_metric",
-    "formula_not_verbatim",
-    "unaddressed_warning",
-    "unbounded_sensitive_projection",
-    "non_select_statement",
-    "explain_failed",
-    "execution_error",
-    "unparsable_sql",
-    "unparsable_plan",
-]
-
-
-class CheckViolation(BaseModel):
-    code: ViolationCode
-    message: str
-    subject: str = ""
-
-
-class QueryPlan(BaseModel):
-    intent: str
-    grain: str
-    tables: list[str]
-    columns: list[str]
-    metric_ids: list[str] = Field(default_factory=list)
-    joins: list[str] = Field(default_factory=list)
-    filters: list[str] = Field(default_factory=list)
-    group_by: list[str] = Field(default_factory=list)
-    order_by: list[str] = Field(default_factory=list)
-    row_limit: int | None = None
-    warnings_addressed: list[str] = Field(default_factory=list)
-
-
-class QueryResult(BaseModel):
-    columns: list[str]
-    column_types: list[str]
-    rows: list[list[Any]]
-    row_count: int
-    truncated: bool
-    elapsed_ms: int
-
-
-class SQLGenerationRequest(BaseModel):
-    question: str
-    grounding: GroundingResponse
-    dialect: Literal["duckdb"] = "duckdb"
-    max_rows: int = 1000
-
-
-class SQLGenerationResponse(BaseModel):
-    status: Literal["ok", "check_failed", "refused"]
-    semantic_version: str
-    dialect: str
-    sql: str = ""
-    plan: QueryPlan | None = None
-    result: QueryResult | None = None
-    violations: list[CheckViolation] = Field(default_factory=list)
-    assumptions: list[str] = Field(default_factory=list)
-    unmet_needs: list[str] = Field(default_factory=list)
-    used_grounding_ids: list[str] = Field(default_factory=list)
-    attempts: int = 1
-    provider: str = ""
-    model: str = ""
-```
-
-`Any` and `Literal` are already imported at the top of `models.py`; no import change is needed.
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `python -m pytest tests/test_text2sql_contract.py -v`
-Expected: 5 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/cerebro/models.py tests/test_text2sql_contract.py
-git commit -m "feat: add text-to-sql contract types"
-```
-
----
-
-### Task 3: Plan containment and warning coverage checks
-
-Implements FR-709, FR-710. Verifies T-703, T-704.
+Implements FR-700, FR-701, AC-712.
 
 **Files:**
-- Create: `src/cerebro/selfcheck.py`
-- Create: `tests/test_selfcheck_plan.py`
+- Modify: `scripts/load_duckdb.py`
+- Modify: `tests/test_load_duckdb.py`
 
 **Interfaces:**
-- Consumes: `QueryPlan`, `CheckViolation`, `GroundingResponse` from Task 2
-- Produces:
-  - `check_plan(plan: QueryPlan, grounding: GroundingResponse) -> list[CheckViolation]`
-  - `grounding_index(grounding: GroundingResponse) -> GroundingIndex`
-  - `class GroundingIndex` with attributes `tables: set[str]`, `columns: set[str]`, `joins: set[str]`, `metrics: set[str]`, `warnings_by_object: dict[str, list[str]]`, `sensitive: dict[str, str]`
+- `preflight_csvs(csv_dir, bundle, manifest) -> SourceInventory`
+- `load_csvs(csv_dir, db_path, bundle, manifest, receipt_dir=None) -> tuple[MaterializationReceipt, Path]`
+- `_load_table(connection, source_file, ddl) -> int` remains injectable for rollback tests.
 
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/test_selfcheck_plan.py`:
+- [ ] **Step 1: Add a late-failure preservation test**
 
 ```python
-from __future__ import annotations
-
-import pytest
-
-from cerebro.bundle import load_validated_bundle
-from cerebro.models import QueryPlan
-from cerebro.paths import DEFAULT_BUNDLE
-from cerebro.retrieval import SemanticRetriever
-from cerebro.selfcheck import check_plan, grounding_index
-
-
-@pytest.fixture(scope="module")
-def grounding():
-    retriever = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE))
-    return retriever.grounding("what is the fraud rate by card type")
-
-
-def _valid_plan(grounding) -> QueryPlan:
-    index = grounding_index(grounding)
-    warnings = index.warnings_by_object["table.card_transactions"] + index.warnings_by_object["metric.card-fraud-rate"]
-    return QueryPlan(
-        intent="fraud rate by card type",
-        grain="one row per card type",
-        tables=["table.card_transactions", "table.cards"],
-        columns=["is_fraud", "card_type"],
-        metric_ids=["metric.card-fraud-rate"],
-        joins=["relationship.card_transaction_card"],
-        group_by=["card_type"],
-        warnings_addressed=warnings,
-    )
-
-
-def test_valid_plan_has_no_violations(grounding):
-    assert check_plan(_valid_plan(grounding), grounding) == []
-
-
-@pytest.mark.parametrize(
-    "field, value, code",
-    [
-        ("tables", ["table.atms"], "unknown_table"),
-        ("columns", ["atm_serial"], "unknown_column"),
-        ("joins", ["relationship.card_atm"], "undeclared_join"),
-        ("metric_ids", ["metric.atm-uptime"], "unknown_metric"),
-    ],
-)
-def test_absent_objects_raise_matching_codes(grounding, field, value, code):
-    plan = _valid_plan(grounding).model_copy(update={field: value})
-    codes = {violation.code for violation in check_plan(plan, grounding)}
-    assert code in codes
-
-
-def test_missing_warning_coverage_is_reported(grounding):
-    plan = _valid_plan(grounding).model_copy(update={"warnings_addressed": []})
-    violations = check_plan(plan, grounding)
-    assert any(violation.code == "unaddressed_warning" for violation in violations)
-
-
-def test_warning_violation_names_the_owning_object(grounding):
-    plan = _valid_plan(grounding).model_copy(update={"warnings_addressed": []})
-    subjects = {v.subject for v in check_plan(plan, grounding) if v.code == "unaddressed_warning"}
-    assert "table.card_transactions" in subjects
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_selfcheck_plan.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'cerebro.selfcheck'`
-
-- [ ] **Step 3: Write minimal implementation**
-
-Create `src/cerebro/selfcheck.py`:
-
-```python
-"""Deterministic gates between the model and the database.
-
-No function in this module calls a model. Every check is a pure function of a
-plan, a SQL string, or a grounding packet, so the whole gate is testable with
-fixtures and no provider running.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-
-from .models import CheckViolation, GroundingResponse, QueryPlan
-
-SENSITIVE_TIERS = ("restricted", "confidential")
-
-
-@dataclass
-class GroundingIndex:
-    tables: set[str] = field(default_factory=set)
-    columns: set[str] = field(default_factory=set)
-    joins: set[str] = field(default_factory=set)
-    metrics: set[str] = field(default_factory=set)
-    warnings_by_object: dict[str, list[str]] = field(default_factory=dict)
-    sensitive: dict[str, str] = field(default_factory=dict)
-
-
-def grounding_index(grounding: GroundingResponse) -> GroundingIndex:
-    index = GroundingIndex()
-    for entry in grounding.tables:
-        index.tables.add(entry["id"])
-        cerebro = entry.get("cerebro", {})
-        index.warnings_by_object[entry["id"]] = [str(w) for w in cerebro.get("warnings", [])]
-        for column in cerebro.get("columns", []):
-            index.columns.add(column["name"])
-            if column.get("classification") in SENSITIVE_TIERS:
-                index.sensitive[column["name"]] = column["classification"]
-    for entry in grounding.joins:
-        index.joins.add(entry["id"])
-        index.warnings_by_object[entry["id"]] = [str(w) for w in entry.get("warnings", [])]
-    for entry in grounding.metrics:
-        index.metrics.add(entry["id"])
-        index.warnings_by_object[entry["id"]] = [str(w) for w in entry.get("warnings", [])]
-    for entry in grounding.concepts:
-        cerebro = entry.get("cerebro", {})
-        index.warnings_by_object[entry["id"]] = [str(w) for w in cerebro.get("warnings", [])]
-    return index
-
-
-def check_plan(plan: QueryPlan, grounding: GroundingResponse) -> list[CheckViolation]:
-    index = grounding_index(grounding)
-    violations: list[CheckViolation] = []
-
-    for name, declared, allowed, code in (
-        ("tables", plan.tables, index.tables, "unknown_table"),
-        ("columns", plan.columns, index.columns, "unknown_column"),
-        ("joins", plan.joins, index.joins, "undeclared_join"),
-        ("metric_ids", plan.metric_ids, index.metrics, "unknown_metric"),
-    ):
-        for value in declared:
-            if value not in allowed:
-                violations.append(
-                    CheckViolation(
-                        code=code,
-                        message=f"plan.{name} references {value!r}, absent from the grounding packet",
-                        subject=value,
-                    )
-                )
-
-    addressed = set(plan.warnings_addressed)
-    for object_id in list(plan.tables) + list(plan.joins) + list(plan.metric_ids):
-        for warning in index.warnings_by_object.get(object_id, []):
-            if warning not in addressed:
-                violations.append(
-                    CheckViolation(
-                        code="unaddressed_warning",
-                        message=f"{object_id} carries an unaddressed warning: {warning}",
-                        subject=object_id,
-                    )
-                )
-    return violations
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `python -m pytest tests/test_selfcheck_plan.py -v`
-Expected: 7 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/cerebro/selfcheck.py tests/test_selfcheck_plan.py
-git commit -m "feat: add plan containment and warning coverage checks"
-```
-
----
-
-### Task 4: Statement shape, verbatim formula, and bounded disclosure
-
-Implements FR-711, FR-712, FR-713. Verifies T-705, T-706, T-707.
-
-**Files:**
-- Modify: `src/cerebro/selfcheck.py` (append)
-- Modify: `pyproject.toml` (add `sqlglot`)
-- Create: `tests/test_selfcheck_sql.py`
-
-**Interfaces:**
-- Consumes: `grounding_index`, `GroundingIndex` from Task 3
-- Produces:
-  - `check_sql(sql: str, plan: QueryPlan, grounding: GroundingResponse, disclosure_cap: int = 50) -> list[CheckViolation]`
-  - `normalize_expression(expression_sql: str) -> str`
-
-- [ ] **Step 1: Add the parser dependency**
-
-Modify `pyproject.toml`, inserting `"sqlglot>=25.0",` into `dependencies` in alphabetical position after `"pyyaml>=6.0",`. Then run:
-
-```bash
-python -m pip install -e '.[dev]'
-```
-
-- [ ] **Step 2: Write the failing test**
-
-Create `tests/test_selfcheck_sql.py`:
-
-```python
-from __future__ import annotations
-
-import pytest
-
-from cerebro.bundle import load_validated_bundle
-from cerebro.models import QueryPlan
-from cerebro.paths import DEFAULT_BUNDLE
-from cerebro.retrieval import SemanticRetriever
-from cerebro.selfcheck import check_sql
-
-FORMULA = "100.0 * SUM(card_transactions.is_fraud) / NULLIF(COUNT(*), 0)"
-
-
-@pytest.fixture(scope="module")
-def grounding():
-    return SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE)).grounding("what is the fraud rate by card type")
-
-
-@pytest.fixture
-def plan():
-    return QueryPlan(
-        intent="fraud rate by card type",
-        grain="one row per card type",
-        tables=["table.card_transactions"],
-        columns=["is_fraud"],
-        metric_ids=["metric.card-fraud-rate"],
-    )
-
-
-def _codes(sql, plan, grounding, **kwargs):
-    return {v.code for v in check_sql(sql, plan, grounding, **kwargs)}
-
-
-def test_unaliased_formula_passes(plan, grounding):
-    sql = f"SELECT {FORMULA} AS fraud_rate FROM card_transactions"
-    assert "formula_not_verbatim" not in _codes(sql, plan, grounding)
-
-
-def test_aliased_table_still_matches_by_ast(plan, grounding):
-    sql = "SELECT 100.0 * SUM(ct.is_fraud) / NULLIF(COUNT(*), 0) AS r FROM card_transactions AS ct"
-    assert "formula_not_verbatim" not in _codes(sql, plan, grounding)
-
-
-def test_altered_formula_is_rejected(plan, grounding):
-    sql = "SELECT 100.0 * SUM(ct.is_fraud) / COUNT(*) AS r FROM card_transactions AS ct"
-    assert "formula_not_verbatim" in _codes(sql, plan, grounding)
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "SELECT 1; SELECT 2",
-        "DROP TABLE customers",
-        "UPDATE customers SET name = 'x'",
-        "PRAGMA database_list",
-    ],
-)
-def test_non_select_and_multi_statement_rejected(sql, plan, grounding):
-    assert "non_select_statement" in _codes(sql, plan, grounding)
-
-
-def test_unparsable_sql_is_reported(plan, grounding):
-    assert "unparsable_sql" in _codes("SELECT FROM WHERE ((", plan, grounding)
-
-
-def test_restricted_column_needs_a_bounded_limit(grounding):
-    bare = QueryPlan(intent="i", grain="g", tables=["table.customers"], columns=["name"])
-    accepted = "SELECT name FROM customers ORDER BY annual_income DESC LIMIT 5"
-    unbounded = "SELECT name FROM customers"
-    too_wide = "SELECT name FROM customers LIMIT 1000"
-
-    assert "unbounded_sensitive_projection" not in _codes(accepted, bare, grounding)
-    assert "unbounded_sensitive_projection" in _codes(unbounded, bare, grounding)
-    assert "unbounded_sensitive_projection" in _codes(too_wide, bare, grounding)
-
-
-def test_aggregated_confidential_column_needs_no_limit(grounding):
-    bare = QueryPlan(intent="i", grain="g", tables=["table.customers"], columns=["annual_income"])
-    sql = "SELECT AVG(annual_income) AS mean_income FROM customers"
-    assert "unbounded_sensitive_projection" not in _codes(sql, bare, grounding)
-```
-
-One fixture is enough for all of these. The packet retrieved for the card
-question has been verified to contain eight tables including `table.customers`,
-so `name` (restricted) and `annual_income` (confidential) are both in its
-sensitive set. One-hop graph expansion is why the packet is broader than the
-question: `concept.card-fraud` and `concept.active-customer` pull customer
-tables in. Do not narrow the fixture to make the test simpler; the breadth is
-the real runtime condition.
-
-Note that `check_sql` deliberately does not verify that a projected column
-belongs to a table in the plan. That containment is Task 3's job (FR-709), and
-duplicating it here would put the same rule in two places.
-
-- [ ] **Step 3: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_selfcheck_sql.py -v`
-Expected: FAIL with `ImportError: cannot import name 'check_sql'`
-
-- [ ] **Step 4: Write minimal implementation**
-
-Append to `src/cerebro/selfcheck.py`:
-
-```python
-import sqlglot
-from sqlglot import exp
-
-DIALECT = "duckdb"
-
-
-def normalize_expression(expression_sql: str) -> str:
-    """Render an expression with table qualifiers stripped, so aliases cannot defeat comparison."""
-    tree = sqlglot.parse_one(expression_sql, read=DIALECT)
-    for column in tree.find_all(exp.Column):
-        column.set("table", None)
-    return tree.sql(dialect=DIALECT).lower()
-
-
-def _projections(statement: exp.Expression):
-    for select in statement.find_all(exp.Select):
-        for projection in select.expressions:
-            yield projection.this if isinstance(projection, exp.Alias) else projection
-
-
-def _row_limit(statement: exp.Expression) -> int | None:
-    limit = statement.args.get("limit")
-    if limit is None:
-        return None
-    try:
-        return int(limit.expression.name)
-    except (AttributeError, ValueError):
-        return None
-
-
-def check_sql(
-    sql: str,
-    plan: QueryPlan,
-    grounding: GroundingResponse,
-    disclosure_cap: int = 50,
-) -> list[CheckViolation]:
-    try:
-        statements = sqlglot.parse(sql, read=DIALECT)
-    except Exception as exc:
-        return [CheckViolation(code="unparsable_sql", message=str(exc))]
-    statements = [item for item in statements if item is not None]
-    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
-        return [
-            CheckViolation(
-                code="non_select_statement",
-                message="exactly one SELECT statement is required",
-            )
-        ]
-
-    statement = statements[0]
-    index = grounding_index(grounding)
-    violations: list[CheckViolation] = []
-
-    rendered = {normalize_expression(node.sql(dialect=DIALECT)) for node in _projections(statement)}
-    formulas = {entry["id"]: entry.get("formula") for entry in grounding.metrics}
-    for metric_id in plan.metric_ids:
-        formula = formulas.get(metric_id)
-        if not formula:
-            continue
-        if normalize_expression(formula) not in rendered:
-            violations.append(
-                CheckViolation(
-                    code="formula_not_verbatim",
-                    message=f"governed formula for {metric_id} is absent from the projection",
-                    subject=metric_id,
-                )
-            )
-
-    disclosed = set()
-    for node in _projections(statement):
-        if isinstance(node, exp.AggFunc) or node.find(exp.AggFunc) is not None:
-            continue
-        for column in node.find_all(exp.Column):
-            if column.name in index.sensitive:
-                disclosed.add(column.name)
-    if disclosed:
-        limit = _row_limit(statement)
-        if limit is None or limit > disclosure_cap:
-            violations.append(
-                CheckViolation(
-                    code="unbounded_sensitive_projection",
-                    message=(
-                        f"projection discloses {sorted(disclosed)} with "
-                        f"{'no row limit' if limit is None else f'limit {limit}'}; "
-                        f"cap is {disclosure_cap}"
-                    ),
-                    subject=",".join(sorted(disclosed)),
-                )
-            )
-    return violations
-```
-
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `python -m pytest tests/test_selfcheck_sql.py -v`
-Expected: 10 passed
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add pyproject.toml src/cerebro/selfcheck.py tests/test_selfcheck_sql.py
-git commit -m "feat: add statement shape, formula AST, and disclosure checks"
-```
-
----
-
-### Task 5: Engine validation before execution
-
-Implements FR-714. Verifies T-709.
-
-**Files:**
-- Modify: `src/cerebro/selfcheck.py` (append)
-- Create: `tests/test_selfcheck_engine.py`
-
-**Interfaces:**
-- Produces: `check_engine(sql: str, connection) -> list[CheckViolation]`
-
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/test_selfcheck_engine.py`:
-
-```python
-from __future__ import annotations
-
-import duckdb
-import pytest
-
-from cerebro.selfcheck import check_engine
-
-
-@pytest.fixture
-def connection():
-    con = duckdb.connect(":memory:")
-    con.execute("CREATE TABLE t (a BIGINT, b VARCHAR)")
-    con.execute("INSERT INTO t VALUES (1, 'x')")
-    yield con
+def test_late_load_failure_preserves_existing_database(tmp_path, bundle, monkeypatch):
+    target = tmp_path / "workshop.duckdb"
+    con = duckdb.connect(str(target))
+    con.execute("CREATE TABLE sentinel(value INTEGER)")
+    con.execute("INSERT INTO sentinel VALUES (7)")
     con.close()
+    before = target.read_bytes()
 
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    import scripts.load_duckdb as loader
+    real = loader._load_table
+    calls = {"count": 0}
 
-def test_valid_sql_passes(connection):
-    assert check_engine("SELECT a FROM t", connection) == []
+    def fail_on_fifth(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 5:
+            raise loader.LoadError("injected late failure")
+        return real(*args, **kwargs)
 
+    monkeypatch.setattr(loader, "_load_table", fail_on_fifth)
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
 
-def test_unknown_column_reports_explain_failed(connection):
-    violations = check_engine("SELECT nope FROM t", connection)
-    assert [v.code for v in violations] == ["explain_failed"]
-
-
-def test_unknown_table_reports_explain_failed(connection):
-    assert [v.code for v in check_engine("SELECT a FROM missing", connection)] == ["explain_failed"]
-
-
-def test_explain_returns_no_rows_from_the_table(connection):
-    check_engine("SELECT a FROM t", connection)
-    assert connection.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+    assert target.read_bytes() == before
+    assert not list(tmp_path.glob(".workshop.duckdb.*.tmp"))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+Run: `.venv/bin/python -m pytest tests/test_load_duckdb.py -v`
 
-Run: `python -m pytest tests/test_selfcheck_engine.py -v`
-Expected: FAIL with `ImportError: cannot import name 'check_engine'`
+Expected: fail if loading mutates the target table-by-table.
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 2: Preflight every file before opening the target**
 
-Append to `src/cerebro/selfcheck.py`:
+Require exact file set, header order, declared casts, row counts, and configured hashes. Produce immutable `SourceInventory`; the mutation phase accepts only that inventory.
 
-```python
-def check_engine(sql: str, connection) -> list[CheckViolation]:
-    """Ask the engine to bind the query without returning data."""
-    try:
-        connection.execute(f"EXPLAIN {sql}")
-    except Exception as exc:
-        return [CheckViolation(code="explain_failed", message=str(exc).strip().splitlines()[0])]
-    return []
-```
+- [ ] **Step 3: Build in a temporary database and atomically replace**
 
-- [ ] **Step 4: Run tests to verify they pass**
+Create the temporary database in the target directory, load in one transaction, verify schema/counts, close, hash, write a content-addressed receipt, then call `os.replace`. On any failure, remove only temporary outputs and leave an existing target unchanged.
 
-Run: `python -m pytest tests/test_selfcheck_engine.py -v`
-Expected: 4 passed
+- [ ] **Step 4: Verify materialization regressions**
 
-- [ ] **Step 5: Commit**
+Run:
 
 ```bash
-git add src/cerebro/selfcheck.py tests/test_selfcheck_engine.py
-git commit -m "feat: validate SQL against the engine before execution"
+.venv/bin/python -m pytest tests/test_load_duckdb.py -v
+.venv/bin/python -m pytest tests/test_upstream_and_source.py -v
+```
+
+Expected: pass with synthetic fixtures. Report real-data-only checks as blocked when authoritative inputs are absent; never turn them into skips.
+
+- [ ] **Step 5: Commit only if authorized**
+
+```bash
+git add scripts/load_duckdb.py tests/test_load_duckdb.py
+git commit -m "fix: materialize DuckDB atomically"
 ```
 
 ---
 
-### Task 6: Hosted provider, transport policy, and offline replay
+### Task 2: Replace plan/SQL contracts with strict snapshot, ambiguity, and value-free relational IR contracts
 
-Implements FR-702, FR-703, FR-703a, FR-703b, FR-703c. Verifies T-701, T-718, T-719, T-720.
+Implements FR-704–FR-708, FR-715–FR-717, AC-713, AC-714.
 
 **Files:**
-- Create: `src/cerebro/hosted_provider.py`
-- Create: `tests/test_hosted_provider.py`
-- Modify: `.env.example` (create if absent)
+- Modify: `src/cerebro/models.py`
+- Rewrite: `tests/test_text2sql_contract.py`
+- Create: `tests/text2sql_factories.py`
 
 **Interfaces:**
-- Consumes: `GenerationProvider`, `OutputT` from `cerebro.enrichment`
-- Produces:
-  - `class HostedProvider(GenerationProvider)` with `name = "hosted"`, `generate(schema_name, prompt, output_model)`
-  - `class ProviderUnavailable(RuntimeError)`
-  - `class ScriptedProvider(GenerationProvider)` taking `responses: list[BaseModel | Exception]`, exposing `calls: list[tuple[str, str]]`
-  - `class EgressGuard(GenerationProvider)` wrapping a provider with a forbidden-substring policy
-  - `class CassetteProvider(GenerationProvider)` recording to and replaying from a JSONL fixture
-  - `provider_from_environment() -> GenerationProvider | None`
+- Set `TEXT2SQL_CONTRACT_VERSION = "008.v3"`, `GROUNDING_SNAPSHOT_VERSION = "008.grounding.v1"`, `RELATIONAL_IR_VERSION = "008.ir.v1"`, `QUESTION_CANONICALIZATION_VERSION = "008.question.v1"`, `LITERAL_SPAN_REGISTRY_VERSION = "008.literal-span.v1"`, and `EXPRESSION_TYPE_REGISTRY_VERSION = "008.types.v1"`.
+- Define `GenerationRoute = Literal["default_ir", "planned_ir"]`; never include `"cache"`.
+- Add strict/frozen `AuthorizationScope`, `GroundingSnapshot`, `SnapshotColumn(data_type=ScalarType)`, `SnapshotMetadataObject.metric_result_type`, `SnapshotGovernedLiteral`, `QuestionLiteralRef`, `GovernedLiteralRef`, all value-free IR expression/node variants including relative-time/limit literal refs, `RelationalQueryIR` without free-form `intent`, `ValidatedIR(generation_route=...)`, `ComplexQueryPlan`, non-Pydantic/non-wire `AcceptedComplexRoute`, `GroundingRefusal`, strict `AmbiguityCandidate` variants, `Ambiguity`, `ClarificationRequest`, value-free local `LiteralClarificationNeed`, `IRGenerationOutcome`, internal `CompiledQuery`, value-free public `SQLArtifact`, exact-default `BudgetLimits`, and `BudgetUsage`.
+- `models.py` owns the module-private accepted-route constructor token/factory; direct construction with any caller token fails. Task 5 permits only `ComplexityRouter` to invoke that factory after validating a plan. `GuardedGenerationRequest` is a frozen local dataclass rather than a Pydantic/wire model, so dictionaries and provider payloads cannot carry route authority.
+- `IRGenerationOutcome` is discriminated across `RelationalQueryIR | ComplexQueryPlan | GroundingRefusal | ClarificationRequest`.
+- Replace response `plan` with `ir` and model-written SQL candidate with local `sql_artifact`; `ResponseBase` carries `ir_contract_version`, `type_registry_version`, `prompt_version`, `router_version`, `compiler_version`, and `checker_version`, `ResponseBase.generation_route` is `GenerationRoute | Literal["none"]`, `OkResponse` requires `GenerationRoute`, and `cache_status` independently carries `disabled | miss | hit`.
+- `CompiledQuery.parameters` remain internal and `BoundParameter.value` is excluded from serialization. Cached/public IR, assumptions, traces, and evidence contain refs only, never resolved values.
+- `AttemptRecord.stage` accepts `snapshot`, `cache`, `default_ir`, `clarification`, `complexity`, `planned_ir`, `literal_resolution`, `compile`, `ast_check`, `engine_validation`, and `execution` plus `provider_transport`.
+- Retain typed warning refs, disclosures, lineage, materialization, and live evidence contracts; change every SQL-bound physical operand in direction/status/grain/snapshot assumptions to `LiteralRef`.
 
-**Assumption to confirm before starting:** the organizer key is used against an
-OpenAI-compatible `/chat/completions` endpoint supporting
-`response_format={"type": "json_schema", ...}`. That covers OpenAI, Azure,
-OpenRouter, Groq, Together, and vLLM gateways. If the organizers hand you a
-native Anthropic or Gemini endpoint instead, only `HostedProvider.generate`
-changes; every other class, every test, and every later task stay as written.
-Record whichever you got in `config/provider.yaml` and note it in the task log.
-
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/test_hosted_provider.py`:
+- [ ] **Step 1: Write illegal-state contract tests**
 
 ```python
-from __future__ import annotations
-
-import json
-from pathlib import Path
-
-import httpx
-import pytest
-
-from cerebro.hosted_provider import (
-    CassetteProvider,
-    EgressGuard,
-    HostedProvider,
-    ProviderUnavailable,
-    ScriptedProvider,
-)
-from cerebro.models import QueryPlan
-
-PLAN = QueryPlan(intent="i", grain="g", tables=["table.cards"], columns=["card_type"])
+def test_ok_requires_concrete_generation_route_and_independent_cache_status(valid_response_base):
+    payload = {
+        **valid_response_base,
+        "status": "ok",
+        "generation_route": "none",
+        "cache_status": "hit",
+    }
+    with pytest.raises(ValidationError):
+        TypeAdapter(SQLGenerationResponse).validate_python(payload)
 
 
-def _client(handler) -> httpx.Client:
-    return httpx.Client(
-        transport=httpx.MockTransport(handler),
-        base_url="https://provider.example/v1",
+def test_cache_is_never_a_generation_route(valid_response_base):
+    with pytest.raises(ValidationError):
+        TypeAdapter(SQLGenerationResponse).validate_python({
+            **valid_response_base,
+            "status": "ok",
+            "generation_route": "cache",
+            "cache_status": "hit",
+        })
+
+
+def test_provider_outcome_schema_has_no_sql_value_or_free_form_intent():
+    schema = json.dumps(TypeAdapter(IRGenerationOutcome).json_schema(), sort_keys=True)
+    assert '"sql"' not in schema
+    assert '"intent"' not in schema
+    assert '"value"' not in json.dumps(LiteralExpression.model_json_schema(), sort_keys=True)
+
+
+def test_literal_expression_rejects_embedded_value():
+    with pytest.raises(ValidationError):
+        LiteralExpression.model_validate({
+            "kind": "literal", "value": "London", "data_type": "string"
+        })
+
+
+def test_clarification_contract_has_only_spans_and_typed_candidates():
+    schema = json.dumps(ClarificationRequest.model_json_schema(), sort_keys=True)
+    for forbidden in ('"message"', '"reasoning"', '"description"', '"raw_value"'):
+        assert forbidden not in schema
+    with pytest.raises(ValidationError):
+        ClarificationRequest.model_validate({
+            "outcome": "clarification_request",
+            "ambiguities": [{
+                "ambiguity_id": "target",
+                "start": 0,
+                "end": 6,
+                "candidates": [{"kind": "object", "object_id": "table.accounts"}],
+                "message": "Which one?",
+            }],
+        })
+
+
+def test_local_literal_clarification_is_typed_and_value_free(valid_response_base):
+    response = RefusedResponse.model_validate({
+        **valid_response_base,
+        "status": "refused",
+        "reason": "clarification_required",
+        "ambiguities": [],
+        "literal_needs": [{
+            "kind": "literal_need",
+            "issue": "unparseable_question_literal",
+            "expected_type": "integer",
+            "target_column": None,
+            "literal_ref": {"kind": "question", "start": 10, "end": 14, "data_type": "integer"},
+        }],
+    })
+    serialized = response.model_dump_json()
+    assert '"literal_needs"' in serialized
+    assert '"value"' not in serialized
+
+
+def test_bound_parameter_value_never_serializes():
+    parameter = BoundParameter(position=1, data_type="string", value="private")
+    assert "private" not in parameter.model_dump_json()
+
+
+def test_budget_contract_defaults_are_exact():
+    limits = BudgetLimits.defaults()
+    assert limits.initial_semantic_call_capacity == 1
+    assert limits.planned_semantic_call_capacity == 2
+    assert limits.max_transport_attempts_per_semantic_call == 2
+    assert limits.provider_timeout_ms_per_attempt == 20_000
+    assert limits.max_input_tokens == 32_000
+    assert limits.max_output_tokens == 8_000
+    assert limits.max_cost_usd == Decimal("0.50")
+    assert limits.end_to_end_deadline_ms == 120_000
+
+
+def test_snapshot_types_and_metric_result_type_are_strict():
+    payload = valid_snapshot().model_dump(mode="json")
+    metric = next(item for item in payload["objects"] if item["object_type"] == "metric")
+    del metric["metric_result_type"]
+    with pytest.raises(ValidationError):
+        GroundingSnapshot.model_validate(payload)
+
+
+def test_accepted_complex_route_cannot_be_caller_constructed(snapshot):
+    plan = complex_window_plan(snapshot)
+    with pytest.raises(TypeError):
+        AcceptedComplexRoute(
+            snapshot_hash=snapshot.snapshot_hash,
+            plan_hash=complex_plan_sha256(plan),
+            plan=plan,
+            _router_token=object(),
+        )
+
+
+def test_refused_response_rejects_sql_artifact(valid_response_base):
+    with pytest.raises(ValidationError):
+        TypeAdapter(SQLGenerationResponse).validate_python({
+            **valid_response_base,
+            "status": "refused",
+            "reason": "missing_grounding",
+            "sql_artifact": {
+                "sql": "SELECT 1",
+                "sql_sha256": "0" * 64,
+                "parameter_count": 0,
+                "parameter_types": [],
+                "ir_hash": "1" * 64,
+                "compiler_version": "test",
+                "dialect": "duckdb",
+            },
+        })
+```
+
+Run: `.venv/bin/python -m pytest tests/test_text2sql_contract.py -v`
+
+Expected: fail against the v2 plan/SQL-stage contract.
+
+- [ ] **Step 2: Implement strict discriminated expression and node unions**
+
+Use `ConfigDict(extra="forbid")` on all serializable boundary models and `ConfigDict(extra="forbid", frozen=True)` on immutable evidence. Keep `AcceptedComplexRoute` and `GuardedGenerationRequest` outside Pydantic serialization. `IRNode` is discriminated by `kind`; `IRGenerationOutcome` by `outcome`; public response by `status`. Validate identifiers at parse time, normalize every column type to `ScalarType`, require `formula` plus `metric_result_type` exactly on metric snapshot objects, reject metric-only fields on non-metrics, require every governed constant value to validate against its declared `ScalarType`, and reject recursive expression depth above the configured contract maximum.
+
+The first supported node set is exact:
+
+```python
+SUPPORTED_DEFAULT_NODE_KINDS = frozenset({
+    "scan", "join", "filter", "aggregate", "project", "sort", "limit",
+})
+SUPPORTED_COMPLEX_NODE_KINDS = frozenset({"window", "set_operation"})
+```
+
+The expression union is exact: `column`, `metric`, ref-only `literal`, allowlisted `function`, allowlisted `binary`, bounded `in`, typed `case`, and `relative_time(data_max, amount_ref, unit, boundaries)`. `QuestionLiteralRef(kind="question", start, end, data_type)` and `GovernedLiteralRef(kind="governed", literal_id)` form a discriminated `LiteralRef`; neither stores a resolved value. `LimitNode.count`, relative-time amount, window offsets, minimum-group guards, and every physical assumption operand use `LiteralRef`. `RelationalQueryIR` has no `intent`, raw SQL, expression SQL, or arbitrary prose/value field. Recursive model references are rebuilt explicitly after all variants are declared, and validation enforces depth and collection-size limits.
+
+- [ ] **Step 3: Make generation-mode and ambiguity states impossible to mix**
+
+`GuardedGenerationRequest` is a frozen, slots-based local dataclass with explicit `__post_init__` checks: `mode="default_ir"` rejects `accepted_complex_route`; `mode="planned_ir"` requires an authentic snapshot/plan-bound `AcceptedComplexRoute`; `mode="provider_probe"` requires an empty probe snapshot and rejects prior violations. It exposes no `model_validate`, dict, or JSON construction path. `ValidatedIR` and `CachedGeneration` require `accepted_complex_plan_hash` exactly for `planned_ir`, reject it for `default_ir`, and require key/payload/validated routes to agree. `IRGenerationOutcome` includes strict `ClarificationRequest`; each `Ambiguity` uses only canonical-question code-point offsets and at least two discriminated object/relationship/governed-literal/grain/operator candidates, with no text/value field. `RefusedResponse(reason="clarification_required")` requires at least one locally validated `Ambiguity` or `LiteralClarificationNeed`: model ambiguity populates only `ambiguities`, while local missing/invalid/unparseable/ungrounded/invented literal handling populates only value-free `literal_needs`. Other refusal reasons reject both fields. A first-call clarification records `generation_route="default_ir"`, while pre-generation failures alone use `none`. `ResponseBase.generation_route` and `cache_status` remain independent, and no model accepts a `PromptEnvelope` from a caller.
+
+- [ ] **Step 4: Create validated shared factories**
+
+`tests/text2sql_factories.py` exports:
+
+```python
+valid_scope(allowed_object_ids=None, policy_version="policy.v1")
+canonical_question(text="Show accounts in London")
+valid_snapshot(scope=None, governed_literals=())
+question_literal_ref(question, token="London", data_type="string")
+governed_literal_ref(literal_id)
+minimal_ir(snapshot=None)
+branch_volume_ir(snapshot=None)
+relative_growth_ir(snapshot=None, question="... last 24 months ...")
+complex_window_plan(snapshot=None)
+valid_clarification_request(question, snapshot)
+sensitive_ir(snapshot=None, question="Which five ...")
+compiled_query(ir=None)
+sql_artifact(compiled=None)
+valid_request(scope=None)
+valid_response_base(snapshot=None)
+codes(violations)
+```
+
+Every factory returns a normally validated model; none uses `model_construct`, embeds a literal value/free-form intent in IR, or hard-codes warning hashes. Helpers derive code-point spans from the exact canonical question and fail if the requested token is absent or non-unique. Task 5 adds accepted-route factories only after `ComplexityRouter` exists; no test helper constructs route authority directly.
+
+- [ ] **Step 5: Run model regressions**
+
+```bash
+.venv/bin/python -m pytest tests/test_text2sql_contract.py tests/test_bundle_validation.py -v
+```
+
+Expected: pass. Old orchestration tests may remain red until Task 10; do not reintroduce v2 fields to satisfy them.
+
+- [ ] **Step 6: Commit only if authorized**
+
+```bash
+git add src/cerebro/models.py tests/test_text2sql_contract.py tests/text2sql_factories.py
+git commit -m "refactor: define snapshot and relational IR contracts"
+```
+
+---
+
+### Task 3: Build authorization-first retrieval and immutable grounding snapshots
+
+Implements FR-704, FR-704b, AC-700, AC-706, AC-715.
+
+**Files:**
+- Modify: `src/cerebro/retrieval.py`
+- Modify: `src/cerebro/models.py`
+- Modify: `src/cerebro/provenance.py`
+- Verify boundary without adding SQL behavior: `src/cerebro/api.py`
+- Create: `tests/test_grounding_snapshot.py`
+- Modify: `tests/test_retrieval_api_mcp.py`
+- Modify: `tests/test_text2sql_contract.py`
+
+**Interfaces:**
+- `canonicalize_question(question: str) -> str` uses version `008.question.v1`: Unicode NFC, trim Unicode whitespace, collapse each internal Unicode-whitespace run to one ASCII space, no case-fold/literal rewrite.
+- `canonical_question_sha256(canonical_question: str) -> Sha256`
+- `GroundingResolver.resolve(canonical_question: str, scope: AuthorizationScope, dialect: str) -> GroundingSnapshot`
+- `authorized_candidates(scope) -> tuple[SemanticObject, ...]` filters before lexical/vector ranking.
+- `expand_authorized(seed_ids, scope, depth=1) -> tuple[str, ...]` never traverses into an unauthorized node.
+- `authorization_scope_sha256(scope_without_hash) -> str` and `grounding_snapshot_sha256(snapshot_without_hash) -> str`
+- `SnapshotGovernedLiteral(literal_id, data_type, value, source_object_id)` represents only explicit authored semantic constants; no discovery/sample path may populate it.
+- Production `SQLGenerationRequest` carries only raw question, trusted `AuthorizationScope`, dialect, and trusted row cap—never caller-supplied `GroundingResponse` or snapshot. The resolver recomputes scope/snapshot hashes and rejects mismatches.
+- Existing `/api/grounding` and MCP contracts continue returning advisory metadata-only `GroundingResponse`; they neither construct `SQLGenerationRequest` nor authorize execution.
+
+- [ ] **Step 1: Prove authorization happens before retrieval and expansion**
+
+```python
+def test_unauthorized_high_score_object_never_enters_snapshot(retriever):
+    scope = valid_scope(allowed_object_ids={"table.accounts"})
+    snapshot = GroundingResolver(retriever).resolve(
+        "show restricted customer identity details", scope, "duckdb"
     )
+    ids = {item.object_id for item in snapshot.objects}
+    assert ids == {"table.accounts"}
+    assert "table.customers" not in ids
 
 
-def _ok(content: str):
-    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
-
-
-def test_scripted_provider_returns_queued_outputs_and_records_calls():
-    provider = ScriptedProvider([PLAN])
-    assert provider.generate("query_plan", "prompt text", QueryPlan).tables == ["table.cards"]
-    assert provider.calls == [("query_plan", "prompt text")]
-
-
-def test_scripted_provider_raises_queued_exceptions():
-    with pytest.raises(ValueError):
-        ScriptedProvider([ValueError("bad json")]).generate("query_plan", "p", QueryPlan)
-
-
-def test_hosted_provider_binds_schema_and_pins_temperature():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.update(json.loads(request.content))
-        captured["auth"] = request.headers.get("authorization")
-        return _ok(PLAN.model_dump_json())
-
-    provider = HostedProvider(model="m", api_key="secret-key", client=_client(handler))
-    assert provider.generate("query_plan", "prompt", QueryPlan).tables == ["table.cards"]
-
-    assert captured["temperature"] == 0
-    assert captured["response_format"]["type"] == "json_schema"
-    assert captured["response_format"]["json_schema"]["strict"] is True
-    assert captured["response_format"]["json_schema"]["schema"] == QueryPlan.model_json_schema()
-    assert captured["auth"] == "Bearer secret-key"
-
-
-def test_hosted_provider_surfaces_schema_invalid_output():
-    provider = HostedProvider(
-        model="m", api_key="k", client=_client(lambda r: _ok('{"intent": "only"}'))
+def test_graph_expansion_cannot_cross_scope(retriever):
+    scope = valid_scope(allowed_object_ids={"table.transactions"})
+    snapshot = GroundingResolver(retriever).resolve(
+        "transactions by branch", scope, "duckdb"
     )
-    with pytest.raises(ValueError, match="query_plan"):
-        provider.generate("query_plan", "prompt", QueryPlan)
+    assert {item.object_id for item in snapshot.objects} <= scope.allowed_object_ids
+```
+
+Run: `.venv/bin/python -m pytest tests/test_grounding_snapshot.py -v`
+
+Expected: fail if filtering occurs after ranking or graph expansion.
+
+- [ ] **Step 2: Add canonical question and snapshot identity tests**
+
+```python
+def test_canonicalize_question_is_versioned_unicode_nfc_and_whitespace_only():
+    assert canonicalize_question("  Revenu\u0065\u0301\u00a0 for\t Q1  ") == "Revenu\u00e9 for Q1"
+    assert canonicalize_question("Q1") != canonicalize_question("q1")
 
 
-def test_secret_never_appears_in_error_text():
-    provider = HostedProvider(
-        model="m", api_key="super-secret", client=_client(lambda r: httpx.Response(400, text="bad"))
-    )
-    with pytest.raises(Exception) as caught:
-        provider.generate("query_plan", "prompt", QueryPlan)
-    assert "super-secret" not in str(caught.value)
-    assert "super-secret" not in repr(provider)
+def test_snapshot_hash_is_stable_for_identical_inputs(resolver, scope):
+    question = canonicalize_question("transaction volume")
+    first = resolver.resolve(question, scope, "duckdb")
+    second = resolver.resolve(question, scope, "duckdb")
+    assert first.snapshot_hash == second.snapshot_hash
+    assert first == second
 
 
-@pytest.mark.parametrize("status", [429, 500, 503])
-def test_transport_faults_retry_then_succeed(status):
-    calls = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return httpx.Response(status, text="try later")
-        return _ok(PLAN.model_dump_json())
-
-    slept: list[float] = []
-    provider = HostedProvider(
-        model="m", api_key="k", client=_client(handler), sleep=slept.append, max_transport_attempts=3
-    )
-    assert provider.generate("query_plan", "p", QueryPlan).tables == ["table.cards"]
-    assert calls["n"] == 2
-    assert slept and slept[0] > 0
+def test_forged_authorization_scope_hash_is_rejected(resolver, scope):
+    forged = scope.model_copy(update={"authorization_scope_hash": "f" * 64})
+    with pytest.raises(AuthorizationScopeIntegrityError):
+        resolver.resolve(canonicalize_question("transaction volume"), forged, "duckdb")
 
 
-def test_exhausted_transport_retries_raise_provider_unavailable():
-    slept: list[float] = []
-    provider = HostedProvider(
-        model="m",
-        api_key="k",
-        client=_client(lambda r: httpx.Response(503, text="down")),
-        sleep=slept.append,
-        max_transport_attempts=3,
-    )
-    with pytest.raises(ProviderUnavailable):
-        provider.generate("query_plan", "p", QueryPlan)
-    assert len(slept) == 2
+@pytest.mark.parametrize("mutation", [
+    "scope", "policy_version", "retrieval_config", "semantic_version",
+    "canonicalization_version", "literal_registry", "object",
+])
+def test_snapshot_identity_changes_for_security_relevant_mutation(
+    resolver, scope, mutation, mutate_snapshot_input,
+):
+    question = canonicalize_question("transaction volume")
+    first = resolver.resolve(question, scope, "duckdb")
+    changed_resolver, changed_scope = mutate_snapshot_input(resolver, scope, mutation)
+    second = changed_resolver.resolve(question, changed_scope, "duckdb")
+    assert first.snapshot_hash != second.snapshot_hash
+```
 
+- [ ] **Step 3: Build the metadata-only snapshot field-by-field**
 
-def test_backoff_grows_between_attempts():
-    slept: list[float] = []
-    provider = HostedProvider(
-        model="m",
-        api_key="k",
-        client=_client(lambda r: httpx.Response(503, text="down")),
-        sleep=slept.append,
-        max_transport_attempts=4,
-    )
-    with pytest.raises(ProviderUnavailable):
-        provider.generate("query_plan", "p", QueryPlan)
-    assert slept == sorted(slept) and slept[0] < slept[-1]
+Include IDs, descriptions, normalized declared column/metric result types and classifications, relationship endpoints, metric formulas, warning refs/controls, policy IDs, ranking evidence, semantic/policy/scope/retrieval/canonicalization/literal-registry/type-registry versions, dialect capability, and explicitly authored governed literals with stable IDs/types/source-object IDs. Exclude rows, samples, discovered database values, database paths, vector embeddings, secrets, raw document bodies not explicitly allowlisted, and arbitrary provenance dictionaries. A governed-literal loader accepts only bundle-authored constants and has no database connection.
 
+Compute and verify the scope hash over frozen `AuthorizationScope` payload with `authorization_scope_hash` excluded. Compute the snapshot hash over the frozen snapshot payload with `snapshot_hash` excluded, then construct the final model. Revalidating either model from canonical bytes must reproduce its hash; a supplied mismatch fails before retrieval.
 
-def test_egress_guard_blocks_forbidden_values_before_any_call():
-    inner = ScriptedProvider([PLAN])
-    guarded = EgressGuard(inner, forbidden=["Pooja Garcia", "customer0@mailbank.com"])
+- [ ] **Step 4: Reject caller grounding while preserving the advisory API**
 
-    with pytest.raises(ValueError, match="egress"):
-        guarded.generate("query_plan", "top customer is Pooja Garcia", QueryPlan)
+Do not add or modify an executable SQL endpoint in `api.py`. Keep `/api/grounding` and the MCP tools metadata-only and returning `GroundingResponse`. Add contract/API tests proving that output cannot validate as `SQLGenerationRequest` and cannot be passed to `Text2SQLAgent.run`; the only production request shape is question plus trusted `AuthorizationScope`. The actual constructors currently in `cli.py` and `evaluation.py` still use question plus `retriever.grounding(...)`; migrate those two call sites in Task 11 through centralized resolver composition, not through the HTTP/MCP response.
+
+```python
+def test_advisory_grounding_cannot_authorize_sql(client, trusted_scope):
+    grounding = client.post("/api/grounding", json={"question": "volume"}).json()
+    with pytest.raises(ValidationError):
+        SQLGenerationRequest.model_validate({
+            "question": "volume",
+            "authorization_scope": trusted_scope.model_dump(mode="json"),
+            "grounding": grounding,
+        })
+```
+
+- [ ] **Step 5: Verify retrieval and API contracts**
+
+```bash
+.venv/bin/python -m pytest tests/test_grounding_snapshot.py tests/test_retrieval_api_mcp.py tests/test_text2sql_contract.py -v
+```
+
+Expected: pass with no provider or database; HTTP/MCP remain grounding-only and `GroundingResponse` is rejected by the execution request contract.
+
+- [ ] **Step 6: Commit only if authorized**
+
+```bash
+git add src/cerebro/retrieval.py src/cerebro/models.py src/cerebro/provenance.py tests/test_grounding_snapshot.py tests/test_retrieval_api_mcp.py tests/test_text2sql_contract.py
+git commit -m "feat: freeze authorized grounding snapshots"
+```
+
+---
+
+### Task 4: Replace prompt strings with a guarded organizer model gateway
+
+Implements FR-702, FR-703, FR-703a–FR-703d, AC-707, AC-711.
+
+**Files:**
+- Create: `src/cerebro/text2sql_provider.py`
+- Create: `src/cerebro/prompting.py`
+- Modify: `src/cerebro/hosted_provider.py`
+- Modify: `scripts/text2sql_preflight.py`
+- Verify unchanged: `src/cerebro/enrichment.py`
+- Rewrite: `tests/test_prompt_egress.py`
+- Modify: `tests/test_hosted_provider.py`
+- Verify unchanged regression: `tests/test_enrichment.py`
+- Create or modify: `tests/conftest.py`
+
+**Interfaces:**
+- Consumer-owned `@runtime_checkable Text2SQLGenerationProvider(Protocol)` defines `generate(request: GuardedGenerationRequest, output_adapter: TypeAdapter[OutputT]) -> ProviderGeneration[OutputT]` plus provider/model/revision/schema-mechanism identity.
+- Generic `ProviderGeneration[OutputT]` records validated output, sanitized transport attempts, and usage.
+- Internal `OrganizerModelGateway.generate(schema_name, prompt, output_adapter: TypeAdapter[OutputT]) -> ProviderGeneration[OutputT]` owns transport only.
+- `GuardedProvider.generate(request: GuardedGenerationRequest, output_adapter: TypeAdapter[OutputT]) -> ProviderGeneration[OutputT]` is the only provider boundary later consumed by `Text2SQLAgent`; hosted/scripted/cassette adapters conform structurally.
+- `_build_prompt_envelope`, `_authorize_prompt_envelope`, and `_render_prompt` remain module-private.
+- Typed exceptions: `ProviderConfigurationError`, `ProviderUnavailable`, `ProviderRejected`, `EgressBlocked`.
+- `probe_provider_schema(...) -> ProviderCapabilityReceipt` performs one metadata-only schema call.
+- `src/cerebro/hosted_provider.py` and Text-to-SQL transport doubles must not import `cerebro.enrichment`; enrichment's existing `GenerationProvider` stays unchanged. Task 10 migrates `text2sql.py`, and Task 11 migrates `GoldenProvider`, to this protocol.
+
+- [ ] **Step 1: Write the no-SQL and forged-input egress tests**
+
+```python
+@pytest.mark.parametrize("forged", [
+    {"canonical_question": "q"},
+    "rendered prompt",
+    PromptEnvelope(
+        mode="default_ir",
+        canonical_question="q",
+        snapshot=prompt_snapshot_view(valid_snapshot()),
+    ),
+])
+def test_guard_rejects_caller_built_payloads(forged):
+    inner = ScriptedProvider([])
+    guarded = GuardedProvider(inner)
+    with pytest.raises(EgressBlocked):
+        guarded.generate(forged, TypeAdapter(IRGenerationOutcome))
     assert inner.calls == []
 
-    guarded.generate("query_plan", "fraud rate by card type", QueryPlan)
-    assert len(inner.calls) == 1
+
+def test_all_provider_output_schemas_exclude_sql_and_embedded_literal_values():
+    for output_type in (IRGenerationOutcome, RelationalQueryIR, ProviderProbe):
+        schema = json.dumps(TypeAdapter(output_type).json_schema(), sort_keys=True)
+        assert '"sql"' not in schema
+    assert '"value"' not in json.dumps(LiteralExpression.model_json_schema(), sort_keys=True)
+    assert '"intent"' not in json.dumps(RelationalQueryIR.model_json_schema(), sort_keys=True)
 
 
-def test_cassette_records_then_replays_without_the_network(tmp_path: Path):
-    path = tmp_path / "cassette.jsonl"
-    live = ScriptedProvider([PLAN])
-
-    recorder = CassetteProvider(path, inner=live)
-    recorder.generate("query_plan", "prompt", QueryPlan)
-
-    replay = CassetteProvider(path, inner=None)
-    assert replay.generate("query_plan", "prompt", QueryPlan).tables == ["table.cards"]
-
-
-def test_replay_fails_loudly_on_a_missing_fixture(tmp_path: Path):
-    replay = CassetteProvider(tmp_path / "empty.jsonl", inner=None)
-    with pytest.raises(ProviderUnavailable, match="no recorded response"):
-        replay.generate("query_plan", "never recorded", QueryPlan)
+def test_text2sql_provider_protocol_is_consumer_owned():
+    source = inspect.getsource(cerebro.hosted_provider)
+    assert "cerebro.enrichment" not in source
+    assert "from .enrichment" not in source
+    assert isinstance(GuardedProvider(ScriptedProvider([])), Text2SQLGenerationProvider)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+Run: `.venv/bin/python -m pytest tests/test_prompt_egress.py tests/test_hosted_provider.py -v`
 
-Run: `python -m pytest tests/test_hosted_provider.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'cerebro.hosted_provider'`
+Expected: fail against the rendered-string provider boundary.
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 2: Add value and diagnostic canaries**
 
-Create `src/cerebro/hosted_provider.py`:
+Place source-row, numeric-PII, transformed/discovered-value, locally resolved question/governed literal, result, credential, raw-SQL, raw-exception, and free-text-subject canaries in local-only structures. Capture the actual inner prompt and assert every forbidden canary is absent. Separately prove an explicitly authored governed constant selected into `GroundingPromptView` is allowed while a lookalike value not identified by a snapshot `literal_id` is blocked. A valid-looking but nonmember table/relationship/metric/policy/column/literal subject must raise `EgressBlocked` with no additional call.
 
-```python
-"""Generation providers reached over the network, plus the doubles that keep tests offline.
+- [ ] **Step 3: Build and authorize strict envelopes field-by-field**
 
-Four classes, one job each:
+`GuardedProvider` accepts an exact `GuardedGenerationRequest` instance. It creates `GroundingPromptView` from allowlisted snapshot fields, includes the exact canonical question, maps local violations through a fixed code/remediation table, reduces output positions to a phase token, revalidates object/relationship/governed-literal membership, renders, and contacts the inner gateway. `planned_ir` accepts only an authentic `AcceptedComplexRoute`, recomputes its current plan hash and snapshot binding immediately before rendering, and rejects any post-validation mutation; it never trusts a caller-supplied plan. Do not serialize models then delete forbidden fields.
 
-`HostedProvider`  talks to an OpenAI-compatible endpoint, binds the output schema
-                  at the API level, and separates transport faults from model faults.
-`EgressGuard`     is the single choke point every prompt passes through. Because
-                  inference is remote, FR-703a is enforced here rather than trusted
-                  to each call site.
-`CassetteProvider` records live responses once and replays them forever, so the
-                  suite needs neither a key nor a network (FR-703c).
-`ScriptedProvider` is the in-test double for agent logic.
-"""
+- [ ] **Step 4: Implement organizer-compatible configuration without vendor lock-in**
 
-from __future__ import annotations
+Read runtime values from `CEREBRO_BASE_URL`, `CEREBRO_API_KEY`, `CEREBRO_MODEL`, and `CEREBRO_MODEL_REVISION`. Keep the transport OpenAI-compatible only behind `OrganizerModelGateway`; no orchestration code imports a vendor SDK or assumes a public OpenAI endpoint. Record the provider-declared schema mechanism and token/cost usage when returned.
 
-import json
-import os
-from pathlib import Path
-from typing import Callable, Iterable
+- [ ] **Step 5: Separate transport attempts from semantic calls**
 
-import httpx
-from pydantic import BaseModel, ValidationError
+Bound retryable HTTP statuses and timeouts with exponential backoff to exactly two transport attempts per semantic call and `20_000 ms` per attempt by deployment default. Return sanitized `ProviderGeneration(output, transport_attempts, usage)`. Schema validation errors propagate to orchestration as semantic decoding failures; non-retryable HTTP rejection never becomes `provider_unavailable`. Usage is cumulative in the request budget across both possible semantic calls.
 
-from .enrichment import GenerationProvider, OutputT
+- [ ] **Step 6: Add the offline network guard and capability probe**
 
-DEFAULT_BASE_URL = "https://api.openai.com/v1"
-RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
-SYSTEM_PROMPT = (
-    "You are a bounded banking query agent. Use only the objects supplied in the "
-    "grounding packet. Never invent a table, column, join, or metric. Reply with "
-    "JSON matching the provided schema and nothing else."
-)
+Block `AF_INET`/`AF_INET6` when `CEREBRO_TEST_NO_NETWORK=1` while preserving `AF_UNIX`. The capability probe uses `mode="provider_probe"`, one empty metadata snapshot, and `ProviderProbe(ok=True)`; it writes a content-addressed receipt without prompt or response content.
 
-
-class ProviderUnavailable(RuntimeError):
-    """Transport could not be completed within the retry budget."""
-
-
-class HostedProvider(GenerationProvider):
-    name = "hosted"
-
-    def __init__(
-        self,
-        model: str,
-        api_key: str,
-        base_url: str = DEFAULT_BASE_URL,
-        client: httpx.Client | None = None,
-        timeout: float = 120.0,
-        max_transport_attempts: int = 4,
-        backoff_base: float = 0.5,
-        sleep: Callable[[float], None] | None = None,
-    ):
-        self.model = model
-        self._key = api_key
-        self.max_transport_attempts = max_transport_attempts
-        self.backoff_base = backoff_base
-        self._sleep = sleep or __import__("time").sleep
-        self.client = client or httpx.Client(base_url=base_url, timeout=timeout)
-
-    def __repr__(self) -> str:  # keep the key out of tracebacks and logs
-        return f"HostedProvider(model={self.model!r}, key=***)"
-
-    def _payload(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> dict:
-        return {
-            "model": self.model,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": output_model.model_json_schema(),
-                },
-            },
-        }
-
-    def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
-        payload = self._payload(schema_name, prompt, output_model)
-        headers = {"authorization": f"Bearer {self._key}"}
-        last = ""
-        for attempt in range(1, self.max_transport_attempts + 1):
-            try:
-                response = self.client.post("/chat/completions", json=payload, headers=headers)
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last = type(exc).__name__
-            else:
-                if response.status_code not in RETRYABLE_STATUS:
-                    if response.status_code >= 400:
-                        raise RuntimeError(
-                            f"{schema_name}: provider rejected the request with "
-                            f"status {response.status_code}"
-                        )
-                    content = response.json()["choices"][0]["message"]["content"]
-                    try:
-                        return output_model.model_validate_json(content)
-                    except ValidationError as exc:
-                        raise ValueError(f"{schema_name}: schema-invalid model output") from exc
-                last = f"status {response.status_code}"
-            if attempt < self.max_transport_attempts:
-                self._sleep(self.backoff_base * (2 ** (attempt - 1)))
-        raise ProviderUnavailable(f"{schema_name}: provider unreachable after {self.max_transport_attempts} attempts ({last})")
-
-
-class EgressGuard(GenerationProvider):
-    """Refuses to send a prompt containing a forbidden substring. FR-703a."""
-
-    def __init__(self, inner: GenerationProvider, forbidden: Iterable[str]):
-        self.inner = inner
-        self.forbidden = [str(value) for value in forbidden if str(value).strip()]
-
-    @property
-    def name(self) -> str:
-        return f"guarded:{self.inner.name}"
-
-    @property
-    def model(self) -> str:
-        return getattr(self.inner, "model", "")
-
-    def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
-        for value in self.forbidden:
-            if value in prompt:
-                raise ValueError(
-                    f"{schema_name}: egress blocked; prompt carries a source value"
-                )
-        return self.inner.generate(schema_name, prompt, output_model)
-
-
-class CassetteProvider(GenerationProvider):
-    """Records responses when `inner` is set, replays from disk when it is not. FR-703c."""
-
-    name = "cassette"
-
-    def __init__(self, path: Path, inner: GenerationProvider | None):
-        self.path = Path(path)
-        self.inner = inner
-        self.model = getattr(inner, "model", "replay")
-        self._entries: dict[str, str] = {}
-        if self.path.is_file():
-            for line in self.path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    entry = json.loads(line)
-                    self._entries[entry["key"]] = entry["content"]
-
-    @staticmethod
-    def _key(schema_name: str, prompt: str) -> str:
-        import hashlib
-
-        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:32]
-        return f"{schema_name}:{digest}"
-
-    def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
-        key = self._key(schema_name, prompt)
-        if key in self._entries:
-            return output_model.model_validate_json(self._entries[key])
-        if self.inner is None:
-            raise ProviderUnavailable(
-                f"{schema_name}: no recorded response for this prompt; "
-                "re-record the cassette with a live key"
-            )
-        result = self.inner.generate(schema_name, prompt, output_model)
-        content = result.model_dump_json()
-        self._entries[key] = content
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"key": key, "content": content}) + "\n")
-        return result
-
-
-class ScriptedProvider(GenerationProvider):
-    """Test double. Returns queued outputs in order and records every call."""
-
-    name = "scripted"
-
-    def __init__(self, responses: list[BaseModel | Exception], model: str = "scripted"):
-        self.model = model
-        self._responses = list(responses)
-        self.calls: list[tuple[str, str]] = []
-
-    def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
-        self.calls.append((schema_name, prompt))
-        if not self._responses:
-            raise AssertionError(f"ScriptedProvider exhausted on {schema_name}")
-        item = self._responses.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
-
-
-def provider_from_environment() -> GenerationProvider | None:
-    """Resolve a provider from configuration, or None so callers can fall back."""
-    key = os.getenv("CEREBRO_API_KEY") or os.getenv("OPENAI_API_KEY")
-    model = os.getenv("CEREBRO_MODEL", "")
-    if not key or not model:
-        return None
-    return HostedProvider(
-        model=model,
-        api_key=key,
-        base_url=os.getenv("CEREBRO_BASE_URL", DEFAULT_BASE_URL),
-    )
-```
-
-Two details worth naming. `EgressGuard` is a separate class rather than a flag
-inside `HostedProvider` so that the guard can wrap the cassette and the scripted
-double too, which is what makes T-718 meaningful. And `CassetteProvider` keys on
-a hash of the prompt, so any prompt change invalidates the fixture rather than
-silently replaying a stale answer.
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `python -m pytest tests/test_hosted_provider.py -v`
-Expected: 13 passed
-
-- [ ] **Step 5: Record the credential shape without committing a secret**
-
-Create `.env.example`:
+Run:
 
 ```bash
-# Supplied by the hackathon organizers. Never commit the real value.
-CEREBRO_API_KEY=
-CEREBRO_MODEL=
-CEREBRO_BASE_URL=https://api.openai.com/v1
+CEREBRO_TEST_NO_NETWORK=1 env -u CEREBRO_API_KEY -u OPENAI_API_KEY -u CEREBRO_MODEL .venv/bin/python -m pytest tests/test_prompt_egress.py tests/test_hosted_provider.py tests/test_enrichment.py -v
+! grep -R "from \.enrichment\|from cerebro\.enrichment\|import cerebro\.enrichment" src/cerebro/hosted_provider.py src/cerebro/text2sql_provider.py
 ```
 
-Confirm `.env` is already ignored, which it is, and confirm the key is absent
-from tracked files:
+Expected: pass, open no external socket, find no Text-to-SQL enrichment import, and leave the existing enrichment tests/contract unchanged.
+
+- [ ] **Step 7: Commit only if authorized**
 
 ```bash
-git check-ignore -v .env
-git grep -nE "sk-[A-Za-z0-9]{16,}" -- . ':!*.example' || echo "no key material tracked"
-```
-
-- [ ] **Step 6: Confirm the live path once, cheaply**
-
-With the key exported, make exactly one live call so the assumption in this
-task's header is confirmed rather than assumed:
-
-```bash
-python -c "
-from cerebro.hosted_provider import provider_from_environment
-from cerebro.models import QueryPlan
-p = provider_from_environment()
-print(p.name, p.model)
-print(p.generate('query_plan', 'Return a plan with tables=[\'table.cards\'] and columns=[\'card_type\'].', QueryPlan))
-"
-```
-
-Expected: a schema-valid `QueryPlan`. If the endpoint rejects
-`response_format.json_schema`, stop and record which mechanism it does support;
-that is the one place this plan's assumption can break, and it changes only
-`HostedProvider._payload`.
-
-- [ ] **Step 7: Prove the suite is offline and key-free (AC-707, T-720)**
-
-```bash
-env -u CEREBRO_API_KEY -u OPENAI_API_KEY python -m pytest tests/ -v
-```
-
-Expected: green. No test may reach the network. If any test hangs, it is calling
-live rather than replaying, which is the defect T-720 exists to catch.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/cerebro/hosted_provider.py tests/test_hosted_provider.py .env.example
-git commit -m "feat: add hosted provider with schema binding, egress guard, and offline replay"
+git add src/cerebro/text2sql_provider.py src/cerebro/prompting.py src/cerebro/hosted_provider.py scripts/text2sql_preflight.py tests/conftest.py tests/test_prompt_egress.py tests/test_hosted_provider.py
+git commit -m "fix: guard organizer model metadata egress"
 ```
 
 ---
 
-### Task 7: Agent with two stages, retry budgets, and refusal
+### Task 5: Validate typed relational IR, ambiguity, and complex-plan escalation
 
-Implements FR-704 to FR-708, FR-715 to FR-717. Verifies T-702, T-708, T-710, T-715, T-716.
+Implements FR-703b, FR-704a, FR-707, FR-709, FR-710, FR-715, FR-716, AC-704, AC-709, AC-714.
 
 **Files:**
-- Create: `src/cerebro/text2sql.py`
-- Create: `tests/test_text2sql_agent.py`
+- Create: `src/cerebro/complexity.py`
+- Modify: `src/cerebro/selfcheck.py`
+- Create: `tests/test_selfcheck_ir.py`
+- Create: `tests/test_complexity_router.py`
+- Modify: `tests/text2sql_factories.py`
 
 **Interfaces:**
-- Consumes: `check_plan`, `check_sql`, `check_engine` from Tasks 3 to 5; `ScriptedProvider` from Task 6
-- Produces:
-  - `class SQLDraft(BaseModel)` with field `sql: str`
-  - `class Text2SQLAgent` constructed as `Text2SQLAgent(provider, execute=None, connection=None, disclosure_cap=50, max_attempts=2)`
-  - `Text2SQLAgent.run(request: SQLGenerationRequest) -> SQLGenerationResponse`
-  - `Executor = Callable[[str, int], QueryResult]`
+- `GroundingIndex.from_snapshot(snapshot) -> GroundingIndex`
+- `ExpressionTypeRegistry(version="008.types.v1")` normalizes snapshot scalar types and metric result types and owns function/operator signatures.
+- `validate_ir(ir, snapshot, canonical_question, generation_route) -> IRValidationResult`
+- `IRValidationResult(validated_ir: RelationalQueryIR | None, violations: tuple[CheckViolation, ...])`
+- `validate_clarification(request, canonical_question, snapshot) -> ClarificationDecision`
+- `ComplexityRouter.validate(plan, snapshot) -> ComplexityDecision`; acceptance calls the module-private factory and returns a non-Pydantic/non-wire `AcceptedComplexRoute` bound to plan/snapshot hashes, never a mutable route string/call count. Direct constructor calls and model/dict/JSON validation paths are rejected.
+- Task 5 extends `tests/text2sql_factories.py` with `accepted_complex_route(snapshot=None, plan=None)` and `foreign_accepted_route(snapshot=None)`; both run `ComplexityRouter`, and neither constructs capability fields directly.
+- Initial complex allowlist: `window.period_over_period.v1` and `set_operation.safe_binary.v1`.
+- `check_grounding_refusal(refusal, snapshot) -> RefusalDecision` verifies absence locally.
 
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/test_text2sql_agent.py`:
+- [ ] **Step 1: Add graph-shape and containment failures**
 
 ```python
-from __future__ import annotations
-
-import pytest
-
-from cerebro.bundle import load_validated_bundle
-from cerebro.hosted_provider import ScriptedProvider
-from cerebro.models import QueryPlan, QueryResult, SQLGenerationRequest
-from cerebro.retrieval import SemanticRetriever
-from cerebro.selfcheck import grounding_index
-from cerebro.text2sql import SQLDraft, Text2SQLAgent
-
-FORMULA = "100.0 * SUM(card_transactions.is_fraud) / NULLIF(COUNT(*), 0)"
-GOOD_SQL = (
-    f"SELECT c.card_type, {FORMULA} AS fraud_rate "
-    "FROM card_transactions AS card_transactions "
-    "JOIN cards AS c ON card_transactions.card_id = c.card_id "
-    "GROUP BY c.card_type"
-)
-
-
-@pytest.fixture(scope="module")
-def grounding():
-    return SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE)).grounding("what is the fraud rate by card type")
-
-
-@pytest.fixture
-def request_obj(grounding):
-    return SQLGenerationRequest(question="What is the fraud rate by card type?", grounding=grounding)
-
-
-def _plan(grounding) -> QueryPlan:
-    index = grounding_index(grounding)
-    warnings = (
-        index.warnings_by_object["table.card_transactions"]
-        + index.warnings_by_object["table.cards"]
-        + index.warnings_by_object["metric.card-fraud-rate"]
-        + index.warnings_by_object["relationship.card_transaction_card"]
+@pytest.mark.parametrize("mutation, expected", [
+    ("duplicate_node", "duplicate_ir_node"),
+    ("cycle", "cyclic_ir"),
+    ("orphan", "orphan_ir_node"),
+    ("missing_root", "invalid_ir_root"),
+    ("unauthorized_table", "ungrounded_ir_reference"),
+    ("disconnected_join", "disconnected_ir"),
+])
+def test_invalid_ir_fails_before_compilation(snapshot, canonical_question, mutation, expected):
+    ir = mutate_ir(minimal_ir(snapshot), mutation)
+    result = validate_ir(
+        ir, snapshot, canonical_question, generation_route="default_ir"
     )
-    return QueryPlan(
-        intent="fraud rate by card type",
-        grain="one row per card type",
-        tables=["table.card_transactions", "table.cards"],
-        columns=["is_fraud", "card_type", "card_id"],
-        metric_ids=["metric.card-fraud-rate"],
-        joins=["relationship.card_transaction_card"],
-        group_by=["card_type"],
-        warnings_addressed=warnings,
-    )
-
-
-def _result() -> QueryResult:
-    return QueryResult(
-        columns=["card_type", "fraud_rate"],
-        column_types=["VARCHAR", "DOUBLE"],
-        rows=[["Debit", 0.4972]],
-        row_count=1,
-        truncated=False,
-        elapsed_ms=12,
-    )
-
-
-def _agent(provider, execute=None):
-    return Text2SQLAgent(provider, execute=execute or (lambda sql, cap: _result()))
-
-
-def test_happy_path_returns_ok_with_plan_result_and_provenance(request_obj, grounding):
-    provider = ScriptedProvider([_plan(grounding), SQLDraft(sql=GOOD_SQL)])
-    response = _agent(provider).run(request_obj)
-
-    assert response.status == "ok"
-    assert response.violations == []
-    assert response.result.row_count == 1
-    assert response.semantic_version == grounding.semantic_version
-    assert "table.card_transactions" in response.used_grounding_ids
-    assert response.provider == "scripted"
-
-
-def test_two_stages_are_called_in_order(request_obj, grounding):
-    provider = ScriptedProvider([_plan(grounding), SQLDraft(sql=GOOD_SQL)])
-    _agent(provider).run(request_obj)
-    assert [name for name, _ in provider.calls] == ["query_plan", "sql_draft"]
-
-
-def test_plan_violation_retries_then_fails_closed(request_obj, grounding):
-    bad = _plan(grounding).model_copy(update={"tables": ["table.atms"]})
-    provider = ScriptedProvider([bad, bad])
-    response = _agent(provider).run(request_obj)
-
-    assert response.status == "check_failed"
-    assert response.attempts == 2
-    assert any(v.code == "unknown_table" for v in response.violations)
-    assert response.result is None
-
-
-def test_sql_violation_returns_sql_but_no_result(request_obj, grounding):
-    altered = GOOD_SQL.replace("NULLIF(COUNT(*), 0)", "COUNT(*)")
-    provider = ScriptedProvider([_plan(grounding), SQLDraft(sql=altered), SQLDraft(sql=altered)])
-    response = _agent(provider).run(request_obj)
-
-    assert response.status == "check_failed"
-    assert response.sql == altered
-    assert response.result is None
-    assert any(v.code == "formula_not_verbatim" for v in response.violations)
-
-
-def test_empty_grounding_refuses_without_calling_the_model(grounding):
-    empty = grounding.model_copy(update={"tables": [], "joins": [], "metrics": [], "concepts": []})
-    provider = ScriptedProvider([])
-    response = _agent(provider).run(SQLGenerationRequest(question="how many ATMs?", grounding=empty))
-
-    assert response.status == "refused"
-    assert response.unmet_needs
-    assert response.sql == ""
-    assert provider.calls == []
-
-
-def test_zero_rows_is_success_and_is_not_retried(request_obj, grounding):
-    empty_result = _result().model_copy(update={"rows": [], "row_count": 0})
-    calls = []
-
-    def execute(sql, cap):
-        calls.append(sql)
-        return empty_result
-
-    provider = ScriptedProvider([_plan(grounding), SQLDraft(sql=GOOD_SQL)])
-    response = Text2SQLAgent(provider, execute=execute).run(request_obj)
-
-    assert response.status == "ok"
-    assert response.result.row_count == 0
-    assert len(calls) == 1
-
-
-def test_schema_invalid_plan_output_is_recorded_as_a_violation(request_obj, grounding):
-    provider = ScriptedProvider([ValueError("bad"), ValueError("bad")])
-    response = _agent(provider).run(request_obj)
-
-    assert response.status == "check_failed"
-    assert any(v.code == "unparsable_plan" for v in response.violations)
-
-
-def test_determinism_across_two_identical_runs(request_obj, grounding):
-    first = _agent(ScriptedProvider([_plan(grounding), SQLDraft(sql=GOOD_SQL)])).run(request_obj)
-    second = _agent(ScriptedProvider([_plan(grounding), SQLDraft(sql=GOOD_SQL)])).run(request_obj)
-    assert first.sql == second.sql
-    assert first.plan == second.plan
+    assert expected in codes(result.violations)
+    assert result.validated_ir is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+Run: `.venv/bin/python -m pytest tests/test_selfcheck_ir.py -v`
 
-Run: `python -m pytest tests/test_text2sql_agent.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'cerebro.text2sql'`
+Expected: fail until IR validation exists.
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 2: Validate membership, dataflow, and expression types recursively**
 
-Create `src/cerebro/text2sql.py`:
+Traverse every node and expression with an explicit depth cap. Validate all column, table, metric, relationship, warning, assumption, policy, disclosure, literal, sort, group, and output references against `GroundingIndex` and the current canonical question. Require one reachable root, unique node IDs, acyclicity, no orphans, connected relationship paths, exact node input arity, references available from each node's input, unique aliases in every output scope, and unique root outputs.
+
+Use only `ExpressionTypeRegistry("008.types.v1")` to normalize snapshot scalar/metric result types and check boolean filters/`CASE` conditions; operator and `IN` compatibility; function arity/signatures; aggregate-only placement; window-only/planned-route placement; no aggregate in filters/group keys; no window outside `WindowNode`; no nested aggregate/window; and set output arity plus position-by-position type compatibility.
 
 ```python
-"""Two-stage grounded text-to-SQL agent.
+@pytest.mark.parametrize("mutation, expected", [
+    ("numeric_filter", "non_boolean_filter"),
+    ("wrong_function_arity", "invalid_function_signature"),
+    ("aggregate_in_filter", "invalid_aggregate_placement"),
+    ("window_in_project", "invalid_window_placement"),
+    ("nested_window_aggregate", "nested_aggregate_or_window"),
+    ("duplicate_alias", "duplicate_output_alias"),
+    ("wrong_node_input_count", "invalid_node_arity"),
+    ("set_arity_mismatch", "set_output_arity_mismatch"),
+    ("set_incompatible_types", "set_output_type_mismatch"),
+])
+def test_named_type_failures_stop_before_compilation(
+    snapshot, canonical_question, mutation, expected,
+):
+    result = validate_ir(
+        mutate_ir(minimal_ir(snapshot), mutation),
+        snapshot,
+        canonical_question,
+        generation_route="planned_ir" if mutation.startswith("set_") else "default_ir",
+    )
+    assert codes(result.violations) == {expected}
+    assert result.validated_ir is None
+```
 
-The model proposes; deterministic checks decide. Execution is injected so the
-agent is testable without a database, and so the checker stays the only thing
-standing between a model and the data.
-"""
+- [ ] **Step 3: Prove the default generation route rejects complex nodes**
 
-from __future__ import annotations
+```python
+@pytest.mark.parametrize("kind", ["window", "set_operation"])
+def test_default_route_cannot_smuggle_complex_node(snapshot, canonical_question, kind):
+    ir = ir_with_complex_node(snapshot, kind)
+    result = validate_ir(
+        ir, snapshot, canonical_question, generation_route="default_ir"
+    )
+    assert "complex_node_requires_planned_route" in codes(result.violations)
+```
 
-import json
-from typing import Callable
+- [ ] **Step 4: Validate typed clarification locally**
 
-from pydantic import BaseModel, ValidationError
-
-from .enrichment import GenerationProvider
-from .models import (
-    CheckViolation,
-    GroundingResponse,
-    QueryPlan,
-    QueryResult,
-    SQLGenerationRequest,
-    SQLGenerationResponse,
-)
-from .selfcheck import check_engine, check_plan, check_sql, grounding_index
-
-Executor = Callable[[str, int], QueryResult]
-
-UNGOVERNED_DIRECTION_NOTE = (
-    "Transaction direction is not declared in the bundle. Treated as inflow: "
-    "Deposit, Interest Credit, Transfer In. Treated as outflow: Withdrawal, "
-    "Transfer Out, Fee Debit. This mapping is inferred, not governed."
-)
-DIRECTION_WORDS = ("outflow", "inflow", "withdraw", "spent", "spending", "deposit", "money out", "money in")
+```python
+def test_valid_clarification_requires_no_fallback_or_engine(snapshot):
+    question = canonicalize_question("volume by customer or account?")
+    request = valid_clarification_request(question, snapshot)
+    decision = validate_clarification(request, question, snapshot)
+    assert decision.reason == "clarification_required"
+    assert decision.ambiguities == request.ambiguities
 
 
-class SQLDraft(BaseModel):
-    sql: str
+@pytest.mark.parametrize("mutation", [
+    "out_of_bounds_span", "partial_token_span", "duplicate_candidates",
+    "one_candidate", "mixed_candidate_kinds", "ungrounded_candidate",
+    "irrelevant_candidate",
+])
+def test_invalid_clarification_request_is_check_failed(
+    snapshot, mutation,
+):
+    question = canonicalize_question("volume by customer or account?")
+    request = mutate_clarification(
+        valid_clarification_request(question, snapshot), mutation
+    )
+    decision = validate_clarification(request, question, snapshot)
+    assert decision.violation.code == "invalid_clarification_request"
+```
+
+Validate `0 <= start < end <= len(canonical_question)` using Unicode code-point offsets, exact `008.literal-span.v1` token boundaries, at least two distinct canonical candidate payloads, homogeneous candidate kinds, snapshot membership, and deterministic relevance. Object/relationship/governed-literal candidates must be ranked or graph-connected to ranked objects; grain/operator candidates must match fixed span-synonym and grounded-input applicability registries. The validator emits no free-form prompt text and cannot contact provider/compiler/engine.
+
+- [ ] **Step 5: Add guarded escalation tests**
+
+```python
+def test_supported_complex_plan_produces_bound_acceptance(snapshot):
+    plan = complex_window_plan(snapshot)
+    decision = ComplexityRouter().validate(plan, snapshot)
+    assert isinstance(decision.accepted, AcceptedComplexRoute)
+    assert decision.accepted.generation_route == "planned_ir"
+    assert decision.accepted.snapshot_hash == snapshot.snapshot_hash
+    assert decision.accepted.plan_hash == complex_plan_sha256(plan)
 
 
-class Text2SQLAgent:
-    def __init__(
-        self,
-        provider: GenerationProvider,
-        execute: Executor | None = None,
-        connection=None,
-        disclosure_cap: int = 50,
-        max_attempts: int = 2,
-    ):
-        self.provider = provider
-        self.execute = execute
-        self.connection = connection
-        self.disclosure_cap = disclosure_cap
-        self.max_attempts = max_attempts
-
-    # ---- prompts -------------------------------------------------------
-
-    @staticmethod
-    def _packet(grounding: GroundingResponse) -> str:
-        return json.dumps(grounding.model_dump(mode="json"), indent=2, sort_keys=True)
-
-    def _plan_prompt(self, request: SQLGenerationRequest, violations: list[CheckViolation]) -> str:
-        parts = [
-            "Stage 1 — produce a QueryPlan for this question using only the grounding packet.",
-            "Every warning attached to an object you use must be copied into warnings_addressed.",
-            "Reference joins by their relationship id, never by writing a predicate.",
-            f"Question: {request.question}",
-            f"Grounding packet:\n{self._packet(request.grounding)}",
-        ]
-        if violations:
-            parts.append("Your previous plan was rejected:\n" + self._render(violations))
-        return "\n\n".join(parts)
-
-    def _sql_prompt(
-        self,
-        request: SQLGenerationRequest,
-        plan: QueryPlan,
-        violations: list[CheckViolation],
-    ) -> str:
-        parts = [
-            f"Stage 2 — write one {request.dialect} SELECT statement implementing this plan.",
-            "Embed each governed metric formula exactly as written in the packet.",
-            "Anchor relative time windows on MAX of the time column, never CURRENT_DATE.",
-            f"Question: {request.question}",
-            f"Plan:\n{plan.model_dump_json(indent=2)}",
-            f"Grounding packet:\n{self._packet(request.grounding)}",
-        ]
-        if violations:
-            parts.append("Your previous SQL was rejected:\n" + self._render(violations))
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _render(violations: list[CheckViolation]) -> str:
-        return "\n".join(f"- [{v.code}] {v.message}" for v in violations)
-
-    # ---- stages --------------------------------------------------------
-
-    def _refusal(self, request: SQLGenerationRequest, needs: list[str]) -> SQLGenerationResponse:
-        return SQLGenerationResponse(
-            status="refused",
-            semantic_version=request.grounding.semantic_version,
-            dialect=request.dialect,
-            unmet_needs=needs,
-            provider=self.provider.name,
-            model=self.provider.model,
+def test_mixed_supported_and_unsupported_plan_refuses(snapshot):
+    plan = complex_window_plan(snapshot).model_copy(update={
+        "operator_ids": (
+            "window.period_over_period.v1",
+            "recursive_query.v1",
         )
+    })
+    decision = ComplexityRouter().validate(plan, snapshot)
+    assert decision.accepted is None
+    assert decision.reason == "unsupported_complexity"
+```
 
-    def _assumptions(self, request: SQLGenerationRequest, plan: QueryPlan) -> list[str]:
-        asked = request.question.lower()
-        touches_transactions = "table.transactions" in plan.tables
-        if touches_transactions and any(word in asked for word in DIRECTION_WORDS):
-            return [UNGOVERNED_DIRECTION_NOTE]
-        return []
+Validate step dependencies, snapshot membership, declared outputs, and exact operator IDs. `AcceptedComplexRoute` construction is module-private/opaque to caller and provider payloads; it binds current snapshot and plan hashes. The router cannot mutate budgets, compile SQL, or contact a provider.
 
-    def run(self, request: SQLGenerationRequest) -> SQLGenerationResponse:
-        grounding = request.grounding
-        index = grounding_index(grounding)
-        if not index.tables:
-            return self._refusal(request, ["grounding packet contains no table"])
+- [ ] **Step 6: Bind warnings and value-free assumptions at IR level**
 
-        attempts = 0
-        accumulated: list[CheckViolation] = []
+Keep stable warning hashes and the deterministic control registry. Positive `metric.transaction-volume` uses governed unsigned `SUM(amount)` with no direction mapping. Signed net requires a complete typed partition whose inflow/outflow operands are `LiteralRef`; status/grain/snapshot physical operands also use refs. Validate question span membership/boundaries and governed-literal IDs/types here, but defer actual scalar resolution to Task 6. Mutation, embedded values, invented refs, or ungrounded refs fail without inspecting fixture-only keywords or serializing resolved values.
 
-        plan: QueryPlan | None = None
-        violations: list[CheckViolation] = []
-        for _ in range(self.max_attempts):
-            attempts += 1
-            try:
-                candidate = self.provider.generate("query_plan", self._plan_prompt(request, violations), QueryPlan)
-            except (ValueError, ValidationError) as exc:
-                violations = [CheckViolation(code="unparsable_plan", message=str(exc))]
-                accumulated.extend(violations)
-                continue
-            violations = check_plan(candidate, grounding)
-            accumulated.extend(violations)
-            if not violations:
-                plan = candidate
-                break
+- [ ] **Step 7: Verify IR, clarification, and generation-route gates**
 
-        if plan is None:
-            return SQLGenerationResponse(
-                status="check_failed",
-                semantic_version=grounding.semantic_version,
-                dialect=request.dialect,
-                violations=accumulated,
-                attempts=attempts,
-                provider=self.provider.name,
-                model=self.provider.model,
-            )
+```bash
+.venv/bin/python -m pytest tests/test_selfcheck_ir.py tests/test_complexity_router.py -v
+```
 
-        sql = ""
-        violations = []
-        for _ in range(self.max_attempts):
-            attempts += 1
-            try:
-                draft = self.provider.generate("sql_draft", self._sql_prompt(request, plan, violations), SQLDraft)
-            except (ValueError, ValidationError) as exc:
-                violations = [CheckViolation(code="unparsable_sql", message=str(exc))]
-                accumulated.extend(violations)
-                continue
-            sql = draft.sql
-            violations = check_sql(sql, plan, grounding, disclosure_cap=self.disclosure_cap)
-            if not violations and self.connection is not None:
-                violations = check_engine(sql, self.connection)
-            accumulated.extend(violations)
-            if violations:
-                continue
+Expected: pass without provider, compiler, or database.
 
-            if self.execute is None:
-                break
-            try:
-                result = self.execute(sql, request.max_rows)
-            except Exception as exc:
-                violations = [CheckViolation(code="execution_error", message=str(exc))]
-                accumulated.extend(violations)
-                continue
-            return SQLGenerationResponse(
-                status="ok",
-                semantic_version=grounding.semantic_version,
-                dialect=request.dialect,
-                sql=sql,
-                plan=plan,
-                result=result,
-                assumptions=self._assumptions(request, plan),
-                used_grounding_ids=sorted(set(plan.tables) | set(plan.joins) | set(plan.metric_ids)),
-                attempts=attempts,
-                provider=self.provider.name,
-                model=self.provider.model,
-            )
+- [ ] **Step 8: Commit only if authorized**
 
-        if not violations:
-            return SQLGenerationResponse(
-                status="ok",
-                semantic_version=grounding.semantic_version,
-                dialect=request.dialect,
-                sql=sql,
-                plan=plan,
-                assumptions=self._assumptions(request, plan),
-                used_grounding_ids=sorted(set(plan.tables) | set(plan.joins) | set(plan.metric_ids)),
-                attempts=attempts,
-                provider=self.provider.name,
-                model=self.provider.model,
-            )
+```bash
+git add src/cerebro/complexity.py src/cerebro/selfcheck.py tests/test_selfcheck_ir.py tests/test_complexity_router.py tests/text2sql_factories.py
+git commit -m "feat: validate typed IR and guard complex routing"
+```
 
-        return SQLGenerationResponse(
-            status="check_failed",
-            semantic_version=grounding.semantic_version,
-            dialect=request.dialect,
-            sql=sql,
-            plan=plan,
-            violations=accumulated,
-            attempts=attempts,
-            provider=self.provider.name,
-            model=self.provider.model,
+---
+
+### Task 6: Resolve literal refs and compile accepted IR to deterministic parameterized SQL
+
+Implements FR-711, FR-712, AC-702, AC-705, AC-706.
+
+**Files:**
+- Create: `src/cerebro/sql_compiler.py`
+- Modify: `src/cerebro/models.py`
+- Create: `tests/test_sql_compiler.py`
+- Modify: `tests/text2sql_factories.py`
+
+**Interfaces:**
+- `LiteralResolver.resolve(ref: LiteralRef, canonical_question: str, snapshot: GroundingSnapshot, expected_type: ScalarType) -> ResolvedLiteral` validates membership/bounds/token/type without exposing the value outside compiler-local memory; failures return/raise a typed issue that orchestration converts to value-free `LiteralClarificationNeed`, never a fabricated `Ambiguity`.
+- `DialectCompiler.compile(validated_ir, snapshot, canonical_question, max_rows) -> CompiledQuery`
+- `to_sql_artifact(compiled: CompiledQuery) -> SQLArtifact` copies SQL, types/count, hashes, version, and dialect but never parameter values.
+- `BoundParameter(position: int, data_type: ScalarType, value: JsonScalar)` is executor-local and excludes `value` from serialization.
+- `CompilerError(code, node_id)` contains no raw data value, canonical question text, or SQL fragment.
+- `compiler_version()` changes whenever rendering, literal scanning/parsing, or operator semantics change.
+
+- [ ] **Step 1: Write deterministic compilation tests before implementation**
+
+```python
+def test_identical_ir_compiles_to_identical_bytes(snapshot):
+    question = canonicalize_question("transaction volume by branch")
+    ir = validated_ir(
+        branch_volume_ir(snapshot), snapshot, question, generation_route="default_ir"
+    )
+    compiler = DialectCompiler("duckdb")
+    first = compiler.compile(ir, snapshot, question, max_rows=1000)
+    second = compiler.compile(ir, snapshot, question, max_rows=1000)
+    assert first.model_dump_json() == second.model_dump_json()
+    assert [
+        (item.position, item.data_type, item.value) for item in first.parameters
+    ] == [
+        (item.position, item.data_type, item.value) for item in second.parameters
+    ]
+    assert first.ir_hash == second.ir_hash
+
+
+def test_question_span_literal_is_parameterized_and_public_models_are_value_free(snapshot):
+    question = canonicalize_question("Show accounts in London")
+    city_ref = QuestionLiteralRef(
+        kind="question", start=17, end=23, data_type="string"
+    )
+    ir = validated_ir(
+        filtered_account_ir(snapshot, city_ref=city_ref),
+        snapshot,
+        question,
+        generation_route="default_ir",
+    )
+    compiled = DialectCompiler("duckdb").compile(
+        ir, snapshot, question, max_rows=100
+    )
+    artifact = to_sql_artifact(compiled)
+    assert "London" not in ir.model_dump_json()
+    assert "London" not in compiled.sql
+    assert "?" in compiled.sql
+    assert [item.value for item in compiled.parameters] == ["London"]
+    assert "London" not in artifact.model_dump_json()
+    assert artifact.parameter_count == 1
+    assert artifact.parameter_types == ("string",)
+
+
+def test_governed_literal_resolves_only_by_snapshot_id(snapshot_with_literals):
+    question = canonicalize_question("Show active accounts")
+    ref = GovernedLiteralRef(kind="governed", literal_id="literal.account-active")
+    compiled = compile_status_ir(snapshot_with_literals, question, ref)
+    assert compiled.parameters[0].value == "ACTIVE"
+    assert "ACTIVE" not in compiled.sql
+
+
+def test_metric_formula_comes_from_snapshot_not_ir(snapshot):
+    question = canonicalize_question("card fraud rate")
+    ir = validated_ir(
+        card_fraud_metric_ir(snapshot), snapshot, question,
+        generation_route="default_ir",
+    )
+    compiled = DialectCompiler("duckdb").compile(
+        ir, snapshot, question, max_rows=100
+    )
+    assert normalized_sql(snapshot.metric("metric.card-fraud-rate").formula) in normalized_sql(compiled.sql)
+```
+
+Run: `.venv/bin/python -m pytest tests/test_sql_compiler.py -v`
+
+Expected: fail because `DialectCompiler` does not exist.
+
+- [ ] **Step 2: Topologically normalize validated IR**
+
+Reject unvalidated input at the type boundary by accepting `ValidatedIR`, not bare `RelationalQueryIR`. Before traversal, recompute canonical IR, snapshot, and canonical-question hashes; verify the original generation route and accepted-plan-hash cross-fields; and return `validated_ir_integrity_error` with no SQL if nested IR or bound context changed after validation. Traverse in stable topological order using node ID only as a deterministic tie-breaker. Assign table aliases `t0`, `t1`, and CTE aliases `q0`, `q1` in traversal order; never reuse model-proposed aliases.
+
+- [ ] **Step 3: Resolve literal refs locally and build SQL with sqlglot AST nodes**
+
+Construct identifiers, predicates, joins, aggregates, projections, sort, limit, window, and safe set operations through `sqlglot.exp`. Expand relationship predicates and metric formulas only from the snapshot. `LiteralResolver` first validates the canonical-question hash on `ValidatedIR`. For `QuestionLiteralRef`, enforce code-point bounds and exactly one token from `008.literal-span.v1`: matching single/double-quoted content (no escapes) is one token excluding quotes; otherwise a token is the maximal run between ASCII space or `,;()[]{}?!`. Apply the exact parser registry: NFC text for `string`; signed ASCII digits or a case-insensitive single-token cardinal `0..19`/exact tens `20..90` for `integer`; finite non-exponent base-10 for `decimal`; `true|false` for `boolean`; valid `YYYY-MM-DD` for `date`; and valid `YYYY-MM-DD[T ]HH:MM:SS` with optional fraction/no implicit timezone conversion for `timestamp`. Enforce consuming semantic bounds such as positive amounts/limits. For `GovernedLiteralRef`, require exact snapshot ID/type and use only its authored constant. Every ref becomes one positional `?` plus one internal `BoundParameter`; deterministic depth-first expression traversal fixes parameter order. Invalid boundaries, parse/type/bound mismatch, unknown governed ID, or any embedded/invented value raises a sanitized literal-resolution error and emits no SQL.
+
+- [ ] **Step 4: Enforce generation-route and row-limit semantics during compilation**
+
+Reject `WindowNode` and `SetOperationNode` unless `validated_ir.generation_route == "planned_ir"`; a cache hit does not alter that field. Resolve IR `LimitNode.count`, relative-time amount, window offsets, minimum-group guards, and assumption operands through `LiteralResolver`. The effective limit is the minimum of trusted request max rows, policy cap, and resolved positive IR limit. A sensitive disclosure cannot obtain a larger cap by omitting `LimitNode`. Trusted deployment caps are local configuration and are not model literal refs.
+
+- [ ] **Step 5: Add compiler-defect and no-raw-SQL tests**
+
+```python
+def test_ir_contract_contains_no_raw_sql_intent_or_literal_value_field():
+    schema = json.dumps(RelationalQueryIR.model_json_schema(), sort_keys=True)
+    assert '"sql"' not in schema
+    assert '"expression_sql"' not in schema
+    assert '"intent"' not in schema
+    assert '"value"' not in json.dumps(LiteralExpression.model_json_schema(), sort_keys=True)
+
+
+@pytest.mark.parametrize("mutation, expected", [
+    ("span_out_of_bounds", "invalid_literal_reference"),
+    ("span_splits_token", "invalid_literal_reference"),
+    ("scalar_parse_mismatch", "invalid_literal_type"),
+    ("unknown_governed_literal", "ungrounded_literal_reference"),
+    ("governed_type_mismatch", "invalid_literal_type"),
+])
+def test_literal_resolution_fails_without_partial_query(
+    snapshot, mutation, expected,
+):
+    with pytest.raises(CompilerError) as caught:
+        compile_literal_mutation(snapshot, mutation)
+    assert caught.value.code == expected
+    assert not hasattr(caught.value, "sql")
+    assert "value" not in str(caught.value).lower()
+
+
+def test_mutated_validated_ir_fails_integrity_before_compilation(snapshot):
+    question = canonicalize_question("transaction volume by branch")
+    accepted = validated_ir(
+        branch_volume_ir(snapshot), snapshot, question,
+        generation_route="default_ir",
+    )
+    accepted.ir.nodes[0].node_id = "tampered"
+    with pytest.raises(CompilerError) as caught:
+        DialectCompiler("duckdb").compile(
+            accepted, snapshot, question, max_rows=100
         )
+    assert caught.value.code == "validated_ir_integrity_error"
+    assert not hasattr(caught.value, "sql")
+
+
+def test_unknown_compiler_node_fails_without_partial_query(snapshot):
+    with pytest.raises(CompilerError) as caught:
+        compile_corrupted_validated_ir(snapshot, node_kind="recursive")
+    assert caught.value.code == "unsupported_compiler_node"
+    assert not hasattr(caught.value, "sql")
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 6: Verify compiler behavior**
 
-Run: `python -m pytest tests/test_text2sql_agent.py -v`
-Expected: 8 passed
+```bash
+.venv/bin/python -m pytest tests/test_sql_compiler.py -v
+```
 
-- [ ] **Step 5: Add the FR-715 assumption test**
+Expected: pass with stable SQL and parameter order on repeated and shuffled-map inputs.
 
-Append to `tests/test_text2sql_agent.py`:
+- [ ] **Step 7: Commit only if authorized**
+
+```bash
+git add src/cerebro/sql_compiler.py src/cerebro/models.py tests/test_sql_compiler.py tests/text2sql_factories.py
+git commit -m "feat: compile relational IR deterministically"
+```
+
+---
+
+### Task 7: Rebind semantic, AST, lineage, and disclosure gates to IR
+
+Implements FR-709a–FR-715, AC-700–AC-703, AC-705, AC-709.
+
+**Files:**
+- Modify: `src/cerebro/selfcheck.py`
+- Modify: `tests/test_selfcheck_plan.py` (retain only local missing-grounding and policy-refusal regressions; IR graph assertions live in `test_selfcheck_ir.py`)
+- Rewrite: `tests/test_selfcheck_sql.py`
+- Create: `tests/test_selfcheck_semantics.py`
+- Modify: `tests/text2sql_factories.py`
+
+**Interfaces:**
+- `authorize_compiled_query(compiled, validated_ir, snapshot, canonical_question, caps) -> SQLAuthorizationResult`
+- `SQLReferenceGraph` resolves physical sources, columns, joins, predicates, functions, literal placeholders/parameter positions, branches, windows, set operations, and output positions.
+- `PredicateLedger` requires exactly one IR declaration for each non-relationship predicate.
+- `SQLAuthorizationResult` exposes lineage/disclosures only when violations are empty; it never exposes parameter values.
+
+- [ ] **Step 1: Inject compiler defects and prove post-compile containment catches them**
 
 ```python
-def test_directional_question_records_an_ungoverned_assumption():
-    # Verified: this phrasing retrieves seven tables including table.transactions.
-    grounding = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE)).grounding("total outflow by month")
-    index = grounding_index(grounding)
-    plan = QueryPlan(
-        intent="outflow by month",
-        grain="one row per month",
-        tables=["table.transactions"],
-        columns=["amount", "txn_type", "txn_date"],
-        group_by=["month"],
-        warnings_addressed=index.warnings_by_object["table.transactions"],
+@pytest.mark.parametrize("mutation, expected", [
+    ("extra_table", "ungrounded_sql_reference"),
+    ("extra_column", "ungrounded_sql_reference"),
+    ("wrong_join", "relationship_mismatch"),
+    ("extra_filter", "undeclared_filter"),
+    ("external_scan", "unsafe_sql_source"),
+    ("extra_literal", "undeclared_literal"),
+    ("parameter_position_swap", "compiled_parameter_mismatch"),
+    ("larger_limit", "compiled_limit_mismatch"),
+])
+def test_compiler_defect_stops_before_engine(
+    compiled_query, validated_ir, snapshot, canonical_question, mutation, expected,
+):
+    corrupted = mutate_compiled_query(compiled_query, mutation)
+    result = authorize_compiled_query(
+        corrupted, validated_ir, snapshot, canonical_question, DisclosureCaps.defaults()
     )
-    sql = "SELECT date_trunc('month', txn_date) AS month, SUM(amount) AS outflow FROM transactions GROUP BY 1"
-    provider = ScriptedProvider([plan, SQLDraft(sql=sql)])
-    response = Text2SQLAgent(provider, execute=lambda s, c: _result()).run(
-        SQLGenerationRequest(question="What is total outflow by month?", grounding=grounding)
-    )
+    assert expected in codes(result.violations)
+    assert result.output_lineage == ()
+    assert result.disclosures == ()
+```
 
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_selfcheck_sql.py tests/test_selfcheck_semantics.py -v
+```
+
+Expected: fail until SQL checks use IR rather than the v2 `QueryPlan`.
+
+- [ ] **Step 2: Resolve the complete SQL AST against IR**
+
+Resolve aliases, CTEs, subqueries, comma joins, `USING`, and each set leaf. Expand relationship equality endpoints to qualified `ColumnRef`. Match every SQL literal placeholder and parameter position to exactly one IR `LiteralRef` resolved against the same canonical-question hash/snapshot, comparing types without serializing values. Deny literal constants introduced by compiler defects, unknown AST nodes/functions, multiple statements, DDL/DML/admin nodes, secrets/settings, extensions, file/network/table functions, `NATURAL JOIN`, unbounded row-level cross joins, and join `OR`.
+
+- [ ] **Step 3: Account for every predicate exactly once**
+
+The ledger claims each term through one of: IR filter predicate, relative-time control, relationship edge, status assumption, or minimum-group disclosure guard. An unclaimed or multiply claimed term is `undeclared_filter`. No string comparison against model SQL is used.
+
+- [ ] **Step 4: Verify metric roots and warning controls**
+
+For each `MetricExpression`, identify one final output root-equivalent to the snapshot formula. Reject formula only in a dead CTE, changed denominator, wrapper, or another output. Re-run warning controls against IR refs, locally resolved parameter positions/types, and compiled AST so a compiler defect cannot bypass them. Never compare or emit resolved parameter values in a violation.
+
+- [ ] **Step 5: Derive complete output lineage and disclosure records**
+
+Propagate source columns and classifications through casts, `CASE`, concatenation, aggregate, window, and set outputs. Sensitive collection/string aggregates fail. Value-preserving output requires every source column plus finite cap. Reducing aggregates require allowed function and minimum group size. For set operations, validate every leaf first and merge lineage by ordinal only after all leaves pass.
+
+- [ ] **Step 6: Add one-unsafe-set-leaf regression matrix**
+
+Cover at least: extra source, wrong metric root, wall-clock relative time, incomplete signed direction, sensitive `LIST`, missing group threshold, and status-mapping mismatch. Every production-path case must prove validator and executor call counts remain zero.
+
+- [ ] **Step 7: Verify deterministic authorization**
+
+```bash
+.venv/bin/python -m pytest tests/test_selfcheck_ir.py tests/test_selfcheck_sql.py tests/test_selfcheck_semantics.py -v
+```
+
+Expected: pass without provider or engine.
+
+- [ ] **Step 8: Commit only if authorized**
+
+```bash
+git add src/cerebro/selfcheck.py tests/test_selfcheck_plan.py tests/test_selfcheck_ir.py tests/test_selfcheck_sql.py tests/test_selfcheck_semantics.py tests/text2sql_factories.py
+git commit -m "fix: authorize compiled SQL against relational IR"
+```
+
+---
+
+### Task 8: Add scope-safe cache identity and global request budgets
+
+Implements FR-704b, FR-708, FR-716, FR-716a, AC-714, AC-715.
+
+**Files:**
+- Create: `src/cerebro/text2sql_cache.py`
+- Modify: `src/cerebro/text2sql.py` (budget primitives only)
+- Modify: `src/cerebro/models.py`
+- Create: `tests/test_text2sql_cache.py`
+- Create: `tests/test_text2sql_budget.py`
+
+**Interfaces:**
+- `CacheKey.from_request(..., canonical_question_hash, generation_route) -> CacheKey`
+- `CachedGeneration(ir, generation_route, accepted_complex_plan_hash, payload_sha256)` contains a value-free IR and original generation route only.
+- `Text2SQLCache.get(key) -> CachedGeneration | None`
+- `Text2SQLCache.put(key, value) -> None`
+- `RequestBudget.start(limits, clock) -> RequestBudget` always starts at semantic capacity one.
+- `budget.authorize_planned_ir(decision: AcceptedComplexRoute) -> None` is the only one-way capacity-one-to-two transition and validates current snapshot/plan binding.
+- `budget.before(action, estimated_tokens=0, estimated_cost_usd=Decimal("0"))` and `budget.record_*` enforce monotonic usage across provider/compiler/engine work.
+
+- [ ] **Step 1: Write the complete cache-key mutation matrix**
+
+```python
+CACHE_KEY_MUTATIONS = (
+    "authorization_scope_hash",
+    "snapshot_hash",
+    "policy_version",
+    "canonicalization_version",
+    "canonical_question_hash",
+    "literal_registry_version",
+    "dialect",
+    "generation_route",
+    "provider",
+    "model",
+    "model_revision",
+    "schema_mechanism",
+    "prompt_version",
+    "ir_contract_version",
+    "router_version",
+    "compiler_version",
+    "type_registry_version",
+    "checker_version",
+)
+
+
+@pytest.mark.parametrize("field", CACHE_KEY_MUTATIONS)
+def test_every_security_relevant_change_is_a_cache_miss(cache_fixture, field):
+    original = cache_fixture.key
+    cache_fixture.cache.put(original, cache_fixture.value)
+    changed = mutate_cache_key(original, field)
+    assert cache_fixture.cache.get(changed) is None
+
+
+def test_question_canonicalization_preserves_case_and_literals():
+    assert canonicalize_question("  Revenue\u00a0 for  Q1  ") == "Revenue for Q1"
+    assert canonicalize_question("Q1") != canonicalize_question("q1")
+    assert canonical_question_sha256("Q1") != canonical_question_sha256("q1")
+```
+
+Run: `.venv/bin/python -m pytest tests/test_text2sql_cache.py -v`
+
+Expected: fail until exact key identity exists.
+
+- [ ] **Step 2: Add cross-scope and integrity tests**
+
+A payload copied under another tenant/scope or canonical-question key must miss. Mutation of cached IR, `generation_route`, accepted complex-plan hash, or payload hash must yield `cache_integrity_error`; it cannot fall through as a hit. `planned_ir` requires a non-null accepted-plan hash; `default_ir` rejects one, and key route, payload route, reconstructed `ValidatedIR.generation_route`, and hash presence must agree. Reject `generation_route="cache"`. Cache values never contain canonical question text, embedded/resolved literal values, compiled SQL, bound parameters, result rows, credentials, or raw provider content. Add a serialization walk that rejects any IR `intent`/literal `value` key.
+
+- [ ] **Step 3: Implement canonical keys and original generation-route lookup**
+
+Compute `canonical_question_hash` from `canonicalize_question` version `008.question.v1`; do not case-fold or rewrite literals. Include canonicalization and `008.literal-span.v1` registry versions. Compute a base fingerprint, then probe exact `generation_route` keys in order `default_ir`, `planned_ir`; reject multiple hits as integrity failure. Stored `generation_route` must equal key route. Use full SHA-256 hashes, not truncated digests. On a hit, reconstruct `ValidatedIR` with its original route, validate every question span against the current canonical string/hash, rerun planned-route-only checks for cached windows/set operations, and compile again; no cached SQL exists to compare.
+
+```python
+def test_cached_planned_ir_preserves_route_and_revalidates_complex_nodes(cache_fixture):
+    cache_fixture.store_planned_ir()
+    hit = cache_fixture.lookup()
+    assert hit.generation_route == "planned_ir"
+    validated = validate_ir(
+        hit.ir,
+        cache_fixture.snapshot,
+        cache_fixture.canonical_question,
+        generation_route=hit.generation_route,
+    )
+    assert validated.validated_ir.generation_route == "planned_ir"
+```
+
+- [ ] **Step 4: Write call, token, cost, and deadline budget tests**
+
+```python
+def test_budget_defaults_are_exact():
+    limits = BudgetLimits.defaults()
+    assert limits.initial_semantic_call_capacity == 1
+    assert limits.planned_semantic_call_capacity == 2
+    assert limits.max_transport_attempts_per_semantic_call == 2
+    assert limits.provider_timeout_ms_per_attempt == 20_000
+    assert limits.max_input_tokens == 32_000
+    assert limits.max_output_tokens == 8_000
+    assert limits.max_cost_usd == Decimal("0.50")
+    assert limits.end_to_end_deadline_ms == 120_000
+
+
+def test_normal_route_rejects_second_semantic_call(fake_clock):
+    budget = RequestBudget.start(BudgetLimits.defaults(), fake_clock)
+    budget.before("default_ir")
+    budget.record_semantic_call(
+        input_tokens=100, output_tokens=20, cost_usd=Decimal("0.01")
+    )
+    with pytest.raises(BudgetExceeded) as caught:
+        budget.before("default_ir")
+    assert caught.value.code == "semantic_call_budget_exceeded"
+
+
+def test_planned_ir_transition_requires_current_router_acceptance(
+    fake_clock, snapshot,
+):
+    budget = RequestBudget.start(BudgetLimits.defaults(), fake_clock)
+    with pytest.raises(BudgetExceeded):
+        budget.before("planned_ir")
+    with pytest.raises(BudgetTransitionDenied):
+        budget.authorize_planned_ir(foreign_accepted_route(snapshot))
+
+
+def test_mutated_accepted_plan_cannot_authorize_fallback(fake_clock, snapshot):
+    budget = RequestBudget.start(BudgetLimits.defaults(), fake_clock)
+    accepted = ComplexityRouter().validate(
+        complex_window_plan(snapshot), snapshot
+    ).accepted
+    accepted.plan.expected_outputs = ("tampered",)
+    with pytest.raises(BudgetTransitionDenied):
+        budget.authorize_planned_ir(accepted)
+
+
+def test_accepted_transition_is_one_time_and_third_call_is_denied(
+    fake_clock, snapshot,
+):
+    budget = RequestBudget.start(BudgetLimits.defaults(), fake_clock)
+    budget.before("default_ir")
+    budget.record_semantic_call(input_tokens=1, output_tokens=1, cost_usd=Decimal("0"))
+    accepted = ComplexityRouter().validate(
+        complex_window_plan(snapshot), snapshot
+    ).accepted
+    budget.authorize_planned_ir(accepted)
+    assert budget.semantic_call_capacity == 2
+    with pytest.raises(BudgetTransitionDenied):
+        budget.authorize_planned_ir(accepted)
+    budget.before("planned_ir")
+    budget.record_semantic_call(input_tokens=1, output_tokens=1, cost_usd=Decimal("0"))
+    with pytest.raises(BudgetExceeded):
+        budget.before("planned_ir")
+
+
+def test_deadline_blocks_action_before_contact(fake_clock):
+    budget = RequestBudget.start(
+        BudgetLimits(end_to_end_deadline_ms=10),
+        fake_clock,
+    )
+    fake_clock.advance_ms(11)
+    with pytest.raises(BudgetExceeded):
+        budget.before("engine_validation")
+```
+
+- [ ] **Step 5: Implement monotonic budget accounting**
+
+Initialize semantic capacity to one regardless of request shape. Recompute the accepted plan hash and validate that `AcceptedComplexRoute` is authentic, unmodified, and bound to the exact current snapshot/plan before the one-way transition to two; deny caller-created, mutated, stale, foreign, absent, or repeated decisions. Before transition, deny `planned_ir` and every second semantic call; after transition, deny every third call. Enforce at most two transport attempts independently for each semantic call and the configured `20_000 ms` per-attempt timeout. Check hard deadline and estimated remaining cumulative token/USD/call capacity before each provider, compiler, `EXPLAIN`, and execution action. Record actual gateway usage after calls, never decrement counters or erase transport attempts, and span both calls plus engine work in one budget. `BudgetUsage` is returned on every terminal response.
+
+- [ ] **Step 6: Verify cache and budget modules**
+
+```bash
+.venv/bin/python -m pytest tests/test_text2sql_cache.py tests/test_text2sql_budget.py -v
+```
+
+Expected: pass without provider or database.
+
+- [ ] **Step 7: Commit only if authorized**
+
+```bash
+git add src/cerebro/text2sql_cache.py src/cerebro/text2sql.py src/cerebro/models.py tests/test_text2sql_cache.py tests/test_text2sql_budget.py
+git commit -m "feat: add scoped cache and request budgets"
+```
+
+---
+
+### Task 9: Make `EXPLAIN` and execution parameter-aware, mandatory, and race-safe
+
+Implements FR-714, FR-718–FR-722, AC-709.
+
+**Files:**
+- Modify: `src/cerebro/executor.py`
+- Rewrite: `tests/test_executor.py`
+- Modify: `tests/test_selfcheck_engine.py`
+
+**Interfaces:**
+- `EngineValidator.validate(compiled: CompiledQuery) -> tuple[CheckViolation, ...]`
+- `Executor.execute(compiled: CompiledQuery, max_rows: int) -> QueryResult`
+- `DuckDBExecutor` implements both protocols and owns one serialized read-only connection.
+- `_run_with_deadline(action, interrupt, timeout_seconds, phase) -> T` is the only watchdog primitive.
+
+- [ ] **Step 1: Add parameter binding and mandatory dependency tests**
+
+```python
+def test_explain_and_execution_receive_identical_parameters(database):
+    compiled = CompiledQuery(
+        sql="SELECT account_id FROM accounts WHERE account_id = ?",
+        parameters=(BoundParameter(position=1, data_type="integer", value=7),),
+        ir_hash="0" * 64,
+        compiler_version="test",
+        dialect="duckdb",
+    )
+    executor = DuckDBExecutor(database)
+    assert executor.validate(compiled) == ()
+    result = executor.execute(compiled, max_rows=10)
+    assert result.columns == ["account_id"]
+```
+
+Run: `.venv/bin/python -m pytest tests/test_executor.py tests/test_selfcheck_engine.py -v`
+
+Expected: fail against string-only executor protocols.
+
+- [ ] **Step 2: Add interruption race and no-partial-row tests**
+
+Prove one watchdog interrupts at most once, success cannot receive a late interrupt, execute plus fetch share one deadline, timeout discards buffered rows, and the connection is verified or replaced only after watchdog join.
+
+- [ ] **Step 3: Implement one synchronized watchdog per phase**
+
+Use `threading.Event` completion/fired flags and unconditional thread join. Set `fired` before `interrupt()` so the deadline wins a simultaneous completion race. Keep the connection lock through join and recovery. Do not use `threading.Timer` or `SET statement_timeout`.
+
+- [ ] **Step 4: Apply finite supported DuckDB settings**
+
+Record effective explain/execute deadlines, row cap, memory, threads, and temporary-directory policy. Unsupported required settings fail construction with `ExecutorConfigurationError`, mapped later to `execution_error` before any provider contact.
+
+- [ ] **Step 5: Verify engine behavior**
+
+```bash
+.venv/bin/python -m pytest tests/test_executor.py tests/test_selfcheck_engine.py -v
+```
+
+Expected: pass for parameter binding, zero rows, max_rows+1 truncation detection, read-only connection, interruption races, no partial rows, and reuse/replacement.
+
+- [ ] **Step 6: Commit only if authorized**
+
+```bash
+git add src/cerebro/executor.py tests/test_executor.py tests/test_selfcheck_engine.py
+git commit -m "fix: bind and bound text-to-sql execution"
+```
+
+---
+
+### Task 10: Rebuild orchestration around one-call IR and guarded fallback
+
+Implements FR-702–FR-708, FR-714–FR-722, AC-704, AC-711, AC-713–AC-715.
+
+**Files:**
+- Rewrite: `src/cerebro/text2sql.py`
+- Rewrite: `tests/test_text2sql_agent.py`
+
+**Interfaces:**
+
+```python
+Text2SQLAgent(
+    resolver: GroundingResolver,
+    provider: Text2SQLGenerationProvider,  # production instance is GuardedProvider
+    router: ComplexityRouter,
+    compiler: DialectCompiler,
+    cache: Text2SQLCache,
+    validator: EngineValidator,
+    executor: Executor,
+    *,
+    disclosure_caps: DisclosureCaps,
+    budget_limits: BudgetLimits,
+    versions: RuntimeVersions,
+)
+```
+
+`run(request: SQLGenerationRequest) -> SQLGenerationResponse`. Every dependency is mandatory; `None` is invalid. The constructor rejects a production provider that is not `GuardedProvider`; protocol-conforming scripted guards are explicit test composition. `text2sql.py` imports `Text2SQLGenerationProvider` from `text2sql_provider.py`, never `GenerationProvider` from enrichment or `OrganizerModelGateway`.
+
+- [ ] **Step 1: Write exact default, complex, and cache call-count tests**
+
+```python
+def test_normal_request_makes_one_semantic_call(agent_fixture):
+    fixture = agent_fixture(provider_outputs=[minimal_ir()])
+    response = fixture.agent.run(valid_request())
     assert response.status == "ok"
-    assert any("not governed" in note for note in response.assumptions)
+    assert response.generation_route == "default_ir"
+    assert response.cache_status == "miss"
+    assert fixture.provider.semantic_calls == 1
+
+
+def test_complex_request_makes_exactly_two_semantic_calls_after_transition(agent_fixture):
+    fixture = agent_fixture(
+        provider_outputs=[complex_window_plan(), relative_growth_ir()]
+    )
+    response = fixture.agent.run(
+        valid_request(question="month over month growth over the last 24 months")
+    )
+    assert response.status == "ok"
+    assert response.generation_route == "planned_ir"
+    assert response.cache_status == "miss"
+    assert response.budget_usage.semantic_calls == 2
+    assert response.budget_usage.planned_ir_authorized is True
+
+
+def test_cached_planned_ir_preserves_generation_route_and_revalidates(agent_fixture):
+    fixture = agent_fixture(preloaded_planned_ir_cache=True, provider_outputs=[])
+    response = fixture.agent.run(
+        valid_request(question="month over month growth over the last 24 months")
+    )
+    assert response.status == "ok"
+    assert response.generation_route == "planned_ir"
+    assert response.cache_status == "hit"
+    assert fixture.provider.semantic_calls == 0
+    assert fixture.ir_checker.calls == ["planned_ir"]
+    assert fixture.compiler.calls == 1
+    assert fixture.ast_checker.calls == 1
+    assert fixture.validator.calls == 1
+    assert fixture.executor.calls == 1
 ```
 
-The phrasing is not arbitrary. `"total outflow by month"` was checked against
-the retriever and returns `table.accounts`, `table.branches`, `table.customers`,
-`table.employees`, `table.loan_payments`, `table.loans`, and
-`table.transactions`. Retrieval is deterministic for a fixed bundle, so this
-holds as long as the bundle version does not change.
+Run: `.venv/bin/python -m pytest tests/test_text2sql_agent.py -v`
 
-Also add the missing import to the test file's header:
+Expected: fail against unconditional plan plus SQL generation.
 
-```python
-from cerebro.paths import DEFAULT_BUNDLE
+- [ ] **Step 2: Implement the exact orchestration order**
+
+1. Start `RequestBudget` at semantic capacity one; validate the request/scope.
+2. Canonicalize the question with `008.question.v1`, compute its hash, then resolve/hash the authorized snapshot.
+3. Probe exact `default_ir` and `planned_ir` generation-route cache keys; validate payload integrity and preserve the hit's original route.
+4. On miss, budget and make one `default_ir` call for `IRGenerationOutcome`.
+5. Locally verify `GroundingRefusal`; validate and terminate a `ClarificationRequest`; validate direct IR; or validate complex escalation.
+6. For locally produced `AcceptedComplexRoute` only, call `budget.authorize_planned_ir(decision)` once, then budget/make one `planned_ir` call; require fallback IR to implement the accepted plan.
+7. Validate IR graph, membership, canonical literal refs, dataflow, explicit type/signature rules, and generation-route restrictions; derive local policy/literal clarification before compilation. A cache hit enters here with its original route and zero semantic calls.
+8. Resolve literal refs against the exact canonical question/snapshot and compile deterministically; resolved values remain internal.
+9. Authorize compiled AST, placeholders/parameters, metrics, warnings, assumptions, lineage, and disclosure.
+10. Run mandatory parameter-aware `EXPLAIN` under the same cumulative deadline/budget.
+11. Execute once under remaining deadline; discard partial rows on failure.
+12. Assemble exactly one strict response with original `generation_route` plus independent `cache_status`; cache only validated value-free IR/generation artifacts.
+
+A valid clarification performs no fallback, compilation, `EXPLAIN`, or execution. No failure after step 6 contacts the provider again; no path can perform a third semantic call.
+
+- [ ] **Step 3: Map every terminal failure to its originating phase**
+
+Use this exhaustive table:
+
+| Origin | Code | Attempt stage |
+|---|---|---|
+| missing organizer configuration | `provider_configuration_error` | `provider_transport` |
+| exhausted retryable transport (at most two attempts/call) | `provider_unavailable` | `provider_transport` |
+| non-retryable rejection | `provider_rejected` | `provider_transport` |
+| guarded egress denial | `egress_blocked` | requested semantic stage |
+| default outcome schema failure | `unparsable_generation_outcome` | `default_ir` |
+| fallback schema failure | `unparsable_fallback_ir` | `planned_ir` |
+| valid typed ambiguity | local `refused / clarification_required` | `clarification` |
+| invalid span/candidates/relevance in model ambiguity | `invalid_clarification_request` | `clarification` |
+| invalid complex plan/operator | local refusal or `invalid_complex_plan` | `complexity` |
+| premature/foreign/repeated planned transition or third call | `budget_exceeded` | blocked `planned_ir` stage |
+| invalid IR graph/membership/type/placement | exact IR/type violation | requested generation stage |
+| post-validation IR/snapshot/question hash drift | `validated_ir_integrity_error` | `compile` |
+| ungrounded/unresolvable/invented literal ref | local `refused / clarification_required` with `LiteralClarificationNeed` | `literal_resolution` |
+| compiler failure | `compiler_error` | `compile` |
+| post-compile parser/containment/parameter failure | exact AST violation | `ast_check` |
+| cache hash/payload/generation-route mismatch | `cache_integrity_error` | `cache` |
+| hard deadline/token/cost/call limit exhaustion | `budget_exceeded` | blocked next stage |
+| binder/type failure | `explain_failed` | `engine_validation` |
+| explain deadline | `explain_timeout` | `engine_validation` |
+| execute/fetch deadline | `execution_timeout` | `execution` |
+| sanitized execute/configuration failure | `execution_error` | `execution` |
+
+- [ ] **Step 4: Add no-repair and no-engine-contact assertions**
+
+For each clarification, IR graph/type, literal, compiler, AST, disclosure, router, cache, and budget failure, assert no `EXPLAIN` or execute call. Valid clarification and local literal clarification also assert no fallback call or SQL artifact. For compiler, validation, and execution failure, assert semantic call count does not increase. For first-boundary egress denial, assert zero inner calls; for denied fallback or premature budget transition, preserve the first call and add no second. Explicitly assert a repeated transition and third call are blocked before provider contact.
+
+- [ ] **Step 5: Verify local refusal behavior**
+
+An absent `GroundingNeed` can return `missing_grounding`; a present claimed-missing object returns `check_failed`. Unbounded sensitive output becomes local `policy_disallowed`. Unsupported complex operator returns refusal before compilation. A valid model `ClarificationRequest` returns `clarification_required` with locally validated `ambiguities`, `generation_route="default_ir"`, and `cache_status="miss"`; out-of-bounds/non-token spans, fewer than two distinct candidates, nonmembers, mixed kinds, or irrelevant candidates return `check_failed / invalid_clarification_request`. Ungrounded, unresolvable, or invented physical literal refs return `clarification_required` with one or more value-free `LiteralClarificationNeed` records, no fabricated ambiguity, the IR's original generation route, and current cache status; they never create an invented bound value.
+
+- [ ] **Step 6: Verify orchestration and contracts**
+
+```bash
+.venv/bin/python -m pytest tests/test_text2sql_agent.py tests/test_text2sql_contract.py tests/test_text2sql_cache.py tests/test_text2sql_budget.py tests/test_complexity_router.py tests/test_hosted_provider.py -v
+! grep -R "from \.enrichment\|from cerebro\.enrichment\|import cerebro\.enrichment" src/cerebro/text2sql.py
 ```
 
-- [ ] **Step 6: Run the full suite**
+Expected: every generation-route/cache call-count, clarification, guarded-transition, phase, no-contact, value-free response, and zero-row invariant passes offline.
 
-Run: `python -m pytest tests/ -v`
-Expected: all tests pass
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Commit only if authorized**
 
 ```bash
 git add src/cerebro/text2sql.py tests/test_text2sql_agent.py
-git commit -m "feat: add two-stage grounded text-to-sql agent"
+git commit -m "refactor: orchestrate one-call relational IR"
 ```
 
 ---
 
-### Task 8: Read-only executor with row cap and timeout
+### Task 11: Rebuild offline reference and CLI composition around the compiler
 
-Implements FR-718 to FR-722. Verifies T-711, T-712.
+Implements FR-703c, FR-703d, FR-704, FR-723, AC-706, AC-707, AC-710, AC-714, AC-715.
 
 **Files:**
-- Create: `src/cerebro/executor.py`
-- Create: `tests/test_executor.py`
+- Modify actual production constructor: `src/cerebro/evaluation.py`
+- Modify actual CLI constructor: `src/cerebro/cli.py`
+- Verify grounding-only boundary unchanged: `src/cerebro/api.py`
+- Rewrite: `tests/golden_answers.py`
+- Create or modify: `tests/fixtures/text2sql-supported-questions.yaml`
+- Rewrite: `tests/test_baseline_evaluation.py`
+- Modify: `tests/test_prompt_egress.py`
+- Modify: `tests/test_retrieval_api_mcp.py`
+- Verify unchanged: `tests/test_enrichment.py`
 
 **Interfaces:**
-- Produces:
-  - `class DuckDBExecutor` constructed as `DuckDBExecutor(database_path, timeout_seconds=30)`
-  - `DuckDBExecutor.__call__(sql: str, max_rows: int) -> QueryResult` so it satisfies `Executor`
-  - `DuckDBExecutor.connection` for passing to `check_engine`
-  - `DuckDBExecutor.close() -> None`
+- `build_agent(database_path, provider_mode, authorization_scope, provider=None) -> AgentRuntime`
+- `run_offline_reference(...) -> OfflineReferenceRun`; persisted entries retain question ID plus canonical-question hash, never question text.
+- `GoldenProvider` structurally implements `Text2SQLGenerationProvider`, emits typed/value-free `IRGenerationOutcome`, and never stores SQL, resolved literals, or imports enrichment.
+- CLI modes remain `ask`, `reference`, and `baseline` with no implicit fallback.
+- The current `cli.py` and `evaluation.py` calls that build `SQLGenerationRequest(question=..., grounding=retriever.grounding(...))` must become `SQLGenerationRequest(question=..., authorization_scope=trusted_scope)` and use the centralized agent's `GroundingResolver`. No HTTP/MCP `GroundingResponse` is reused.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Convert deterministic answers from SQL to IR fixtures**
 
-Create `tests/test_executor.py`:
+For metric, two-hop join, bounded disclosure, and zero-row cases, store one value-free `RelationalQueryIR` output. Build each question first with `canonicalize_question`, then derive every amount/limit/filter span by code-point offset; for example, `five`, `24`, and the zero-row fixture's explicit `0` are `QuestionLiteralRef`, not `5`/`24`/`0` embedded in IR. Use `GovernedLiteralRef` only for stable constants authored in the snapshot. Do not infer numeric zero from prose such as “negative amount.” The relative-time growth case stores exactly two scripted outputs: an accepted `ComplexQueryPlan` using `window.period_over_period.v1`, then its conforming fallback IR. Expected SQL and resolved values belong only in compiler/executor assertions, not provider fixtures, cache payloads, or artifacts.
 
-```python
-from __future__ import annotations
+- [ ] **Step 2: Preserve the supported capability set**
 
-import duckdb
-import pytest
+Use these cases:
 
-from cerebro.executor import DuckDBExecutor
-
-
-@pytest.fixture
-def database(tmp_path):
-    path = tmp_path / "t.duckdb"
-    con = duckdb.connect(str(path))
-    con.execute("CREATE TABLE t (a BIGINT, b VARCHAR)")
-    con.execute("INSERT INTO t SELECT i, 'x' FROM range(10) AS s(i)")
-    con.close()
-    return path
-
-
-def test_returns_metadata_and_rows(database):
-    executor = DuckDBExecutor(database)
-    result = executor("SELECT a, b FROM t ORDER BY a", max_rows=100)
-    executor.close()
-
-    assert result.columns == ["a", "b"]
-    assert result.column_types == ["BIGINT", "VARCHAR"]
-    assert result.row_count == 10
-    assert result.truncated is False
-    assert result.elapsed_ms >= 0
-
-
-def test_row_cap_truncates_rather_than_raising(database):
-    executor = DuckDBExecutor(database)
-    result = executor("SELECT a FROM t ORDER BY a", max_rows=3)
-    executor.close()
-
-    assert result.row_count == 3
-    assert result.truncated is True
-
-
-def test_zero_rows_is_not_an_error(database):
-    executor = DuckDBExecutor(database)
-    result = executor("SELECT a FROM t WHERE a > 999", max_rows=100)
-    executor.close()
-
-    assert result.row_count == 0
-    assert result.truncated is False
-
-
-def test_connection_is_read_only(database):
-    executor = DuckDBExecutor(database)
-    with pytest.raises(Exception):
-        executor.connection.execute("CREATE TABLE blocked (x INTEGER)")
-    executor.close()
+```yaml
+questions:
+  - id: metric-fidelity
+    question: What is the card fraud rate by card type?
+  - id: two-hop-join
+    question: What is transaction volume by branch?
+  - id: relative-time
+    question: What is monthly transaction growth over the last 24 months of available data?
+  - id: bounded-disclosure
+    question: Which five customers have the highest annual income?
+  - id: zero-row
+    question: List card transaction IDs with amount below 0.
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+`metric-fidelity`, `two-hop-join`, `bounded-disclosure`, and `zero-row` use `generation_route="default_ir"` with one call. `relative-time` requires period-over-period `LAG`, so local complex-plan acceptance performs the budget transition and one `planned_ir` call; it records `generation_route="planned_ir"` and exactly two total semantic calls. Cache status is asserted separately and never changes either route.
 
-Run: `python -m pytest tests/test_executor.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'cerebro.executor'`
-
-- [ ] **Step 3: Write minimal implementation**
-
-Create `src/cerebro/executor.py`:
+- [ ] **Step 3: Assert non-vacuous outcomes and call counts**
 
 ```python
-"""Read-only DuckDB execution for the demo path.
-
-This is demo glue, not the Governed Query Executor described in the README. It
-bounds rows and time. It does not do identity, authorization, audit logging, or
-cost accounting.
-"""
-
-from __future__ import annotations
-
-import time
-from pathlib import Path
-
-import duckdb
-
-from .models import QueryResult
-
-
-class DuckDBExecutor:
-    def __init__(self, database_path: Path | str, timeout_seconds: int = 30):
-        self.connection = duckdb.connect(str(database_path), read_only=True)
-        self.connection.execute(f"SET statement_timeout = {int(timeout_seconds) * 1000}")
-
-    def __call__(self, sql: str, max_rows: int) -> QueryResult:
-        started = time.perf_counter()
-        cursor = self.connection.execute(sql)
-        rows = cursor.fetchmany(max_rows + 1)
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        truncated = len(rows) > max_rows
-        rows = rows[:max_rows]
-        description = cursor.description or []
-        return QueryResult(
-            columns=[column[0] for column in description],
-            column_types=[str(column[1]) for column in description],
-            rows=[list(row) for row in rows],
-            row_count=len(rows),
-            truncated=truncated,
-            elapsed_ms=elapsed_ms,
-        )
-
-    def close(self) -> None:
-        self.connection.close()
+@pytest.mark.parametrize("case_id", [
+    "metric-fidelity",
+    "two-hop-join",
+    "relative-time",
+    "bounded-disclosure",
+    "zero-row",
+])
+def test_supported_case_reaches_ok(case_id, offline_run):
+    response = offline_run.responses_by_id[case_id]
+    assert response.status == "ok"
+    assert response.output_lineage
+    expected_route = "planned_ir" if case_id == "relative-time" else "default_ir"
+    expected_calls = 2 if case_id == "relative-time" else 1
+    assert response.generation_route == expected_route
+    assert response.cache_status == "miss"
+    assert response.budget_usage.semantic_calls == expected_calls
+    serialized = response.model_dump_json()
+    assert '"intent"' not in serialized
+    assert '"value"' not in response.ir.model_dump_json()
 ```
 
-If `SET statement_timeout` is rejected by the installed DuckDB build, replace
-that line with `SET statement_timeout = '30s'` and adjust the argument
-accordingly; check `SELECT * FROM duckdb_settings() WHERE name LIKE '%timeout%'`
-to see the accepted form. Do not silently drop the timeout.
+For `zero-row`, require `rows == []`, `row_count == 0`, one execution, and no semantic retry. Test `COUNT(*) = 0` separately as one returned row.
 
-If `column_types` comes back as Python type objects rather than DuckDB type
-names, use `cursor.types` instead of `description[1]`; assert against the real
-values you observe rather than changing the test to match a bug.
+- [ ] **Step 4: Centralize runtime composition**
 
-- [ ] **Step 4: Run tests to verify they pass**
+`build_agent` constructs trusted authorization scope → canonicalizer/resolver → `GuardedProvider` wrapping organizer/cassette/scripted protocol adapter → router → compiler/literal resolver → cache → validator/executor → agent. CLI and evaluation import this function; neither constructs prompts, providers, cache keys, snapshots, or agents ad hoc. Migrate both actual source call sites from `question + retriever.grounding(...)` to `question + trusted AuthorizationScope`; the agent itself resolves grounding. `api.py` stays unchanged as advisory grounding, and tests prove its response is not accepted by this composition.
 
-Run: `python -m pytest tests/test_executor.py -v`
-Expected: 4 passed
+- [ ] **Step 5: Keep CLI modes explicit**
 
-- [ ] **Step 5: Commit**
+- `cerebro ask`: live organizer provider plus explicit trusted authorization-scope input only; missing provider/scope configuration returns typed JSON and exit 2. It never calls `/api/grounding` or accepts serialized `GroundingResponse`.
+- `cerebro reference`: scripted/cassette offline only with an explicit fixture scope; writes `run_kind=offline_reference` and never result or resolved literal values.
+- `cerebro baseline`: live organizer provider plus explicit trusted scope only; owns current-run capability probing and never accepts `GoldenProvider`.
+- Existing HTTP `/api/grounding` and MCP commands remain advisory metadata retrieval only; do not add an SQL endpoint.
+
+- [ ] **Step 6: Verify offline operation with networking disabled**
 
 ```bash
-git add src/cerebro/executor.py tests/test_executor.py
-git commit -m "feat: add read-only executor with row cap and timeout"
+CEREBRO_TEST_NO_NETWORK=1 env -u CEREBRO_API_KEY -u OPENAI_API_KEY -u CEREBRO_MODEL .venv/bin/python -m pytest tests/test_baseline_evaluation.py tests/test_prompt_egress.py tests/test_retrieval_api_mcp.py tests/test_enrichment.py -v
+! grep -R "from cerebro\.enrichment\|import cerebro\.enrichment" tests/golden_answers.py
+CEREBRO_TEST_NO_NETWORK=1 env -u CEREBRO_API_KEY -u OPENAI_API_KEY -u CEREBRO_MODEL .venv/bin/python -m cerebro reference --output artifacts/offline-reference.json
+```
+
+Expected: all supported fixtures are `ok`, generation-route/cache/call counts match, artifact is value-free `offline_reference`, no external socket opens, grounding-only API cannot authorize execution, and enrichment behavior remains unchanged.
+
+- [ ] **Step 7: Commit only if authorized**
+
+```bash
+git add src/cerebro/evaluation.py src/cerebro/cli.py tests/golden_answers.py tests/fixtures/text2sql-supported-questions.yaml tests/test_baseline_evaluation.py tests/test_prompt_egress.py tests/test_retrieval_api_mcp.py
+git commit -m "fix: evaluate deterministic IR compilation offline"
 ```
 
 ---
 
-### Task 9: CLI command and baseline evaluation artifact
+### Task 12: Produce an evidence-bound live Option B baseline
 
-Implements AC-708, AC-709, AC-700 to AC-706 assertions. Verifies T-713, T-714, T-717.
+Implements FR-724, FR-725, AC-708, AC-713–AC-715.
 
 **Files:**
-- Modify: `src/cerebro/cli.py`
+- Modify: `src/cerebro/models.py` (artifact/evidence contracts)
 - Modify: `src/cerebro/evaluation.py`
-- Create: `tests/test_baseline_evaluation.py`
+- Modify: `src/cerebro/cli.py`
+- Modify: `scripts/text2sql_preflight.py`
+- Create or modify: `tests/test_text2sql_artifact.py`
+- Modify: `tests/test_baseline_evaluation.py`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1 to 8
-- Produces:
-  - `cerebro.evaluation.build_agent(database_path, provider=None) -> tuple[Text2SQLAgent, DuckDBExecutor]` — returns the executor too, because the caller owns closing it
-  - `cerebro.evaluation.run_sql_baseline(bundle_path, questions_path, database_path, provider=None, artifact_path=None) -> dict`
-  - CLI subcommands `cerebro ask "<question>"` and `cerebro baseline`
+- `ArtifactProvenance` adds retrieval, scope, snapshot, canonicalization, canonical-question, literal-registry, prompt, IR/type-registry, router, compiler, checker, cache, and exact budget version/hash evidence.
+- Each `EvaluationQuestion` records original `generation_route`, independent `cache_status`, canonical-question/snapshot/scope hashes, IR hash, value-free `SQLArtifact`, attempt records, budget usage, terminal status, result schema/count, lineage, and disclosures; it excludes canonical question text, resolved literal/bound parameter values, and result values.
+- `prepare_live_evidence(...) -> ValidatedLiveEvidence`
+- `validate_live_baseline(candidate, evidence) -> EvaluationArtifact | BlockedEvaluation`
+- Atomic writer accepts only validated `EvaluationArtifact`.
 
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/test_baseline_evaluation.py`:
+- [ ] **Step 1: Make every Option B evidence field mandatory**
 
 ```python
-from __future__ import annotations
-
-import json
-
-import pytest
-
-from cerebro.evaluation import run_sql_baseline
-from cerebro.paths import ROOT
-
-DATABASE = ROOT / "data" / "workshop.duckdb"
-pytestmark = pytest.mark.skipif(not DATABASE.exists(), reason="run scripts/load_duckdb.py first")
-
-
-def test_baseline_report_shape_and_gate(tmp_path):
-    report = run_sql_baseline(database_path=DATABASE)
-
-    assert set(report) >= {"questions", "totals", "model", "provider", "semantic_version"}
-    assert len(report["questions"]) == 10
-    for entry in report["questions"]:
-        assert entry["status"] in {"ok", "check_failed", "refused"}
-        assert "attempts" in entry
-        assert "violations" in entry
-
-    # AC-709: a contract violation may never reach execution.
-    for entry in report["questions"]:
-        if entry["violations"]:
-            assert entry["status"] == "check_failed"
-            assert entry["row_count"] is None
-
-
-def test_relative_time_question_anchors_on_max_txn_date():
-    report = run_sql_baseline(database_path=DATABASE)
-    entry = next(item for item in report["questions"] if item["id"] == "GQ-08")
-    if entry["status"] != "ok":
-        pytest.skip(f"GQ-08 did not reach ok on the baseline model: {entry['status']}")
-    sql = entry["sql"].upper()
-    assert "MAX(" in sql
-    assert "CURRENT_DATE" not in sql and "NOW()" not in sql
-
-
-def test_branch_question_uses_both_declared_joins():
-    report = run_sql_baseline(database_path=DATABASE)
-    entry = next(item for item in report["questions"] if item["id"] == "GQ-05")
-    if entry["status"] != "ok":
-        pytest.skip(f"GQ-05 did not reach ok on the baseline model: {entry['status']}")
-    assert "relationship.transaction_account" in entry["joins"]
-    assert "relationship.account_branch" in entry["joins"]
-
-
-def test_baseline_artifact_is_written(tmp_path):
-    target = tmp_path / "baseline.json"
-    run_sql_baseline(database_path=DATABASE, artifact_path=target)
-    payload = json.loads(target.read_text(encoding="utf-8"))
-    assert len(payload["questions"]) == 10
+@pytest.mark.parametrize("field", [
+    "retrieval_config_sha256",
+    "policy_version",
+    "canonicalization_version",
+    "canonical_question_hash_algorithm",
+    "literal_registry_version",
+    "prompt_version",
+    "ir_contract_version",
+    "type_registry_version",
+    "router_version",
+    "compiler_version",
+    "checker_sha256",
+    "budget_limits",
+])
+def test_live_artifact_requires_option_b_provenance(field, valid_artifact_dict):
+    payload = valid_artifact_dict()
+    del payload["provenance"][field]
+    with pytest.raises(ValidationError):
+        EvaluationArtifact.model_validate(payload)
 ```
 
-The three per-question tests skip rather than fail when the baseline model does
-not reach `ok`. That is deliberate: AC-703 and AC-705 constrain the *shape* of a
-successful answer, while the pass rate itself is the number spec 010 improves.
-Failing the build on a 3B model's pass rate would make the baseline unmeasurable.
+Run: `.venv/bin/python -m pytest tests/test_text2sql_artifact.py -v`
 
-- [ ] **Step 2: Run test to verify it fails**
+Expected: fail until v3 provenance is mandatory.
 
-Run: `python -m pytest tests/test_baseline_evaluation.py -v`
-Expected: FAIL with `ImportError: cannot import name 'run_sql_baseline'`
+- [ ] **Step 2: Bind capability evidence to the actual organizer runtime**
 
-- [ ] **Step 3: Write minimal implementation**
+The baseline creates a new run ID, derives provider/model/revision/schema mechanism from the actual gateway, performs exactly one fresh metadata-only capability probe before the first question, and writes a receipt bound to that run. Caller-supplied runtime identity or capability receipt is a type error.
 
-Extend `src/cerebro/evaluation.py`. Move the six import lines below up into the
-existing import block at the top of the file rather than leaving them mid-file;
-`yaml`, `Path`, `DEFAULT_BUNDLE`, `ROOT`, `load_validated_bundle`, and
-`SemanticRetriever` are already imported there and are reused as-is.
+- [ ] **Step 3: Record per-question generation route, cache, snapshot, and budget evidence**
 
-```python
-import json
-from datetime import datetime, timezone
+Final validation derives semantic call totals from attempts and requires:
 
-from .executor import DuckDBExecutor
-from .hosted_provider import provider_from_environment
-from .models import SQLGenerationRequest
-from .text2sql import Text2SQLAgent
+- default cache miss: `generation_route="default_ir"`, `cache_status="miss"`, exactly one semantic call, capacity one;
+- planned cache miss: `generation_route="planned_ir"`, `cache_status="miss"`, exactly two semantic calls and one locally accepted one-way capacity transition;
+- default cache hit: `generation_route="default_ir"`, `cache_status="hit"`, zero semantic calls plus current span/IR validation, local recompilation, AST/policy checks, and one `EXPLAIN`;
+- planned cache hit: `generation_route="planned_ir"`, `cache_status="hit"`, zero semantic calls plus planned-route complex-node validation, current span/type checks, local recompilation, AST/policy checks, and one `EXPLAIN`;
+- no entry uses `generation_route="cache"`, parallel candidates, repeated transition, third call, or post-compiler provider call;
+- cumulative usage stays within exact configured call/transport/token/USD/deadline limits;
+- value-free IR/artifacts contain no canonical question text, resolved literal values, or bound parameters.
 
+Any mismatch blocks the artifact.
 
-def build_agent(database_path: Path | str, provider=None) -> tuple[Text2SQLAgent, DuckDBExecutor]:
-    resolved = provider or provider_from_environment()
-    if resolved is None:
-        raise RuntimeError(
-            "No provider configured; set CEREBRO_API_KEY and CEREBRO_MODEL, "
-            "or pass a provider explicitly"
-        )
-    executor = DuckDBExecutor(database_path)
-    agent = Text2SQLAgent(resolved, execute=executor, connection=executor.connection)
-    return agent, executor
+- [ ] **Step 4: Preserve retained-path rereads and non-vacuity**
 
+Keep resolved immutable paths for source manifest, materialization receipt, bundle, database, and generated capability receipt. Final validation reopens and rehashes each. Require exactly ten unique expected golden IDs, totals derived from entries, reported-total equality, and at least one `ok`.
 
-def run_sql_baseline(
-    bundle_path: Path | str = DEFAULT_BUNDLE,
-    questions_path: Path | str = ROOT / "evaluation" / "golden-questions.yaml",
-    database_path: Path | str = ROOT / "data" / "workshop.duckdb",
-    provider=None,
-    artifact_path: Path | str | None = None,
-) -> dict:
-    retriever = SemanticRetriever(load_validated_bundle(bundle_path))
-    cases = yaml.safe_load(Path(questions_path).read_text(encoding="utf-8"))["questions"]
-    agent, executor = build_agent(database_path, provider)
-    entries = []
-    try:
-        for case in cases:
-            grounding = retriever.grounding(case["question"], limit=10)
-            response = agent.run(SQLGenerationRequest(question=case["question"], grounding=grounding))
-            entries.append(
-                {
-                    "id": case["id"],
-                    "question": case["question"],
-                    "status": response.status,
-                    "attempts": response.attempts,
-                    "sql": response.sql,
-                    "joins": list(response.plan.joins) if response.plan else [],
-                    "row_count": response.result.row_count if response.result else None,
-                    "violations": [v.code for v in response.violations],
-                    "assumptions": response.assumptions,
-                    "used_grounding_ids": response.used_grounding_ids,
-                }
-            )
-    finally:
-        executor.close()
+- [ ] **Step 5: Prove blocked validation never changes output**
 
-    totals: dict[str, int] = {}
-    for entry in entries:
-        totals[entry["status"]] = totals.get(entry["status"], 0) + 1
-    decoding_defects = sum(
-        1 for entry in entries if {"unparsable_plan", "unparsable_sql"} & set(entry["violations"])
-    )
-    report = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "semantic_version": retriever.bundle.version,
-        "provider": agent.provider.name,
-        "model": agent.provider.model,
-        "adapter": None,
-        "questions": entries,
-        "totals": totals,
-        "decoding_defects": decoding_defects,
-    }
-    if artifact_path is not None:
-        target = Path(artifact_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    return report
-```
+Test absent output remains absent and a pre-existing output remains byte-identical for each blocker: evidence drift, stale probe, wrong provider/model/revision, dirty code, question cardinality/duplicate, falsified totals, all failures, generation-route/cache/call-count mismatch, cached planned IR not route-revalidated, unauthorized/repeated budget transition, budget overflow, canonicalization/literal/type version drift, serialized canonical question/resolved value, or missing v3 provenance.
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `python -m pytest tests/test_baseline_evaluation.py -v`
-Expected: 4 passed or skipped, none failed
-
-- [ ] **Step 5: Wire the CLI**
-
-In `src/cerebro/cli.py`, add these subparsers inside `build_parser` after the `evaluate` block:
-
-```python
-    ask = commands.add_parser("ask", help="Answer one question through the grounded agent")
-    ask.add_argument("question")
-    ask.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
-    ask.add_argument("--database", type=Path, default=ROOT / "data" / "workshop.duckdb")
-    baseline = commands.add_parser("baseline", help="Run the golden set and write the baseline artifact")
-    baseline.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
-    baseline.add_argument("--database", type=Path, default=ROOT / "data" / "workshop.duckdb")
-    baseline.add_argument("--output", type=Path, default=ROOT / "artifacts" / "baseline.json")
-```
-
-Add these branches inside `main` before the `serve` branch:
-
-```python
-        elif args.command == "ask":
-            from .evaluation import build_agent
-            from .models import SQLGenerationRequest
-            from .retrieval import SemanticRetriever
-
-            retriever = SemanticRetriever(load_validated_bundle(args.bundle))
-            agent, executor = build_agent(args.database)
-            try:
-                response = agent.run(
-                    SQLGenerationRequest(
-                        question=args.question,
-                        grounding=retriever.grounding(args.question, limit=10),
-                    )
-                )
-            finally:
-                executor.close()
-            print(response.model_dump_json(indent=2))
-            return 0 if response.status == "ok" else 1
-        elif args.command == "baseline":
-            from .evaluation import run_sql_baseline
-
-            report = run_sql_baseline(
-                bundle_path=args.bundle, database_path=args.database, artifact_path=args.output
-            )
-            for entry in report["questions"]:
-                print(f"{entry['status']:<13} {entry['id']}  attempts={entry['attempts']}  {entry['question']}")
-            print(f"\ntotals: {report['totals']}  decoding_defects: {report['decoding_defects']}")
-            print(f"artifact: {args.output}")
-            return 0
-```
-
-Update the imports at the top of `cli.py`:
-
-```python
-from .bundle import BundleLoader, BundleValidator, load_validated_bundle
-from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG, ROOT
-```
-
-- [ ] **Step 6: Run the agent end to end**
+- [ ] **Step 6: Run offline artifact verification**
 
 ```bash
-python -m cerebro ask "What is the fraud rate by card type?"
-python -m cerebro baseline
+.venv/bin/python -m pytest tests/test_text2sql_artifact.py tests/test_baseline_evaluation.py -v
 ```
 
-Expected: the first prints a JSON response; the second prints ten status lines
-and writes `artifacts/baseline.json`. Record the totals line — that is the
-AC-708 baseline that spec 010 is measured against, and spec 010's AC-904 blocks
-training until this file exists.
+Expected: all schema, mismatch, drift, generation-route/cache, call-count, value-free evidence, budget-transition/overflow, and atomic-writer tests pass without live credentials or real data.
 
-- [ ] **Step 7: Run the full suite**
+- [ ] **Step 7: Run the live baseline only when external gates exist**
 
-Run: `python -m pytest tests/ -v`
-Expected: all tests pass or skip; none fail
-
-- [ ] **Step 8: Commit**
+First run:
 
 ```bash
-git add src/cerebro/cli.py src/cerebro/evaluation.py tests/test_baseline_evaluation.py
-git commit -m "feat: add ask command and baseline evaluation artifact"
+.venv/bin/python scripts/text2sql_preflight.py
+```
+
+If organizer credentials/capability or authoritative data evidence is missing, record the live baseline as `BLOCKED`; do not create an artifact. When all gates pass, run the explicit `cerebro baseline` command with manifest, bundle, receipt, database, capability-receipt directory, authorization-scope input, and output paths required by the implemented CLI help.
+
+- [ ] **Step 8: Commit only if authorized**
+
+```bash
+git add src/cerebro/models.py src/cerebro/evaluation.py src/cerebro/cli.py scripts/text2sql_preflight.py tests/test_text2sql_artifact.py tests/test_baseline_evaluation.py
+git commit -m "feat: bind live baseline to Option B evidence"
 ```
 
 ---
 
-## Spec Coverage
+## Final Verification
 
-| Spec requirement | Task |
+- [ ] **Step 1: Run all targeted Text-to-SQL tests without networking**
+
+```bash
+CEREBRO_TEST_NO_NETWORK=1 env -u CEREBRO_API_KEY -u OPENAI_API_KEY -u CEREBRO_MODEL .venv/bin/python -m pytest \
+  tests/test_text2sql_preflight.py \
+  tests/test_load_duckdb.py \
+  tests/test_text2sql_contract.py \
+  tests/test_grounding_snapshot.py \
+  tests/test_retrieval_api_mcp.py \
+  tests/test_prompt_egress.py \
+  tests/test_hosted_provider.py \
+  tests/test_enrichment.py \
+  tests/test_selfcheck_ir.py \
+  tests/test_complexity_router.py \
+  tests/test_sql_compiler.py \
+  tests/test_selfcheck_sql.py \
+  tests/test_selfcheck_semantics.py \
+  tests/test_text2sql_cache.py \
+  tests/test_text2sql_budget.py \
+  tests/test_executor.py \
+  tests/test_selfcheck_engine.py \
+  tests/test_text2sql_agent.py \
+  tests/test_baseline_evaluation.py \
+  tests/test_text2sql_artifact.py -v
+```
+
+Expected: pass with no external socket and no live credential.
+
+- [ ] **Step 2: Run the full repository suite**
+
+```bash
+CEREBRO_TEST_NO_NETWORK=1 env -u CEREBRO_API_KEY -u OPENAI_API_KEY -u CEREBRO_MODEL .venv/bin/python -m pytest -q
+```
+
+Expected: pass. Real-data/live-only checks report explicit blocked evidence through their commands rather than pytest skips that claim success.
+
+- [ ] **Step 3: Run compile and diff checks**
+
+```bash
+.venv/bin/python -m compileall -q src scripts tests
+git diff --check
+```
+
+Expected: both exit 0.
+
+- [ ] **Step 4: Verify architectural invariants by search**
+
+Search production source and assert:
+
+- no `SQLCandidate`, `SQLDraft`, `_sql_prompt`, provider output SQL field, free-form `RelationalQueryIR.intent`, or `LiteralExpression.value`;
+- every SQL-bound model operand uses `QuestionLiteralRef` or `GovernedLiteralRef`; only `sql_compiler.py` resolves refs and creates executable SQL ASTs/internal `BoundParameter.value`;
+- only `GuardedProvider` renders hosted prompts, and `Text2SQLAgent` never consumes `OrganizerModelGateway` directly;
+- `src/cerebro/text2sql.py`, `src/cerebro/hosted_provider.py`, `src/cerebro/text2sql_provider.py`, and `GoldenProvider` do not import `cerebro.enrichment`; existing enrichment tests pass unchanged;
+- `GenerationRoute` contains only `default_ir`/`planned_ir`; no response/cache/evidence path uses `"cache"` as a generation route;
+- only the production composition root constructs `Text2SQLAgent`; the actual `cli.py`/`evaluation.py` request constructors pass question plus trusted `AuthorizationScope`, never `retriever.grounding(...)`;
+- `src/cerebro/api.py` remains grounding-only; `/api/grounding` and MCP do not construct `SQLGenerationRequest`, expose execution, or authorize a snapshot;
+- no execution or validation failure path invokes provider generation;
+- no cache hit bypasses canonical-span validation, `validate_ir` with the original generation route, `DialectCompiler.compile`, `authorize_compiled_query`, or `EngineValidator.validate`; cached planned IR reruns planned-route complex-node checks;
+- the budget starts at capacity one; only current `AcceptedComplexRoute` calls `authorize_planned_ir`; no premature/repeated transition or third semantic call exists;
+- no public response, value-free IR/assumption, cache payload, trace, or evaluation artifact serializes canonical question text, resolved literal values, or `BoundParameter.value`.
+
+- [ ] **Step 5: Report external evidence separately**
+
+Report these independently:
+
+- offline suite: `VERIFIED` or exact failing command;
+- authoritative real-data materialization: `VERIFIED` or `BLOCKED` with missing evidence;
+- organizer capability: `VERIFIED` or `BLOCKED` with missing configuration/receipt;
+- live unadapted baseline: `VERIFIED` only after final evidence validation, otherwise `BLOCKED`.
+
+## Requirement Coverage
+
+| Task | Requirements |
 |---|---|
-| FR-700, FR-701 | 1 |
-| FR-702, FR-703, FR-703a, FR-703b, FR-703c | 6 |
-| FR-704 to FR-708 | 2, 7 |
-| FR-709, FR-710 | 3 |
-| FR-711, FR-712, FR-713 | 4 |
-| FR-714 | 5 |
-| FR-715, FR-716, FR-717 | 7 |
-| FR-718 to FR-722 | 8 |
-| AC-700 to AC-706 | 3, 4, 7, 9 |
-| AC-707 | 6 |
-| AC-708, AC-709 | 9 |
-
-## Known Deviations From The Spec
-
-Both are deliberate and should be reviewed rather than silently accepted.
-
-**FR-715 uses a keyword heuristic.** `Text2SQLAgent._assumptions` decides a
-question is directional by matching words against `DIRECTION_WORDS`. The spec
-says an inferred mapping must be recorded; it does not say how the agent knows
-inference happened. A keyword list will miss phrasings. The alternative is to
-have the model declare the inference in the plan, which means trusting the model
-to self-report and gives a weaker guarantee. The heuristic is the safer of two
-imperfect options for a demo, and the right fix is upstream: a declaration in
-the bundle removes the need entirely.
-
-**`check_engine` runs only when a connection is supplied.** `Text2SQLAgent`
-accepts `connection=None`, in which case FR-714 does not run. This keeps the
-agent unit-testable without a database, and Task 9 always supplies a real
-connection on the live path. A reviewer should confirm no production entry point
-constructs the agent without one.
+| 0 | FR-701–FR-703d, FR-724 |
+| 1 | FR-700, FR-701, AC-712 |
+| 2 | FR-704–FR-708, FR-715–FR-717, AC-713, AC-714 |
+| 3 | FR-704, FR-704b, AC-700, AC-706, AC-715 |
+| 4 | FR-702–FR-703d, AC-707, AC-711 |
+| 5 | FR-703b, FR-704a, FR-707, FR-709, FR-710, FR-715, FR-716, AC-704, AC-709, AC-714 |
+| 6 | FR-711, FR-712, AC-702, AC-705, AC-706 |
+| 7 | FR-709a–FR-715, AC-700–AC-703, AC-705, AC-709 |
+| 8 | FR-704b, FR-708, FR-716, FR-716a, AC-714, AC-715 |
+| 9 | FR-714, FR-718–FR-722, AC-709 |
+| 10 | FR-702–FR-708, FR-714–FR-722, AC-704, AC-711, AC-713–AC-715 |
+| 11 | FR-703c, FR-703d, FR-704, FR-723, AC-706, AC-707, AC-710, AC-714, AC-715 |
+| 12 | FR-724, FR-725, AC-708, AC-713–AC-715 |
