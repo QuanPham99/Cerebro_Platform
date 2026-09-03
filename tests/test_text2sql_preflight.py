@@ -27,11 +27,14 @@ def _contracts():
 
 
 def _provenance():
-    assert util.find_spec("cerebro.provenance") is not None, "missing Task 0 provenance module"
+    assert util.find_spec("cerebro.provenance") is not None, (
+        "missing Task 0 provenance module"
+    )
     module = import_module("cerebro.provenance")
     names = (
         "canonical_json_bytes",
         "manifest_table_id",
+        "semantic_bundle_sha256",
         "sha256_file",
         "source_manifest_sha256",
     )
@@ -41,7 +44,9 @@ def _provenance():
 
 
 def _preflight():
-    assert util.find_spec("scripts.text2sql_preflight") is not None, "missing Task 0 preflight module"
+    assert util.find_spec("scripts.text2sql_preflight") is not None, (
+        "missing Task 0 preflight module"
+    )
     module = import_module("scripts.text2sql_preflight")
     assert hasattr(module, "check_preflight"), "missing check_preflight"
     assert hasattr(module, "main"), "missing preflight CLI entry point"
@@ -58,15 +63,45 @@ def _write_matching_evidence(tmp_path: Path):
         SourceManifest,
         SourceTableManifest,
     ) = _contracts()
-    _canonical_json_bytes, manifest_table_id, sha256_file, source_manifest_sha256 = _provenance()
+    (
+        _canonical_json_bytes,
+        manifest_table_id,
+        semantic_bundle_sha256,
+        sha256_file,
+        source_manifest_sha256,
+    ) = _provenance()
 
     csv_dir = tmp_path / "archive"
     csv_dir.mkdir()
     csv_path = csv_dir / "accounts.csv"
     csv_path.write_bytes(b"account_id\n1\n")
 
-    bundle_path = tmp_path / "bundle.yaml"
-    bundle_path.write_text("name: caf\u00e9-bank\nversion: 1\n", encoding="utf-8")
+    bundle_path = tmp_path / "bundle"
+    bundle_path.mkdir()
+    (bundle_path / "bundle.yaml").write_text(
+        "name: caf\u00e9-bank\nversion: 1\n",
+        encoding="utf-8",
+    )
+    bundle_object_path = bundle_path / "accounts.md"
+    bundle_object_path.write_text(
+        """---
+type: table
+id: table.accounts
+name: Accounts
+status: active
+cerebro:
+  columns:
+  - name: account_id
+    data_type: BIGINT
+---
+
+# Accounts
+
+Governed account metadata.
+""",
+        encoding="utf-8",
+    )
+    bundle = import_module("cerebro.bundle").load_validated_bundle(bundle_path)
     database_path = tmp_path / "workshop.duckdb"
     database_path.write_bytes(b"deterministic database evidence")
 
@@ -85,7 +120,7 @@ def _write_matching_evidence(tmp_path: Path):
 
     materialization_receipt = MaterializationReceipt(
         source_manifest_sha256=source_manifest_sha256(manifest),
-        bundle_sha256=sha256_file(bundle_path),
+        bundle_sha256=semantic_bundle_sha256(bundle),
         tables=(
             MaterializedTableReceipt(
                 table_id=manifest_table_id("accounts"),
@@ -109,10 +144,13 @@ def _write_matching_evidence(tmp_path: Path):
         schema_mechanism="json_schema",
     )
     provider_receipt_path = tmp_path / "provider-capability-receipt.json"
-    provider_receipt_path.write_text(provider_receipt.model_dump_json(), encoding="utf-8")
+    provider_receipt_path.write_text(
+        provider_receipt.model_dump_json(), encoding="utf-8"
+    )
 
     return {
         "bundle_path": bundle_path,
+        "bundle_object_path": bundle_object_path,
         "csv_dir": csv_dir,
         "database_path": database_path,
         "manifest": manifest,
@@ -155,7 +193,13 @@ def test_evidence_contracts_are_strict_frozen_and_value_free():
         SourceManifest,
         SourceTableManifest,
     ) = _contracts()
-    _canonical_json_bytes, manifest_table_id, _sha256_file, _source_manifest_sha256 = _provenance()
+    (
+        _canonical_json_bytes,
+        manifest_table_id,
+        _semantic_bundle_sha256,
+        _sha256_file,
+        _source_manifest_sha256,
+    ) = _provenance()
 
     table = SourceTableManifest(
         name="accounts", file_name="accounts.csv", sha256=SHA256_A, row_count=2
@@ -204,14 +248,19 @@ def test_evidence_contracts_are_strict_frozen_and_value_free():
         )
     with pytest.raises(ValidationError):
         SourceTableManifest(
-            name="table.accounts", file_name="accounts.csv", sha256=SHA256_A, row_count=2
+            name="table.accounts",
+            file_name="accounts.csv",
+            sha256=SHA256_A,
+            row_count=2,
         )
     with pytest.raises(ValidationError):
         MaterializedTableReceipt(
             table_id="accounts", source_file_sha256=SHA256_A, row_count=2
         )
 
-    capability_schema = json.dumps(capability.model_json_schema(), sort_keys=True).lower()
+    capability_schema = json.dumps(
+        capability.model_json_schema(), sort_keys=True
+    ).lower()
     for forbidden in ("api_key", "credential", "prompt", "response_body"):
         assert forbidden not in capability_schema
 
@@ -266,7 +315,13 @@ def test_preflight_report_rejects_false_offline_readiness():
 
 
 def test_canonical_evidence_helpers_are_deterministic_utf8_and_hash_bound(tmp_path):
-    canonical_json_bytes, _manifest_table_id, sha256_file, source_manifest_sha256 = _provenance()
+    (
+        canonical_json_bytes,
+        _manifest_table_id,
+        _semantic_bundle_sha256,
+        sha256_file,
+        source_manifest_sha256,
+    ) = _provenance()
     (
         _MaterializationReceipt,
         _MaterializedTableReceipt,
@@ -294,7 +349,9 @@ def test_canonical_evidence_helpers_are_deterministic_utf8_and_hash_bound(tmp_pa
 
     evidence_file = tmp_path / "evidence.bin"
     evidence_file.write_bytes(b"evidence\x00bytes")
-    assert sha256_file(evidence_file) == hashlib.sha256(b"evidence\x00bytes").hexdigest()
+    assert (
+        sha256_file(evidence_file) == hashlib.sha256(b"evidence\x00bytes").hexdigest()
+    )
 
     manifest = SourceManifest(
         tables=(
@@ -306,9 +363,47 @@ def test_canonical_evidence_helpers_are_deterministic_utf8_and_hash_bound(tmp_pa
             ),
         )
     )
-    assert source_manifest_sha256(manifest) == hashlib.sha256(
-        canonical_json_bytes(manifest)
-    ).hexdigest()
+    assert (
+        source_manifest_sha256(manifest)
+        == hashlib.sha256(canonical_json_bytes(manifest)).hexdigest()
+    )
+
+
+def test_semantic_bundle_hash_is_root_independent_order_stable_and_complete():
+    semantic_bundle_sha256 = _provenance()[2]
+    bundle_module = import_module("cerebro.bundle")
+    default_bundle = import_module("cerebro.paths").DEFAULT_BUNDLE
+    bundle = bundle_module.load_validated_bundle(default_bundle)
+    baseline = semantic_bundle_sha256(bundle)
+
+    reordered = bundle.model_copy(deep=True)
+    reordered.root = "/different/machine/specific/root"
+    reordered.objects.reverse()
+    assert semantic_bundle_sha256(reordered) == baseline
+
+    table_index = next(
+        index for index, obj in enumerate(bundle.objects) if obj.type == "table"
+    )
+    table_payload = bundle.objects[table_index].model_dump(mode="python")
+    mutations = (
+        {**table_payload, "body": table_payload["body"] + "\nGoverned body drift."},
+        {**table_payload, "path": "governed/relocated-table.md"},
+        {
+            **table_payload,
+            "cerebro": {
+                **table_payload["cerebro"],
+                "governed_hash_marker": "changed",
+            },
+        },
+        {**table_payload, "governed_extra_metadata": {"owner": "changed"}},
+    )
+    for changed_table in mutations:
+        bundle_payload = bundle.model_dump(mode="python")
+        objects = list(bundle_payload["objects"])
+        objects[table_index] = changed_table
+        bundle_payload["objects"] = objects
+        changed_bundle = type(bundle).model_validate(bundle_payload)
+        assert semantic_bundle_sha256(changed_bundle) != baseline
 
 
 @pytest.mark.parametrize(
@@ -327,13 +422,25 @@ def test_canonical_evidence_helpers_are_deterministic_utf8_and_hash_bound(tmp_pa
     ),
 )
 def test_manifest_table_id_rejects_non_raw_lowercase_snake_case(raw_name):
-    _canonical_json_bytes, manifest_table_id, _sha256_file, _source_manifest_sha256 = _provenance()
+    (
+        _canonical_json_bytes,
+        manifest_table_id,
+        _semantic_bundle_sha256,
+        _sha256_file,
+        _source_manifest_sha256,
+    ) = _provenance()
     with pytest.raises(ValueError, match="raw lowercase snake-case"):
         manifest_table_id(raw_name)
 
 
 def test_manifest_table_id_adds_the_authority_prefix_once():
-    _canonical_json_bytes, manifest_table_id, _sha256_file, _source_manifest_sha256 = _provenance()
+    (
+        _canonical_json_bytes,
+        manifest_table_id,
+        _semantic_bundle_sha256,
+        _sha256_file,
+        _source_manifest_sha256,
+    ) = _provenance()
     assert manifest_table_id("card_transactions") == "table.card_transactions"
     assert manifest_table_id("table2") == "table.table2"
 
@@ -391,6 +498,26 @@ def test_matching_live_evidence_is_ready(tmp_path):
     assert report.blockers == ()
 
 
+def test_preflight_requires_bundle_root_directory_not_bundle_file(tmp_path):
+    check_preflight = _preflight().check_preflight
+    evidence = _write_matching_evidence(tmp_path)
+
+    report = check_preflight(
+        csv_dir=evidence["csv_dir"],
+        manifest_path=evidence["manifest_path"],
+        bundle_path=evidence["bundle_object_path"],
+        environ={"CEREBRO_API_KEY": "key", "CEREBRO_MODEL": "organizer-model"},
+        database_path=evidence["database_path"],
+        materialization_receipt_path=evidence["materialization_receipt_path"],
+        provider_capability_receipt_path=evidence["provider_receipt_path"],
+    )
+
+    codes = {item.code for item in report.blockers}
+    assert "missing_bundle" in codes
+    assert "bundle_hash_mismatch" not in codes
+    assert report.data_prerequisites_ready is False
+
+
 def test_preflight_blocks_if_source_disappears_after_directory_snapshot(
     tmp_path, monkeypatch
 ):
@@ -425,11 +552,13 @@ def test_preflight_blocks_if_source_disappears_after_directory_snapshot(
 @pytest.mark.parametrize(
     ("evidence_name", "expected_code"),
     (
-        ("bundle_path", "bundle_hash_mismatch"),
+        ("bundle_object_path", "bundle_hash_mismatch"),
         ("database_path", "database_hash_mismatch"),
     ),
 )
-def test_preflight_rejects_changed_evidence_hashes(tmp_path, evidence_name, expected_code):
+def test_preflight_rejects_changed_evidence_hashes(
+    tmp_path, evidence_name, expected_code
+):
     check_preflight = _preflight().check_preflight
     evidence = _write_matching_evidence(tmp_path)
     evidence[evidence_name].write_bytes(b"changed after receipt")
@@ -484,14 +613,18 @@ def test_preflight_rejects_receipts_bound_to_other_manifest_or_model(tmp_path):
         evidence["materialization_receipt_path"].read_bytes()
     )
     evidence["materialization_receipt_path"].write_text(
-        receipt.model_copy(update={"source_manifest_sha256": "b" * 64}).model_dump_json(),
+        receipt.model_copy(
+            update={"source_manifest_sha256": "b" * 64}
+        ).model_dump_json(),
         encoding="utf-8",
     )
     provider_receipt = ProviderCapabilityReceipt.model_validate_json(
         evidence["provider_receipt_path"].read_bytes()
     )
     evidence["provider_receipt_path"].write_text(
-        provider_receipt.model_copy(update={"model": "different-model"}).model_dump_json(),
+        provider_receipt.model_copy(
+            update={"model": "different-model"}
+        ).model_dump_json(),
         encoding="utf-8",
     )
 

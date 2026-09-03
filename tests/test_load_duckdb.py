@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import shutil
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from importlib import import_module
@@ -173,6 +176,12 @@ def test_preflight_returns_immutable_name_aligned_inventory(
     )
 
     expected_names = sorted(table.name for table in manifest.tables)
+    provenance = import_module("cerebro.provenance")
+    assert hasattr(provenance, "semantic_bundle_sha256")
+    assert inventory.bundle_sha256 == provenance.semantic_bundle_sha256(
+        reordered_bundle
+    )
+    assert not hasattr(loader, "_bundle_sha256")
     assert [table.name for table in inventory.tables] == expected_names
     assert isinstance(inventory.tables, tuple)
     assert all(isinstance(table.columns, tuple) for table in inventory.tables)
@@ -451,6 +460,69 @@ def test_load_materializes_exact_schema_and_value_free_content_addressed_receipt
             assert count == 1
     finally:
         connection.close()
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_materialization_receipt_and_bundle_root_share_preflight_identity(
+    tmp_path: Path,
+) -> None:
+    loader = _loader()
+    preflight = import_module("scripts.text2sql_preflight")
+    bundle_root = tmp_path / "bundle"
+    shutil.copytree(DEFAULT_BUNDLE, bundle_root)
+    governed_bundle = import_module("cerebro.bundle").load_validated_bundle(bundle_root)
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, governed_bundle)
+    manifest_path = tmp_path / "source-manifest.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+
+    receipt, receipt_path = loader.load_csvs(
+        csv_dir,
+        target,
+        governed_bundle,
+        manifest,
+        receipt_dir=receipt_dir,
+    )
+
+    report = preflight.check_preflight(
+        csv_dir=csv_dir,
+        manifest_path=manifest_path,
+        bundle_path=bundle_root,
+        environ={},
+        database_path=target,
+        materialization_receipt_path=receipt_path,
+        provider_capability_receipt_path=None,
+    )
+    assert report.data_prerequisites_ready is True
+    assert [blocker.code for blocker in report.blockers if blocker.gate == "data"] == []
+
+    governed_object = bundle_root / "tables" / "accounts.md"
+    original_text = governed_object.read_text(encoding="utf-8")
+    marker = "classification: confidential"
+    assert marker in original_text
+    governed_object.write_text(
+        original_text.replace(marker, "classification: restricted", 1),
+        encoding="utf-8",
+    )
+
+    drifted_report = preflight.check_preflight(
+        csv_dir=csv_dir,
+        manifest_path=manifest_path,
+        bundle_path=bundle_root,
+        environ={},
+        database_path=target,
+        materialization_receipt_path=receipt_path,
+        provider_capability_receipt_path=None,
+    )
+    assert drifted_report.data_prerequisites_ready is False
+    assert {
+        blocker.code for blocker in drifted_report.blockers if blocker.gate == "data"
+    } == {"bundle_hash_mismatch"}
+    serialized = drifted_report.model_dump_json()
+    assert str(bundle_root) not in serialized
+    assert "restricted" not in serialized
+    assert receipt.bundle_sha256
     _assert_no_invocation_temps(target, receipt_dir)
 
 
@@ -744,6 +816,114 @@ def test_receipt_finalize_failure_preserves_target_and_cleans_temps(
     _assert_no_invocation_temps(target, receipt_dir)
 
 
+def test_receipt_descriptor_stays_open_in_private_workspace_through_publication(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+    real_mkstemp = loader.tempfile.mkstemp
+    real_link = loader.os.link
+    reserved: dict[str, Any] = {}
+    publication: dict[str, Any] = {}
+
+    def record_reserved_descriptor(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        descriptor, raw_path = real_mkstemp(*args, **kwargs)
+        reserved.update(descriptor=descriptor, path=Path(raw_path))
+        return descriptor, raw_path
+
+    def inspect_descriptor_at_publication(source: Any, destination: Any) -> None:
+        descriptor = reserved["descriptor"]
+        descriptor_stat = loader.os.fstat(descriptor)
+        source_path = Path(source)
+        source_stat = source_path.lstat()
+        publication.update(
+            descriptor_is_regular=loader.stat.S_ISREG(descriptor_stat.st_mode),
+            source_matches_descriptor=(
+                source_stat.st_dev == descriptor_stat.st_dev
+                and source_stat.st_ino == descriptor_stat.st_ino
+            ),
+            source=source_path,
+            workspace_mode=source_path.parent.lstat().st_mode & 0o777,
+            workspace_is_symlink=source_path.parent.is_symlink(),
+        )
+        real_link(source, destination)
+
+    monkeypatch.setattr(loader.tempfile, "mkstemp", record_reserved_descriptor)
+    monkeypatch.setattr(loader.os, "link", inspect_descriptor_at_publication)
+
+    _receipt, receipt_path = loader.load_csvs(
+        csv_dir,
+        target,
+        bundle,
+        manifest,
+        receipt_dir=receipt_dir,
+    )
+
+    assert publication == {
+        "descriptor_is_regular": True,
+        "source_matches_descriptor": True,
+        "source": reserved["path"],
+        "workspace_mode": 0o700,
+        "workspace_is_symlink": False,
+    }
+    assert reserved["path"].parent.parent == receipt_dir
+    assert receipt_path.is_file()
+    with pytest.raises(OSError):
+        loader.os.fstat(reserved["descriptor"])
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_receipt_temp_path_substitution_cannot_truncate_existing_database(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    connection = duckdb.connect(str(target))
+    connection.execute("CREATE TABLE sentinel(value INTEGER)")
+    connection.execute("INSERT INTO sentinel VALUES (7)")
+    connection.close()
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    real_mkstemp = loader.tempfile.mkstemp
+    substituted_paths: list[Path] = []
+
+    def substitute_reserved_path(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        descriptor, raw_path = real_mkstemp(*args, **kwargs)
+        receipt_temp = Path(raw_path)
+        receipt_temp.unlink()
+        receipt_temp.symlink_to(target)
+        substituted_paths.append(receipt_temp)
+        return descriptor, raw_path
+
+    def fail_receipt_link(source: Any, destination: Any) -> None:
+        raise OSError("injected failure after unsafe receipt write")
+
+    monkeypatch.setattr(loader.tempfile, "mkstemp", substitute_reserved_path)
+    monkeypatch.setattr(loader.os, "link", fail_receipt_link)
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert len(substituted_paths) == 1
+    assert target.read_bytes() == target_before
+    assert not target.is_symlink()
+    assert not list(receipt_dir.glob("*.json"))
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
 def test_concurrent_preexisting_receipt_is_never_overwritten_or_deleted(
     tmp_path: Path,
     bundle: SemanticBundle,
@@ -777,6 +957,119 @@ def test_concurrent_preexisting_receipt_is_never_overwritten_or_deleted(
     receipt_files = list(receipt_dir.glob("*.json"))
     assert len(receipt_files) == 1
     assert receipt_files[0].read_bytes() == preexisting
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_existing_receipt_symlink_is_rejected_without_touching_its_target(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing database bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    symlink_target = tmp_path / "matching-receipt-evidence.json"
+    real_link = loader.os.link
+    competing: dict[str, Any] = {}
+
+    def publish_matching_symlink(source: Any, destination: Any) -> None:
+        receipt_bytes = Path(source).read_bytes()
+        symlink_target.write_bytes(receipt_bytes)
+        receipt_path = Path(destination)
+        receipt_path.symlink_to(symlink_target)
+        competing.update(path=receipt_path, bytes=receipt_bytes)
+        real_link(source, destination)
+
+    monkeypatch.setattr(loader.os, "link", publish_matching_symlink)
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    receipt_path = competing["path"]
+    assert target.read_bytes() == target_before
+    assert receipt_path.is_symlink()
+    assert receipt_path.readlink() == symlink_target
+    assert symlink_target.read_bytes() == competing["bytes"]
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_existing_receipt_fifo_is_rejected_without_blocking_or_removal(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing database bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    real_link = loader.os.link
+    stop_writer = threading.Event()
+    writer_threads: list[threading.Thread] = []
+    competing: dict[str, Any] = {}
+
+    def publish_matching_fifo(source: Any, destination: Any) -> None:
+        receipt_bytes = Path(source).read_bytes()
+        receipt_path = Path(destination)
+        loader.os.mkfifo(receipt_path, 0o600)
+        competing.update(path=receipt_path, bytes=receipt_bytes)
+
+        def write_when_reader_opens() -> None:
+            while not stop_writer.is_set():
+                try:
+                    descriptor = loader.os.open(
+                        receipt_path,
+                        loader.os.O_WRONLY | loader.os.O_NONBLOCK,
+                    )
+                except OSError:
+                    stop_writer.wait(0.01)
+                    continue
+                try:
+                    remaining = memoryview(receipt_bytes)
+                    while remaining:
+                        written = loader.os.write(descriptor, remaining)
+                        remaining = remaining[written:]
+                finally:
+                    loader.os.close(descriptor)
+                return
+
+        writer = threading.Thread(target=write_when_reader_opens, daemon=True)
+        writer_threads.append(writer)
+        writer.start()
+        real_link(source, destination)
+
+    monkeypatch.setattr(loader.os, "link", publish_matching_fifo)
+    started = time.monotonic()
+    try:
+        with pytest.raises(loader.LoadError):
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+    finally:
+        elapsed = time.monotonic() - started
+        stop_writer.set()
+        for writer in writer_threads:
+            writer.join(timeout=1)
+
+    receipt_path = competing["path"]
+    assert elapsed < 5
+    assert all(not writer.is_alive() for writer in writer_threads)
+    assert target.read_bytes() == target_before
+    assert loader.stat.S_ISFIFO(receipt_path.lstat().st_mode)
     _assert_no_invocation_temps(target, receipt_dir)
 
 

@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
+from yaml import YAMLError
 
+from cerebro.bundle import load_validated_bundle
 from cerebro.models import (
     MaterializationReceipt,
     PreflightBlocker,
@@ -18,7 +20,12 @@ from cerebro.models import (
     ProviderCapabilityReceipt,
     SourceManifest,
 )
-from cerebro.provenance import manifest_table_id, sha256_file, source_manifest_sha256
+from cerebro.provenance import (
+    manifest_table_id,
+    semantic_bundle_sha256,
+    sha256_file,
+    source_manifest_sha256,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -74,9 +81,24 @@ def check_preflight(
         if manifest is None:
             block("invalid_data_manifest", "data")
 
-    bundle_exists = _is_file(bundle_path)
+    bundle_exists = _is_directory(bundle_path)
+    bundle_hash: str | None = None
     if not bundle_exists:
         block("missing_bundle", "data")
+    elif bundle_path is not None:
+        try:
+            bundle_hash = semantic_bundle_sha256(load_validated_bundle(bundle_path))
+        except (
+            AttributeError,
+            OSError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            YAMLError,
+        ):
+            # Bundle parsing and validation errors are intentionally reduced to
+            # a static blocker so governed content and paths never escape.
+            block("bundle_hash_mismatch", "data")
 
     csv_directory_exists = _is_directory(csv_dir)
     if not csv_directory_exists:
@@ -120,7 +142,10 @@ def check_preflight(
                 break
 
     if manifest is not None and materialization_receipt is not None:
-        if source_manifest_sha256(manifest) != materialization_receipt.source_manifest_sha256:
+        if (
+            source_manifest_sha256(manifest)
+            != materialization_receipt.source_manifest_sha256
+        ):
             block("manifest_hash_mismatch", "data")
 
         manifest_tables = {
@@ -134,13 +159,12 @@ def check_preflight(
         if manifest_tables != receipt_tables:
             block("materialization_table_mismatch", "data")
 
-    if bundle_exists and bundle_path is not None and materialization_receipt is not None:
-        try:
-            bundle_hash = sha256_file(bundle_path)
-        except OSError:
-            bundle_hash = None
-        if bundle_hash != materialization_receipt.bundle_sha256:
-            block("bundle_hash_mismatch", "data")
+    if (
+        bundle_hash is not None
+        and materialization_receipt is not None
+        and bundle_hash != materialization_receipt.bundle_sha256
+    ):
+        block("bundle_hash_mismatch", "data")
 
     if materialization_receipt is not None:
         if not _is_file(database_path):
@@ -182,7 +206,11 @@ def check_preflight(
             block("provider_model_mismatch", "organizer")
 
         expected_provider_fields = (
-            ("CEREBRO_PROVIDER", provider_receipt.provider, "provider_identity_mismatch"),
+            (
+                "CEREBRO_PROVIDER",
+                provider_receipt.provider,
+                "provider_identity_mismatch",
+            ),
             (
                 "CEREBRO_MODEL_REVISION",
                 provider_receipt.revision,
@@ -238,11 +266,15 @@ def main(
     runtime_environment = os.environ if environ is None else environ
     arguments = _argument_parser().parse_args(list(argv) if argv is not None else None)
     report = check_preflight(
-        csv_dir=_configured_path(arguments.csv_dir, runtime_environment, "CEREBRO_CSV_DIR"),
+        csv_dir=_configured_path(
+            arguments.csv_dir, runtime_environment, "CEREBRO_CSV_DIR"
+        ),
         manifest_path=_configured_path(
             arguments.manifest, runtime_environment, "CEREBRO_SOURCE_MANIFEST"
         ),
-        bundle_path=_configured_path(arguments.bundle, runtime_environment, "CEREBRO_BUNDLE"),
+        bundle_path=_configured_path(
+            arguments.bundle, runtime_environment, "CEREBRO_BUNDLE"
+        ),
         environ=runtime_environment,
         database_path=_configured_path(
             arguments.database, runtime_environment, "CEREBRO_DATABASE_PATH"

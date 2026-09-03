@@ -23,6 +23,7 @@ from cerebro.models import (
 from cerebro.provenance import (
     canonical_json_bytes,
     manifest_table_id,
+    semantic_bundle_sha256,
     sha256_file,
     source_manifest_sha256,
 )
@@ -135,15 +136,6 @@ def _active_bundle_tables(
     if not tables:
         raise LoadError("bundle has no active table metadata")
     return tables
-
-
-def _bundle_sha256(bundle: SemanticBundle) -> str:
-    normalized = bundle.model_copy(deep=True)
-    normalized.objects = sorted(
-        normalized.objects,
-        key=lambda item: (item.type, item.id, item.path),
-    )
-    return sha256(canonical_json_bytes(normalized, exclude={"root"})).hexdigest()
 
 
 def _csv_relation(columns: tuple[SourceColumn, ...]) -> str:
@@ -311,7 +303,7 @@ def preflight_csvs(
         raise LoadError("CSV preflight failed: " + "; ".join(errors))
     return SourceInventory(
         source_manifest_sha256=source_manifest_sha256(manifest),
-        bundle_sha256=_bundle_sha256(bundle),
+        bundle_sha256=semantic_bundle_sha256(bundle),
         tables=tuple(inventory_tables),
     )
 
@@ -377,14 +369,91 @@ def _verify_materialization(
             )
 
 
-def _unique_temp_path(directory: Path, *, prefix: str, suffix: str) -> Path:
-    descriptor, raw_path = tempfile.mkstemp(
-        dir=directory,
-        prefix=prefix,
-        suffix=suffix,
+def _validate_regular_descriptor_path(
+    descriptor: int,
+    path: Path,
+    *,
+    error_message: str,
+) -> os.stat_result:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or descriptor_stat.st_dev != path_stat.st_dev
+        or descriptor_stat.st_ino != path_stat.st_ino
+    ):
+        raise LoadError(error_message)
+    return descriptor_stat
+
+
+def _link_no_follow(source: Path, destination: Path) -> None:
+    if os.link in getattr(os, "supports_follow_symlinks", ()):
+        os.link(source, destination, follow_symlinks=False)
+    else:
+        os.link(source, destination)
+
+
+def _read_bounded_descriptor(descriptor: int, limit: int) -> bytes:
+    contents = bytearray()
+    while len(contents) < limit:
+        chunk = os.read(descriptor, min(64 * 1024, limit - len(contents)))
+        if not chunk:
+            break
+        contents.extend(chunk)
+    return bytes(contents)
+
+
+def _validate_existing_receipt(receipt_path: Path, receipt_bytes: bytes) -> None:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | no_follow
     )
-    os.close(descriptor)
-    return Path(raw_path)
+    try:
+        descriptor = os.open(receipt_path, flags)
+    except OSError as exc:
+        raise LoadError("pre-existing receipt could not be securely opened") from exc
+
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise LoadError("pre-existing receipt is not a regular file")
+        if no_follow == 0:
+            _validate_regular_descriptor_path(
+                descriptor,
+                receipt_path,
+                error_message=(
+                    "pre-existing receipt path is not the opened regular file"
+                ),
+            )
+        try:
+            existing_bytes = _read_bounded_descriptor(
+                descriptor,
+                len(receipt_bytes) + 1,
+            )
+        except OSError as exc:
+            raise LoadError("pre-existing receipt could not be read") from exc
+        if existing_bytes != receipt_bytes:
+            raise LoadError("content-addressed receipt collision")
+        try:
+            existing = MaterializationReceipt.model_validate_json(existing_bytes)
+        except Exception as exc:
+            raise LoadError("pre-existing receipt is invalid") from exc
+        if canonical_json_bytes(existing) != receipt_bytes:
+            raise LoadError("pre-existing receipt is not canonical")
+        _validate_regular_descriptor_path(
+            descriptor,
+            receipt_path,
+            error_message="pre-existing receipt path changed while validating",
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _create_private_workspace(target: Path) -> Path:
@@ -412,9 +481,23 @@ def _create_private_workspace(target: Path) -> Path:
         raise
 
 
-def _remove_private_workspace(workspace: Path | None) -> None:
+def _remove_private_workspace(
+    workspace: Path | None,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     if workspace is None:
         return
+    if expected_identity is not None:
+        try:
+            workspace_stat = os.stat(workspace, follow_symlinks=False)
+        except OSError:
+            return
+        if (
+            not stat.S_ISDIR(workspace_stat.st_mode)
+            or (workspace_stat.st_dev, workspace_stat.st_ino) != expected_identity
+        ):
+            return
     # rmtree refuses to traverse a symlink, so cleanup remains scoped to the
     # invocation-owned directory even if the path is unexpectedly disturbed.
     try:
@@ -590,25 +673,59 @@ def _build_database(path: Path, inventory: SourceInventory) -> None:
             connection.close()
 
 
-def _write_receipt_temp(receipt_dir: Path, receipt_bytes: bytes) -> Path:
-    receipt_temp = _unique_temp_path(
-        receipt_dir,
-        prefix=".materialization-receipt.",
-        suffix=".tmp",
-    )
+def _write_receipt_temp(
+    receipt_workspace: Path,
+    receipt_bytes: bytes,
+) -> tuple[int, Path]:
+    workspace_mode = receipt_workspace.lstat().st_mode
+    if (
+        not stat.S_ISDIR(workspace_mode)
+        or stat.S_ISLNK(workspace_mode)
+        or stat.S_IMODE(workspace_mode) != 0o700
+    ):
+        raise LoadError("receipt workspace is not a private mode-0700 directory")
+
+    descriptor = -1
     try:
-        with receipt_temp.open("wb") as destination:
-            destination.write(receipt_bytes)
+        descriptor, raw_path = tempfile.mkstemp(
+            dir=receipt_workspace,
+            prefix="receipt-",
+            suffix=".tmp",
+        )
+        receipt_temp = Path(raw_path)
+        if receipt_temp.parent != receipt_workspace:
+            raise LoadError("temporary receipt escaped its private workspace")
+        descriptor_stat = _validate_regular_descriptor_path(
+            descriptor,
+            receipt_temp,
+            error_message="temporary receipt path is not the opened regular file",
+        )
+        if stat.S_IMODE(descriptor_stat.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+
+        with os.fdopen(descriptor, "w+b", closefd=False) as destination:
+            written = destination.write(receipt_bytes)
+            if written != len(receipt_bytes):
+                raise LoadError("temporary receipt write was incomplete")
             destination.flush()
-            os.fsync(destination.fileno())
-        if receipt_temp.read_bytes() != receipt_bytes:
+            os.fsync(descriptor)
+            destination.seek(0)
+            validated_bytes = destination.read(len(receipt_bytes) + 1)
+
+        if validated_bytes != receipt_bytes:
             raise LoadError("temporary receipt validation failed")
-        validated = MaterializationReceipt.model_validate_json(receipt_bytes)
+        validated = MaterializationReceipt.model_validate_json(validated_bytes)
         if canonical_json_bytes(validated) != receipt_bytes:
             raise LoadError("temporary receipt is not canonical")
-        return receipt_temp
+        _validate_regular_descriptor_path(
+            descriptor,
+            receipt_temp,
+            error_message="temporary receipt path changed before publication",
+        )
+        return descriptor, receipt_temp
     except Exception:
-        receipt_temp.unlink(missing_ok=True)
+        if descriptor >= 0:
+            os.close(descriptor)
         raise
 
 
@@ -628,7 +745,9 @@ def load_csvs(
     receipts = Path(receipt_dir) if receipt_dir is not None else target_dir
 
     workspace: Path | None = None
-    receipt_temp: Path | None = None
+    receipt_workspace: Path | None = None
+    receipt_workspace_identity: tuple[int, int] | None = None
+    receipt_descriptor: int | None = None
     receipt_path: Path | None = None
     try:
         workspace = _create_private_workspace(target)
@@ -656,26 +775,34 @@ def load_csvs(
         receipt_hash = sha256(receipt_bytes).hexdigest()
         receipts.mkdir(parents=True, exist_ok=True)
         receipt_path = receipts / f"{receipt_hash}.json"
-        receipt_temp = _write_receipt_temp(receipts, receipt_bytes)
+        receipt_workspace = _create_private_workspace(
+            receipts / "materialization-receipt"
+        )
+        receipt_workspace_stat = receipt_workspace.lstat()
+        receipt_workspace_identity = (
+            receipt_workspace_stat.st_dev,
+            receipt_workspace_stat.st_ino,
+        )
+        receipt_descriptor, receipt_temp = _write_receipt_temp(
+            receipt_workspace,
+            receipt_bytes,
+        )
 
+        _validate_regular_descriptor_path(
+            receipt_descriptor,
+            receipt_temp,
+            error_message="temporary receipt path changed before publication",
+        )
         try:
-            os.link(receipt_temp, receipt_path)
+            _link_no_follow(receipt_temp, receipt_path)
         except FileExistsError:
-            existing_bytes = receipt_path.read_bytes()
-            if existing_bytes != receipt_bytes:
-                raise LoadError(
-                    f"content-addressed receipt collision: {receipt_path.name}"
-                )
-            existing = MaterializationReceipt.model_validate_json(existing_bytes)
-            if canonical_json_bytes(existing) != receipt_bytes:
-                raise LoadError(
-                    f"pre-existing receipt is not canonical: {receipt_path.name}"
-                )
-            receipt_temp.unlink()
-            receipt_temp = None
+            _validate_existing_receipt(receipt_path, receipt_bytes)
         else:
-            receipt_temp.unlink()
-            receipt_temp = None
+            _validate_regular_descriptor_path(
+                receipt_descriptor,
+                receipt_path,
+                error_message="published receipt is not the validated regular file",
+            )
 
         # Publication makes this immutable path shared evidence. If database
         # replacement fails, leave the harmless orphan in place: its database
@@ -688,6 +815,10 @@ def load_csvs(
             raise
         raise LoadError(f"DuckDB materialization failed: {exc}") from exc
     finally:
-        if receipt_temp is not None:
-            receipt_temp.unlink(missing_ok=True)
+        if receipt_descriptor is not None:
+            os.close(receipt_descriptor)
+        _remove_private_workspace(
+            receipt_workspace,
+            expected_identity=receipt_workspace_identity,
+        )
         _remove_private_workspace(workspace)

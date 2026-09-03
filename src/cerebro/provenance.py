@@ -8,14 +8,12 @@ from typing import cast
 
 from pydantic import BaseModel
 
-from .models import SourceManifest, TableId
+from .models import SemanticBundle, SourceManifest, TableId
 
 _RAW_TABLE_NAME = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 
 
-def canonical_json_bytes(
-    model: BaseModel, *, exclude: set[str] = frozenset()
-) -> bytes:
+def canonical_json_bytes(model: BaseModel, *, exclude: set[str] = frozenset()) -> bytes:
     """Serialize validated evidence as deterministic UTF-8 JSON bytes."""
     payload = model.model_dump(mode="json", exclude=exclude)
     return json.dumps(
@@ -25,6 +23,18 @@ def canonical_json_bytes(
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+def semantic_bundle_sha256(bundle: SemanticBundle) -> str:
+    """Hash complete semantic evidence without machine-specific root authority."""
+    if not isinstance(bundle, SemanticBundle):
+        raise TypeError("bundle must be a SemanticBundle")
+    normalized = SemanticBundle.model_validate(bundle.model_dump(mode="python"))
+    normalized.objects = sorted(
+        normalized.objects,
+        key=canonical_json_bytes,
+    )
+    return sha256(canonical_json_bytes(normalized, exclude={"root"})).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
