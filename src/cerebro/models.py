@@ -271,9 +271,42 @@ PreflightBlockerCode: TypeAlias = Literal[
 ]
 
 
+_PREFLIGHT_BLOCKER_GATES: dict[PreflightBlockerCode, PreflightGate] = {
+    "missing_api_key": "organizer",
+    "missing_model": "organizer",
+    "missing_provider_capability": "organizer",
+    "invalid_provider_capability": "organizer",
+    "provider_identity_mismatch": "organizer",
+    "provider_model_mismatch": "organizer",
+    "provider_revision_mismatch": "organizer",
+    "provider_schema_mechanism_mismatch": "organizer",
+    "missing_data_manifest": "data",
+    "invalid_data_manifest": "data",
+    "missing_bundle": "data",
+    "missing_csv_directory": "data",
+    "source_file_set_mismatch": "data",
+    "source_file_hash_mismatch": "data",
+    "missing_materialization_receipt": "data",
+    "invalid_materialization_receipt": "data",
+    "manifest_hash_mismatch": "data",
+    "materialization_table_mismatch": "data",
+    "missing_database": "data",
+    "bundle_hash_mismatch": "data",
+    "database_hash_mismatch": "data",
+    "engine_version_mismatch": "data",
+}
+
+
 class PreflightBlocker(_StrictFrozenEvidenceModel):
     code: PreflightBlockerCode
     gate: PreflightGate
+
+    @model_validator(mode="after")
+    def gate_matches_code(self) -> PreflightBlocker:
+        expected_gate = _PREFLIGHT_BLOCKER_GATES.get(self.code)
+        if expected_gate is None or self.gate != expected_gate:
+            raise ValueError("preflight blocker gate must match its code")
+        return self
 
 
 class PreflightReport(_StrictFrozenEvidenceModel):
@@ -285,6 +318,8 @@ class PreflightReport(_StrictFrozenEvidenceModel):
 
     @model_validator(mode="after")
     def readiness_matches_blockers(self) -> PreflightReport:
+        if not self.offline_ready:
+            raise ValueError("offline readiness must remain available")
         data_ready = not any(blocker.gate == "data" for blocker in self.blockers)
         organizer_ready = not any(blocker.gate == "organizer" for blocker in self.blockers)
         if self.data_prerequisites_ready != data_ready:

@@ -216,6 +216,55 @@ def test_evidence_contracts_are_strict_frozen_and_value_free():
         assert forbidden not in capability_schema
 
 
+def test_preflight_blocker_enforces_exact_code_to_gate_mapping():
+    models = import_module("cerebro.models")
+    PreflightBlocker = models.PreflightBlocker
+    code_to_gate = {
+        "missing_api_key": "organizer",
+        "missing_model": "organizer",
+        "missing_provider_capability": "organizer",
+        "invalid_provider_capability": "organizer",
+        "provider_identity_mismatch": "organizer",
+        "provider_model_mismatch": "organizer",
+        "provider_revision_mismatch": "organizer",
+        "provider_schema_mechanism_mismatch": "organizer",
+        "missing_data_manifest": "data",
+        "invalid_data_manifest": "data",
+        "missing_bundle": "data",
+        "missing_csv_directory": "data",
+        "source_file_set_mismatch": "data",
+        "source_file_hash_mismatch": "data",
+        "missing_materialization_receipt": "data",
+        "invalid_materialization_receipt": "data",
+        "manifest_hash_mismatch": "data",
+        "materialization_table_mismatch": "data",
+        "missing_database": "data",
+        "bundle_hash_mismatch": "data",
+        "database_hash_mismatch": "data",
+        "engine_version_mismatch": "data",
+    }
+
+    assert set(code_to_gate) == set(models.PreflightBlockerCode.__args__)
+    for code, expected_gate in code_to_gate.items():
+        assert PreflightBlocker(code=code, gate=expected_gate).gate == expected_gate
+        wrong_gate = "data" if expected_gate == "organizer" else "organizer"
+        with pytest.raises(ValidationError):
+            PreflightBlocker(code=code, gate=wrong_gate)
+
+
+def test_preflight_report_rejects_false_offline_readiness():
+    PreflightReport = _contracts()[3]
+
+    with pytest.raises(ValidationError):
+        PreflightReport(
+            offline_ready=False,
+            data_prerequisites_ready=True,
+            organizer_prerequisites_ready=True,
+            live_prerequisites_ready=True,
+            blockers=(),
+        )
+
+
 def test_canonical_evidence_helpers_are_deterministic_utf8_and_hash_bound(tmp_path):
     canonical_json_bytes, _manifest_table_id, sha256_file, source_manifest_sha256 = _provenance()
     (
@@ -340,6 +389,37 @@ def test_matching_live_evidence_is_ready(tmp_path):
     assert report.organizer_prerequisites_ready is True
     assert report.live_prerequisites_ready is True
     assert report.blockers == ()
+
+
+def test_preflight_blocks_if_source_disappears_after_directory_snapshot(
+    tmp_path, monkeypatch
+):
+    module = _preflight()
+    evidence = _write_matching_evidence(tmp_path)
+    source_path = evidence["csv_dir"] / "accounts.csv"
+    original_is_file = module._is_file
+
+    def is_file_after_snapshot(path):
+        if path == source_path:
+            return False
+        return original_is_file(path)
+
+    monkeypatch.setattr(module, "_is_file", is_file_after_snapshot)
+
+    report = module.check_preflight(
+        csv_dir=evidence["csv_dir"],
+        manifest_path=evidence["manifest_path"],
+        bundle_path=evidence["bundle_path"],
+        environ={"CEREBRO_API_KEY": "key", "CEREBRO_MODEL": "organizer-model"},
+        database_path=evidence["database_path"],
+        materialization_receipt_path=evidence["materialization_receipt_path"],
+        provider_capability_receipt_path=evidence["provider_receipt_path"],
+    )
+
+    assert {item.code for item in report.blockers} == {"source_file_set_mismatch"}
+    assert report.data_prerequisites_ready is False
+    assert report.live_prerequisites_ready is False
+    assert str(source_path) not in report.model_dump_json()
 
 
 @pytest.mark.parametrize(

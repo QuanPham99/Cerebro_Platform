@@ -108,7 +108,8 @@ def check_preflight(
         for table in manifest.tables:
             source_path = csv_dir / table.file_name
             if not _is_file(source_path):
-                continue
+                block("source_file_set_mismatch", "data")
+                break
             try:
                 source_hash = sha256_file(source_path)
             except OSError:
