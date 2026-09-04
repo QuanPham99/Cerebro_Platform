@@ -52,30 +52,95 @@ class LoadError(RuntimeError):
     """The source set could not be safely materialized."""
 
 
+def _public_load_error(failure: Exception, *, fallback: str) -> LoadError:
+    """Create a chain-free public error from trusted category text only."""
+    if isinstance(failure, LoadError) and len(failure.args) == 1:
+        message = failure.args[0]
+        if type(message) is str and message:
+            return LoadError(message)
+    return LoadError(fallback)
+
+
 _DATABASE_LOCK_PROBE_TIMEOUT_SECONDS = 2.0
-_DATABASE_LOCK_BLOCKED_EXIT = 73
 _DATABASE_LOCK_UNSUPPORTED_EXIT = 74
+_DATABASE_LOCK_OWNER_OUTPUT = re.compile(rb"PID:([1-9][0-9]*)\n")
 _DATABASE_LOCK_PROBE_SCRIPT = f"""
-import errno
 import fcntl
+import os
+import struct
 import sys
 
+UNSUPPORTED_EXIT = {_DATABASE_LOCK_UNSUPPORTED_EXIT}
+
 try:
-    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError as error:
-    if error.errno in (errno.EACCES, errno.EAGAIN):
-        raise SystemExit({_DATABASE_LOCK_BLOCKED_EXIT})
-    raise SystemExit({_DATABASE_LOCK_UNSUPPORTED_EXIT})
+    descriptor = int(sys.argv[1])
+except (IndexError, ValueError):
+    raise SystemExit(UNSUPPORTED_EXIT)
+
+if struct.calcsize("P") != 8:
+    raise SystemExit(UNSUPPORTED_EXIT)
+if sys.platform == "darwin":
+    layout = "@qqihh"
+    expected_size = 24
+    request = struct.pack(
+        layout,
+        0,
+        0,
+        0,
+        fcntl.F_WRLCK,
+        os.SEEK_SET,
+    )
+    type_index = 3
+    pid_index = 2
+elif sys.platform.startswith("linux"):
+    layout = "@hhqqi4x"
+    expected_size = 32
+    request = struct.pack(
+        layout,
+        fcntl.F_WRLCK,
+        os.SEEK_SET,
+        0,
+        0,
+        0,
+    )
+    type_index = 0
+    pid_index = 4
+else:
+    raise SystemExit(UNSUPPORTED_EXIT)
+
+if struct.calcsize(layout) != expected_size or len(request) != expected_size:
+    raise SystemExit(UNSUPPORTED_EXIT)
 try:
-    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
-except OSError:
-    raise SystemExit({_DATABASE_LOCK_UNSUPPORTED_EXIT})
+    response = fcntl.fcntl(descriptor, fcntl.F_GETLK, request)
+except (OSError, ValueError):
+    raise SystemExit(UNSUPPORTED_EXIT)
+if not isinstance(response, bytes) or len(response) != expected_size:
+    raise SystemExit(UNSUPPORTED_EXIT)
+try:
+    fields = struct.unpack(layout, response)
+except struct.error:
+    raise SystemExit(UNSUPPORTED_EXIT)
+
+lock_type = fields[type_index]
+owner_pid = fields[pid_index]
+if lock_type == fcntl.F_UNLCK:
+    os.write(1, b"UNLOCKED\\n")
+elif lock_type in (fcntl.F_RDLCK, fcntl.F_WRLCK) and owner_pid > 0:
+    os.write(1, b"PID:" + str(owner_pid).encode("ascii") + b"\\n")
+else:
+    raise SystemExit(UNSUPPORTED_EXIT)
 raise SystemExit(0)
 """
 
 
+class _DatabaseLockStateMismatch(LoadError):
+    def __init__(self, observed: str) -> None:
+        super().__init__("DuckDB connection is not bound to the retained database")
+        self.observed = observed
+
+
 def _probe_database_lock(descriptor: int) -> str:
-    """Probe DuckDB's retained-inode flock state in a short local child."""
+    """Probe the POSIX whole-file lock owner from a short local child."""
     try:
         descriptor_stat = os.fstat(descriptor)
     except OSError:
@@ -96,25 +161,39 @@ def _probe_database_lock(descriptor: int) -> str:
             close_fds=True,
             pass_fds=(descriptor,),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=_DATABASE_LOCK_PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         raise LoadError("database lock probe is unsupported or unavailable") from None
 
-    if completed.returncode == 0:
+    if completed.returncode != 0:
+        raise LoadError("database lock probe returned an unsupported result")
+    output = completed.stdout
+    if not isinstance(output, bytes) or len(output) > 64:
+        raise LoadError("database lock probe returned an unsupported result")
+    if output == b"UNLOCKED\n":
         return "acquired"
-    if completed.returncode == _DATABASE_LOCK_BLOCKED_EXIT:
-        return "blocked"
-    raise LoadError("database lock probe returned an unsupported result")
+    owner_match = _DATABASE_LOCK_OWNER_OUTPUT.fullmatch(output)
+    if owner_match is None:
+        raise LoadError("database lock probe returned an unsupported result")
+    owner_pid = int(owner_match.group(1))
+    if owner_pid > 2_147_483_647:
+        raise LoadError("database lock probe returned an unsupported result")
+    if owner_pid != os.getpid():
+        raise LoadError(
+            "DuckDB connection lock owner does not match the retained database"
+        )
+    return "blocked"
 
 
 def _require_database_lock_state(descriptor: int, expected: str) -> None:
     if expected not in {"acquired", "blocked"}:
         raise LoadError("invalid database lock transition expectation")
-    if _probe_database_lock(descriptor) != expected:
-        raise LoadError("DuckDB connection is not bound to the retained database")
+    observed = _probe_database_lock(descriptor)
+    if observed != expected:
+        raise _DatabaseLockStateMismatch(observed)
 
 
 @dataclass(frozen=True)
@@ -488,7 +567,7 @@ def _validate_csv_file_set(
         raise LoadError("CSV file count does not match the expected active table count")
 
 
-def preflight_csvs(
+def _preflight_csvs_impl(
     csv_dir: Path | str,
     bundle: SemanticBundle,
     manifest: SourceManifest,
@@ -646,6 +725,22 @@ def preflight_csvs(
         bundle_sha256=bundle_hash,
         tables=tuple(inventory_tables),
     )
+
+
+def preflight_csvs(
+    csv_dir: Path | str,
+    bundle: SemanticBundle,
+    manifest: SourceManifest,
+) -> SourceInventory:
+    """Validate every source and return immutable, name-aligned load metadata."""
+    failure: Exception | None = None
+    try:
+        return _preflight_csvs_impl(csv_dir, bundle, manifest)
+    except Exception as error:  # noqa: BLE001 - public exception boundary
+        failure = error
+    if failure is None:  # pragma: no cover - the try either returns or captures
+        raise LoadError("CSV preflight failed")
+    raise _public_load_error(failure, fallback="CSV preflight failed")
 
 
 def _load_table(
@@ -1729,7 +1824,15 @@ def _build_database(
                         path.name,
                         error_message="database entry validation did not recover",
                     )
-                    _require_database_lock_state(database_descriptor, "blocked")
+                    fence_entries[path.name] = _identity(recovered_stat)
+                    path_authority_confirmed = True
+                    try:
+                        _require_database_lock_state(database_descriptor, "blocked")
+                    except _DatabaseLockStateMismatch as error:
+                        if error.observed == "acquired":
+                            fence_entries.pop(path.name, None)
+                            path_authority_confirmed = False
+                        raise
                     try:
                         connection.close()
                     finally:
@@ -1743,10 +1846,16 @@ def _build_database(
                     )
                 except (LoadError, OSError, duckdb.Error):
                     raise LoadError("database entry validation failed") from None
-                fence_entries[path.name] = _identity(recovered_stat)
-                path_authority_confirmed = True
                 raise LoadError("database entry validation failed") from None
-            _require_database_lock_state(database_descriptor, "blocked")
+            fence_entries[path.name] = _identity(database_stat)
+            path_authority_confirmed = True
+            try:
+                _require_database_lock_state(database_descriptor, "blocked")
+            except _DatabaseLockStateMismatch as error:
+                if error.observed == "acquired":
+                    fence_entries.pop(path.name, None)
+                    path_authority_confirmed = False
+                raise
             database_stat = _validate_regular_descriptor_entry(
                 database_descriptor,
                 fence_descriptor,
@@ -1755,8 +1864,6 @@ def _build_database(
                     "database entry changed during connection lock validation"
                 ),
             )
-            fence_entries[path.name] = _identity(database_stat)
-            path_authority_confirmed = True
             connection.execute("BEGIN TRANSACTION")
             transaction_open = True
             for table, descriptor in zip(
@@ -2171,6 +2278,35 @@ def _validate_target_before_publication(
         _close_best_effort(descriptor)
 
 
+def _validate_published_database(
+    *,
+    target_parent_descriptor: int,
+    target_dir: Path,
+    target_name: str,
+    database_descriptor: int,
+    expected_hash: str,
+) -> None:
+    _validate_directory_descriptor_path(
+        target_parent_descriptor,
+        target_dir,
+        error_message="database target directory changed at publication boundary",
+    )
+    _validate_regular_descriptor_entry(
+        database_descriptor,
+        target_parent_descriptor,
+        target_name,
+        error_message="published database is not the retained regular file",
+    )
+    if _sha256_descriptor(database_descriptor) != expected_hash:
+        raise LoadError("published database hash changed at publication boundary")
+    _validate_regular_descriptor_entry(
+        database_descriptor,
+        target_parent_descriptor,
+        target_name,
+        error_message="published database changed while validating publication",
+    )
+
+
 def _create_target_restore_candidate(
     backup: TargetBackup,
     workspace_descriptor: int,
@@ -2199,6 +2335,118 @@ def _create_target_restore_candidate(
     except Exception:
         _close_best_effort(candidate_descriptor)
         raise
+
+
+def _quarantine_unknown_target(
+    target_parent_descriptor: int,
+    target_name: str,
+) -> None:
+    try:
+        source_stat = os.stat(
+            target_name,
+            dir_fd=target_parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise LoadError("unknown database target could not be inspected") from None
+
+    quarantine_name: str | None = None
+    quarantine_descriptor: int | None = None
+    quarantine_identity: tuple[int, int] | None = None
+    moved = False
+    for _ in range(128):
+        candidate = f".{target_name}.preserved-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=target_parent_descriptor)
+        except FileExistsError:
+            continue
+        except OSError:
+            raise LoadError("unknown database target could not be preserved") from None
+        quarantine_name = candidate
+        break
+    if quarantine_name is None:
+        raise LoadError("unknown database target could not be preserved")
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        quarantine_descriptor = os.open(
+            quarantine_name,
+            flags,
+            dir_fd=target_parent_descriptor,
+        )
+        quarantine_stat = _validate_directory_descriptor_entry(
+            quarantine_descriptor,
+            target_parent_descriptor,
+            quarantine_name,
+            required_mode=0o700,
+            error_message="unknown database quarantine is not retained",
+        )
+        quarantine_identity = _identity(quarantine_stat)
+        source_stat = os.stat(
+            target_name,
+            dir_fd=target_parent_descriptor,
+            follow_symlinks=False,
+        )
+        os.rename(
+            target_name,
+            target_name,
+            src_dir_fd=target_parent_descriptor,
+            dst_dir_fd=quarantine_descriptor,
+        )
+        moved = True
+        preserved_stat = os.stat(
+            target_name,
+            dir_fd=quarantine_descriptor,
+            follow_symlinks=False,
+        )
+        if _identity(preserved_stat) != _identity(source_stat) or stat.S_IFMT(
+            preserved_stat.st_mode
+        ) != stat.S_IFMT(source_stat.st_mode):
+            raise LoadError("unknown database target quarantine changed identity")
+        _validate_directory_descriptor_entry(
+            quarantine_descriptor,
+            target_parent_descriptor,
+            quarantine_name,
+            required_mode=0o700,
+            error_message="unknown database quarantine changed after preservation",
+        )
+        try:
+            os.stat(
+                target_name,
+                dir_fd=target_parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise LoadError("database target changed during quarantine")
+    except LoadError:
+        raise
+    except OSError:
+        raise LoadError("unknown database target could not be preserved") from None
+    finally:
+        _close_best_effort(quarantine_descriptor)
+        if not moved and quarantine_identity is not None:
+            try:
+                quarantine_stat = os.stat(
+                    quarantine_name,
+                    dir_fd=target_parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISDIR(quarantine_stat.st_mode)
+                    and _identity(quarantine_stat) == quarantine_identity
+                ):
+                    os.rmdir(quarantine_name, dir_fd=target_parent_descriptor)
+            except OSError:
+                pass
 
 
 def _restore_target_after_publication_failure(
@@ -2231,6 +2479,16 @@ def _restore_target_after_publication_failure(
         target_backup,
     ):
         return
+
+    if not _entry_matches_retained_file(
+        database_descriptor,
+        target_parent_descriptor,
+        target_name,
+    ):
+        _quarantine_unknown_target(
+            target_parent_descriptor,
+            target_name,
+        )
 
     restore_descriptor: int | None = None
     try:
@@ -2297,7 +2555,7 @@ def _discard_target_backup_best_effort(
         pass
 
 
-def load_csvs(
+def _load_csvs_impl(
     csv_dir: Path | str,
     db_path: Path | str,
     bundle: SemanticBundle,
@@ -2528,24 +2786,18 @@ def load_csvs(
                 )
             except OSError:
                 raise LoadError("database replace failure after adoption") from None
-            _validate_directory_descriptor_path(
-                target_parent_descriptor,
-                target_dir,
-                error_message="database target directory changed during publication",
+            _validate_published_database(
+                target_parent_descriptor=target_parent_descriptor,
+                target_dir=target_dir,
+                target_name=target.name,
+                database_descriptor=database_descriptor,
+                expected_hash=database_hash,
             )
             _validate_csv_file_set(
                 source_root,
                 expected_csv_names,
                 len(inventory.tables),
             )
-            _validate_regular_descriptor_entry(
-                database_descriptor,
-                target_parent_descriptor,
-                target.name,
-                error_message="published database is not the retained regular file",
-            )
-            if _sha256_descriptor(database_descriptor) != database_hash:
-                raise LoadError("published database hash changed during publication")
             _validate_published_receipt(
                 uses_retained_inode=receipt_uses_retained_inode,
                 retained_descriptor=receipt_descriptor,
@@ -2563,12 +2815,12 @@ def load_csvs(
                 target_backup,
                 workspace_descriptor,
             )
-            _validate_directory_descriptor_path(
-                target_parent_descriptor,
-                target_dir,
-                error_message=(
-                    "database target directory changed after backup cleanup"
-                ),
+            _validate_published_database(
+                target_parent_descriptor=target_parent_descriptor,
+                target_dir=target_dir,
+                target_name=target.name,
+                database_descriptor=database_descriptor,
+                expected_hash=database_hash,
             )
             _validate_directory_descriptor_path(
                 receipt_parent_descriptor,
@@ -2583,10 +2835,12 @@ def load_csvs(
                 receipt_bytes=receipt_bytes,
                 error_message="published receipt content changed at success boundary",
             )
-            _validate_directory_descriptor_path(
-                target_parent_descriptor,
-                target_dir,
-                error_message="database target directory changed at success boundary",
+            _validate_published_database(
+                target_parent_descriptor=target_parent_descriptor,
+                target_dir=target_dir,
+                target_name=target.name,
+                database_descriptor=database_descriptor,
+                expected_hash=database_hash,
             )
         except Exception:
             _restore_target_after_publication_failure(
@@ -2631,3 +2885,27 @@ def load_csvs(
         _close_best_effort(database_descriptor)
         _close_best_effort(workspace_descriptor)
         _close_best_effort(target_parent_descriptor)
+
+
+def load_csvs(
+    csv_dir: Path | str,
+    db_path: Path | str,
+    bundle: SemanticBundle,
+    manifest: SourceManifest,
+    receipt_dir: Path | str | None = None,
+) -> tuple[MaterializationReceipt, Path]:
+    """Build a verified DuckDB off to the side and atomically publish it."""
+    failure: Exception | None = None
+    try:
+        return _load_csvs_impl(
+            csv_dir,
+            db_path,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    except Exception as error:  # noqa: BLE001 - public exception boundary
+        failure = error
+    if failure is None:  # pragma: no cover - the try either returns or captures
+        raise LoadError("DuckDB materialization failed")
+    raise _public_load_error(failure, fallback="DuckDB materialization failed")

@@ -2575,15 +2575,318 @@ def test_close_best_effort_does_not_retry_reused_same_inode_descriptor(
                 pass
 
 
+def test_foreign_duckdb_decoy_lock_cannot_authorize_different_connection(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"previous target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    query_database = tmp_path / "different-query-database.duckdb"
+    ready_path = tmp_path / "foreign-decoy-ready"
+    real_connect = loader.duckdb.connect
+    observed: dict[str, Any] = {"connected": False}
+
+    lock_holder_script = """
+import os
+import sys
+from pathlib import Path
+
+import duckdb
+
+connection = duckdb.connect(sys.argv[1])
+Path(sys.argv[2]).write_text(str(os.getpid()), encoding="ascii")
+try:
+    sys.stdin.buffer.read(1)
+finally:
+    connection.close()
+"""
+
+    def terminate_decoy_process() -> None:
+        process = observed.get("process")
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except loader.subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def release_decoy_process() -> None:
+        process = observed["process"]
+        if process.poll() is None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(b"release\n")
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+                process.stdin = None
+            try:
+                process.wait(timeout=5)
+            except loader.subprocess.TimeoutExpired as exc:
+                terminate_decoy_process()
+                raise AssertionError("foreign DuckDB decoy did not exit") from exc
+        stderr = b"" if process.stderr is None else process.stderr.read()
+        assert process.returncode == 0, stderr.decode(errors="replace")
+
+    class ReleaseDecoyWhenClosed:
+        def __init__(self, connection: Any) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def close(self) -> None:
+            try:
+                self._connection.close()
+            finally:
+                release_decoy_process()
+
+    def connect_to_b_while_foreign_process_locks_a(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(database) == ":memory:" or observed["connected"]:
+            return real_connect(database, *args, **kwargs)
+
+        database_path = Path(database)
+        seed_connection = real_connect(str(database_path))
+        seed_connection.close()
+        process = loader.subprocess.Popen(
+            [
+                loader.sys.executable,
+                "-I",
+                "-c",
+                lock_holder_script,
+                str(database_path),
+                str(ready_path),
+            ],
+            stdin=loader.subprocess.PIPE,
+            stdout=loader.subprocess.DEVNULL,
+            stderr=loader.subprocess.PIPE,
+        )
+        observed["process"] = process
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready_path.exists():
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+        if not ready_path.exists():
+            terminate_decoy_process()
+            stderr = b"" if process.stderr is None else process.stderr.read()
+            raise AssertionError(
+                "foreign DuckDB decoy did not acquire its lock: "
+                + stderr.decode(errors="replace")
+            )
+
+        decoy_pid = int(ready_path.read_text(encoding="ascii"))
+        assert decoy_pid == process.pid
+        assert decoy_pid != loader.os.getpid()
+        connection_b = real_connect(str(query_database), *args, **kwargs)
+        observed.update(connected=True, decoy_pid=decoy_pid)
+        return ReleaseDecoyWhenClosed(connection_b)
+
+    monkeypatch.setattr(
+        loader.duckdb,
+        "connect",
+        connect_to_b_while_foreign_process_locks_a,
+    )
+
+    try:
+        with pytest.raises(loader.LoadError, match="connection.*database"):
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+
+        assert observed["connected"] is True
+        assert observed["decoy_pid"] != loader.os.getpid()
+        assert observed["process"].poll() == 0
+        assert target.read_bytes() == target_before
+        assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
+        _assert_no_invocation_temps(target, receipt_dir)
+    finally:
+        terminate_decoy_process()
+
+
+@pytest.mark.parametrize(
+    "probe_failure",
+    ("spawn-oserror", "timeout", "unsupported-result"),
+)
+def test_first_database_owner_probe_failure_cleans_private_workspace(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_failure: str,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"previous target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    observed = {"calls": 0}
+
+    def fail_first_owner_probe(*args: Any, **kwargs: Any) -> Any:
+        observed["calls"] += 1
+        assert observed["calls"] == 1
+        if probe_failure == "spawn-oserror":
+            raise OSError("PRIVATE_PROBE_SPAWN_CANARY_RESTART_9")
+        if probe_failure == "timeout":
+            raise loader.subprocess.TimeoutExpired(
+                cmd=args[0],
+                timeout=kwargs["timeout"],
+                output=b"PRIVATE_PROBE_TIMEOUT_CANARY_RESTART_9",
+            )
+        return loader.subprocess.CompletedProcess(
+            args=args[0],
+            returncode=91,
+            stdout=b"PRIVATE_PROBE_AMBIGUOUS_CANARY_RESTART_9",
+        )
+
+    monkeypatch.setattr(loader.subprocess, "run", fail_first_owner_probe)
+
+    with pytest.raises(loader.LoadError, match="lock probe|connection.*database"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["calls"] == 1
+    assert target.read_bytes() == target_before
+    assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_target_replacement_after_backup_discard_restores_old_target_and_preserves_unknown(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"previous target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    attacker_bytes = b"ATTACKER_POST_DISCARD_TARGET_CANARY_RESTART_9"
+    attacker_candidate = tmp_path / "attacker-post-discard.duckdb"
+    real_discard = loader._discard_target_backup_best_effort
+    observed: dict[str, Any] = {"replaced": False}
+
+    def discard_then_replace_public_target(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        attacker_candidate.write_bytes(attacker_bytes)
+        loader.os.replace(attacker_candidate, target)
+        attacker_stat = target.stat()
+        observed.update(
+            replaced=True,
+            attacker_identity=(attacker_stat.st_dev, attacker_stat.st_ino),
+        )
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_replace_public_target,
+    )
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["replaced"] is True
+    assert target.read_bytes() == target_before
+    preserved_attacker_paths = []
+    for candidate in tmp_path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.read_bytes() == attacker_bytes:
+                preserved_attacker_paths.append(candidate)
+        except OSError:
+            continue
+    assert preserved_attacker_paths
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_target_replacement_after_backup_discard_without_prior_target_is_left_untouched(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+    attacker_bytes = b"ATTACKER_NO_PRIOR_TARGET_CANARY_RESTART_9"
+    attacker_candidate = tmp_path / "attacker-no-prior-target.duckdb"
+    real_discard = loader._discard_target_backup_best_effort
+    observed: dict[str, Any] = {"replaced": False}
+
+    def discard_then_replace_public_target(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        attacker_candidate.write_bytes(attacker_bytes)
+        loader.os.replace(attacker_candidate, target)
+        attacker_stat = target.stat()
+        observed.update(
+            replaced=True,
+            attacker_identity=(attacker_stat.st_dev, attacker_stat.st_ino),
+        )
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_replace_public_target,
+    )
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["replaced"] is True
+    attacker_stat = target.stat()
+    assert (attacker_stat.st_dev, attacker_stat.st_ino) == observed["attacker_identity"]
+    assert target.read_bytes() == attacker_bytes
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
 def _assert_sanitized_load_error(
     error: BaseException,
     *,
     forbidden: tuple[str, ...],
 ) -> None:
     message = str(error)
+    formatted = "".join(import_module("traceback").format_exception(error))
     for value in forbidden:
         assert value not in message
+        assert value not in formatted
     assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_duckdb_lock_probe_observes_connection_close_transition(
