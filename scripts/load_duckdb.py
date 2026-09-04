@@ -32,6 +32,7 @@ _DATA_TYPE = re.compile(
     r"[A-Z][A-Z0-9_]*(?: [A-Z][A-Z0-9_]*)*"
     r"(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])*"
 )
+_HARD_LINK = os.link
 
 
 class LoadError(RuntimeError):
@@ -209,6 +210,59 @@ def _check_castability(table: SourceTableInventory) -> int:
         connection.close()
 
 
+def _copy_preflight_snapshot(source_file: Path, snapshot: Path) -> str:
+    """Copy and hash one securely opened source into a private snapshot."""
+    source_descriptor = _open_regular_source(source_file)
+    destination_descriptor: int | None = None
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    digest = sha256()
+    try:
+        destination_descriptor = os.open(snapshot, flags, 0o600)
+        _validate_regular_descriptor_path(
+            destination_descriptor,
+            snapshot,
+            error_message="private preflight snapshot is not the opened regular file",
+        )
+        with os.fdopen(source_descriptor, "rb") as source:
+            source_descriptor = -1
+            with os.fdopen(
+                destination_descriptor,
+                "wb",
+                closefd=False,
+            ) as destination:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination_descriptor)
+        os.fchmod(destination_descriptor, 0o400)
+        descriptor_stat = _validate_regular_descriptor_path(
+            destination_descriptor,
+            snapshot,
+            error_message="private preflight snapshot changed after copying",
+        )
+        if stat.S_IMODE(descriptor_stat.st_mode) != 0o400:
+            raise LoadError("private preflight snapshot is not mode 0400")
+        if _sha256_descriptor(destination_descriptor) != digest.hexdigest():
+            raise LoadError("private preflight snapshot hash changed after copying")
+        return digest.hexdigest()
+    except OSError as exc:
+        raise LoadError(
+            f"could not create private preflight snapshot for {source_file.name}"
+        ) from exc
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+
+
 def preflight_csvs(
     csv_dir: Path | str,
     bundle: SemanticBundle,
@@ -246,57 +300,83 @@ def preflight_csvs(
 
     errors: list[str] = []
     inventory_tables: list[SourceTableInventory] = []
-    for name in sorted(bundle_tables):
-        manifest_table = manifest_tables[name]
-        source_file = root / manifest_table.file_name
-        columns = bundle_tables[name]
-        expected_header = tuple(column.name for column in columns)
-        ddl = _table_ddl(name, columns)
-        table_inventory = SourceTableInventory(
-            name=name,
-            table_id=manifest_table_id(name),
-            source_file=source_file,
-            source_file_sha256=manifest_table.sha256,
-            row_count=manifest_table.row_count,
-            columns=columns,
-            ddl=ddl,
-        )
-        inventory_tables.append(table_inventory)
+    try:
+        with tempfile.TemporaryDirectory(prefix="cerebro-preflight-") as raw_workspace:
+            preflight_workspace = Path(raw_workspace)
+            workspace_mode = preflight_workspace.lstat().st_mode
+            if (
+                not stat.S_ISDIR(workspace_mode)
+                or stat.S_ISLNK(workspace_mode)
+                or stat.S_IMODE(workspace_mode) != 0o700
+            ):
+                raise LoadError(
+                    "private preflight workspace is not a mode-0700 directory"
+                )
 
-        try:
-            actual_hash = sha256_file(source_file)
-            if actual_hash != manifest_table.sha256:
-                errors.append(
-                    f"SHA-256 mismatch for {manifest_table.file_name}: "
-                    f"expected {manifest_table.sha256}, got {actual_hash}"
+            for index, name in enumerate(sorted(bundle_tables)):
+                manifest_table = manifest_tables[name]
+                source_file = root / manifest_table.file_name
+                columns = bundle_tables[name]
+                expected_header = tuple(column.name for column in columns)
+                ddl = _table_ddl(name, columns)
+                table_inventory = SourceTableInventory(
+                    name=name,
+                    table_id=manifest_table_id(name),
+                    source_file=source_file,
+                    source_file_sha256=manifest_table.sha256,
+                    row_count=manifest_table.row_count,
+                    columns=columns,
+                    ddl=ddl,
                 )
-        except OSError as exc:
-            errors.append(f"could not hash {manifest_table.file_name}: {exc}")
+                inventory_tables.append(table_inventory)
+                snapshot = preflight_workspace / f"source-{index:04d}.csv"
 
-        try:
-            actual_header, actual_count = _read_csv_shape(source_file)
-            if actual_header != expected_header:
-                errors.append(
-                    f"header mismatch for {manifest_table.file_name}: "
-                    f"expected {expected_header}, got {actual_header}"
-                )
-            if actual_count != manifest_table.row_count:
-                errors.append(
-                    f"row count mismatch for {manifest_table.file_name}: "
-                    f"expected {manifest_table.row_count}, got {actual_count}"
-                )
-        except LoadError as exc:
-            errors.append(str(exc))
+                try:
+                    actual_hash = _copy_preflight_snapshot(source_file, snapshot)
+                except LoadError as exc:
+                    errors.append(str(exc))
+                    continue
+                if actual_hash != manifest_table.sha256:
+                    errors.append(
+                        f"SHA-256 mismatch for {manifest_table.file_name}: "
+                        f"expected {manifest_table.sha256}, got {actual_hash}"
+                    )
 
-        try:
-            cast_count = _check_castability(table_inventory)
-            if cast_count != manifest_table.row_count:
-                errors.append(
-                    f"cast row count mismatch for {manifest_table.file_name}: "
-                    f"expected {manifest_table.row_count}, got {cast_count}"
+                try:
+                    actual_header, actual_count = _read_csv_shape(snapshot)
+                    if actual_header != expected_header:
+                        errors.append(
+                            f"header mismatch for {manifest_table.file_name}: "
+                            f"expected {expected_header}, got {actual_header}"
+                        )
+                    if actual_count != manifest_table.row_count:
+                        errors.append(
+                            f"row count mismatch for {manifest_table.file_name}: "
+                            f"expected {manifest_table.row_count}, got {actual_count}"
+                        )
+                except LoadError as exc:
+                    errors.append(str(exc))
+
+                snapshot_inventory = SourceTableInventory(
+                    name=table_inventory.name,
+                    table_id=table_inventory.table_id,
+                    source_file=snapshot,
+                    source_file_sha256=table_inventory.source_file_sha256,
+                    row_count=table_inventory.row_count,
+                    columns=table_inventory.columns,
+                    ddl=table_inventory.ddl,
                 )
-        except LoadError as exc:
-            errors.append(str(exc))
+                try:
+                    cast_count = _check_castability(snapshot_inventory)
+                    if cast_count != manifest_table.row_count:
+                        errors.append(
+                            f"cast row count mismatch for {manifest_table.file_name}: "
+                            f"expected {manifest_table.row_count}, got {cast_count}"
+                        )
+                except LoadError as exc:
+                    errors.append(str(exc))
+    except OSError as exc:
+        raise LoadError("private CSV preflight workspace failed") from exc
 
     if errors:
         raise LoadError("CSV preflight failed: " + "; ".join(errors))
@@ -753,13 +833,21 @@ def _open_regular_source(source_file: Path) -> int:
 def _copy_verified_snapshot(
     table: SourceTableInventory,
     workspace: Path,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
     index: int,
 ) -> Path:
     snapshot = workspace / f"source-{index:04d}.csv"
+    _validate_directory_descriptor_path(
+        workspace_descriptor,
+        workspace,
+        required_mode=0o700,
+        error_message="source snapshot workspace is not the pinned mode-0700 directory",
+    )
     source_descriptor = _open_regular_source(table.source_file)
     destination_descriptor: int | None = None
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_CLOEXEC", 0)
@@ -767,16 +855,51 @@ def _copy_verified_snapshot(
     )
     digest = sha256()
     try:
-        destination_descriptor = os.open(snapshot, flags, 0o600)
+        destination_descriptor = os.open(
+            snapshot.name,
+            flags,
+            0o600,
+            dir_fd=workspace_descriptor,
+        )
+        destination_stat = os.fstat(destination_descriptor)
+        known_entries[snapshot.name] = _identity(destination_stat)
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise LoadError("verified source snapshot is not a regular file")
+        _validate_regular_descriptor_entry(
+            destination_descriptor,
+            workspace_descriptor,
+            snapshot.name,
+            error_message="verified source snapshot entry changed after creation",
+        )
+
         with os.fdopen(source_descriptor, "rb") as source:
             source_descriptor = -1
-            with os.fdopen(destination_descriptor, "wb") as destination:
-                destination_descriptor = None
+            with os.fdopen(
+                destination_descriptor,
+                "wb",
+                closefd=False,
+            ) as destination:
                 while chunk := source.read(1024 * 1024):
                     digest.update(chunk)
                     destination.write(chunk)
                 destination.flush()
-                os.fsync(destination.fileno())
+                os.fsync(destination_descriptor)
+
+        if digest.hexdigest() != table.source_file_sha256:
+            raise LoadError(f"source changed after preflight: {table.source_file.name}")
+
+        os.fchmod(destination_descriptor, 0o400)
+        snapshot_stat = _validate_regular_descriptor_entry(
+            destination_descriptor,
+            workspace_descriptor,
+            snapshot.name,
+            error_message="verified source snapshot entry changed after copying",
+        )
+        if stat.S_IMODE(snapshot_stat.st_mode) != 0o400:
+            raise LoadError("verified source snapshot is not mode 0400")
+        if _sha256_descriptor(destination_descriptor) != table.source_file_sha256:
+            raise LoadError("verified source snapshot hash changed after copying")
+        return snapshot
     except OSError as exc:
         raise LoadError(
             f"could not create verified snapshot for {table.source_file.name}"
@@ -787,22 +910,6 @@ def _copy_verified_snapshot(
         if destination_descriptor is not None:
             os.close(destination_descriptor)
 
-    if digest.hexdigest() != table.source_file_sha256:
-        raise LoadError(f"source changed after preflight: {table.source_file.name}")
-
-    try:
-        os.chmod(snapshot, 0o400)
-        snapshot_mode = snapshot.lstat().st_mode
-        if not stat.S_ISREG(snapshot_mode) or stat.S_ISLNK(snapshot_mode):
-            raise LoadError("verified source snapshot is not a regular file")
-        if sha256_file(snapshot) != table.source_file_sha256:
-            raise LoadError("verified source snapshot hash changed after copying")
-    except OSError as exc:
-        raise LoadError(
-            f"could not validate source snapshot for {table.source_file.name}"
-        ) from exc
-    return snapshot
-
 
 def _snapshot_inventory(
     inventory: SourceInventory,
@@ -812,16 +919,13 @@ def _snapshot_inventory(
 ) -> SourceInventory:
     snapshot_tables: list[SourceTableInventory] = []
     for index, table in enumerate(inventory.tables):
-        snapshot = _copy_verified_snapshot(table, workspace, index)
-        snapshot_descriptor, snapshot_stat = _open_regular_directory_entry(
+        snapshot = _copy_verified_snapshot(
+            table,
+            workspace,
             workspace_descriptor,
-            snapshot.name,
-            error_message="verified source snapshot entry changed after copying",
+            known_entries,
+            index,
         )
-        try:
-            known_entries[snapshot.name] = _identity(snapshot_stat)
-        finally:
-            os.close(snapshot_descriptor)
         snapshot_tables.append(
             SourceTableInventory(
                 name=table.name,
@@ -1004,6 +1108,168 @@ def _write_receipt_temp(
         raise
 
 
+def _prepare_existing_target_backup(
+    target_parent_descriptor: int,
+    target_name: str,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> tuple[int, str, str] | None:
+    try:
+        target_stat = os.stat(
+            target_name,
+            dir_fd=target_parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise LoadError("existing database target could not be inspected") from exc
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise LoadError("existing database target is not a regular file")
+
+    target_descriptor: int | None = None
+    try:
+        target_descriptor, target_stat = _open_regular_directory_entry(
+            target_parent_descriptor,
+            target_name,
+            error_message="existing database target changed while opening",
+        )
+        target_hash = _sha256_descriptor(target_descriptor)
+        backup_name = "previous-target.duckdb"
+        # Register the expected identity before linking. A failed or hostile
+        # link cannot make cleanup remove an entry with any other identity.
+        known_entries[backup_name] = _identity(target_stat)
+        link_arguments: dict[str, Any] = {
+            "src_dir_fd": target_parent_descriptor,
+            "dst_dir_fd": workspace_descriptor,
+        }
+        if _HARD_LINK in getattr(os, "supports_follow_symlinks", ()):
+            link_arguments["follow_symlinks"] = False
+        try:
+            _HARD_LINK(target_name, backup_name, **link_arguments)
+        except OSError as exc:
+            raise LoadError("existing database target could not be backed up") from exc
+
+        _validate_regular_descriptor_entry(
+            target_descriptor,
+            workspace_descriptor,
+            backup_name,
+            error_message="database backup is not the retained target inode",
+        )
+        _validate_regular_descriptor_entry(
+            target_descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="existing database target changed during backup",
+        )
+        if _sha256_descriptor(target_descriptor) != target_hash:
+            raise LoadError("existing database target changed during backup")
+        return target_descriptor, target_hash, backup_name
+    except Exception:
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+        raise
+
+
+def _entry_matches_retained_file(
+    descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    expected_hash: str | None = None,
+) -> bool:
+    try:
+        _validate_regular_descriptor_entry(
+            descriptor,
+            directory_descriptor,
+            name,
+            error_message="retained file entry changed",
+        )
+        return expected_hash is None or _sha256_descriptor(descriptor) == expected_hash
+    except (LoadError, OSError):
+        return False
+
+
+def _restore_target_after_publication_failure(
+    *,
+    target_parent_descriptor: int,
+    target_name: str,
+    workspace_descriptor: int,
+    database_descriptor: int,
+    previous_target_descriptor: int | None,
+    previous_target_hash: str | None,
+    backup_name: str | None,
+) -> None:
+    if previous_target_descriptor is None:
+        if not _entry_matches_retained_file(
+            database_descriptor,
+            target_parent_descriptor,
+            target_name,
+        ):
+            return
+        try:
+            os.unlink(target_name, dir_fd=target_parent_descriptor)
+        except OSError as exc:
+            raise LoadError(
+                "failed to remove the invocation-created database after publication"
+            ) from exc
+        return
+
+    if previous_target_hash is None or backup_name is None:
+        raise LoadError("previous database recovery state is incomplete")
+    if _entry_matches_retained_file(
+        previous_target_descriptor,
+        target_parent_descriptor,
+        target_name,
+        previous_target_hash,
+    ):
+        return
+
+    _validate_regular_descriptor_entry(
+        previous_target_descriptor,
+        workspace_descriptor,
+        backup_name,
+        error_message="previous database backup changed before restoration",
+    )
+    try:
+        os.replace(
+            backup_name,
+            target_name,
+            src_dir_fd=workspace_descriptor,
+            dst_dir_fd=target_parent_descriptor,
+        )
+    except OSError as exc:
+        raise LoadError("failed to restore previous database target") from exc
+    _validate_regular_descriptor_entry(
+        previous_target_descriptor,
+        target_parent_descriptor,
+        target_name,
+        error_message="restored database is not the retained previous target",
+    )
+    if _sha256_descriptor(previous_target_descriptor) != previous_target_hash:
+        raise LoadError("restored database hash does not match the previous target")
+
+
+def _discard_target_backup_best_effort(
+    previous_target_descriptor: int | None,
+    workspace_descriptor: int,
+    backup_name: str | None,
+) -> None:
+    if previous_target_descriptor is None or backup_name is None:
+        return
+    try:
+        _validate_regular_descriptor_entry(
+            previous_target_descriptor,
+            workspace_descriptor,
+            backup_name,
+            error_message="database backup changed before cleanup",
+        )
+        os.unlink(backup_name, dir_fd=workspace_descriptor)
+    except (LoadError, OSError):
+        # Publication already succeeded. Never turn a conservative cleanup
+        # leak into a reported failure after mutating the caller's target.
+        pass
+
+
 def load_csvs(
     csv_dir: Path | str,
     db_path: Path | str,
@@ -1020,6 +1286,9 @@ def load_csvs(
     receipts = Path(receipt_dir) if receipt_dir is not None else target_dir
 
     target_parent_descriptor: int | None = None
+    previous_target_descriptor: int | None = None
+    previous_target_hash: str | None = None
+    backup_name: str | None = None
     workspace: Path | None = None
     workspace_descriptor: int | None = None
     workspace_identity: tuple[int, int] | None = None
@@ -1110,26 +1379,57 @@ def load_csvs(
         # replacement fails, leave the harmless orphan in place: its database
         # hash cannot validate against a mismatched target, and another
         # invocation may already have adopted it.
-        _validate_regular_descriptor_entry(
-            database_descriptor,
-            workspace_descriptor,
-            database_temp.name,
-            error_message="database entry changed before publication",
-        )
-        os.replace(
-            database_temp.name,
-            target.name,
-            src_dir_fd=workspace_descriptor,
-            dst_dir_fd=target_parent_descriptor,
-        )
-        _validate_regular_descriptor_entry(
-            database_descriptor,
+        previous_target = _prepare_existing_target_backup(
             target_parent_descriptor,
             target.name,
-            error_message="published database is not the retained regular file",
+            workspace_descriptor,
+            workspace_entries,
         )
-        if _sha256_descriptor(database_descriptor) != database_hash:
-            raise LoadError("published database hash changed during publication")
+        if previous_target is not None:
+            (
+                previous_target_descriptor,
+                previous_target_hash,
+                backup_name,
+            ) = previous_target
+
+        try:
+            _validate_regular_descriptor_entry(
+                database_descriptor,
+                workspace_descriptor,
+                database_temp.name,
+                error_message="database entry changed before publication",
+            )
+            os.replace(
+                database_temp.name,
+                target.name,
+                src_dir_fd=workspace_descriptor,
+                dst_dir_fd=target_parent_descriptor,
+            )
+            _validate_regular_descriptor_entry(
+                database_descriptor,
+                target_parent_descriptor,
+                target.name,
+                error_message="published database is not the retained regular file",
+            )
+            if _sha256_descriptor(database_descriptor) != database_hash:
+                raise LoadError("published database hash changed during publication")
+        except Exception:
+            _restore_target_after_publication_failure(
+                target_parent_descriptor=target_parent_descriptor,
+                target_name=target.name,
+                workspace_descriptor=workspace_descriptor,
+                database_descriptor=database_descriptor,
+                previous_target_descriptor=previous_target_descriptor,
+                previous_target_hash=previous_target_hash,
+                backup_name=backup_name,
+            )
+            raise
+
+        _discard_target_backup_best_effort(
+            previous_target_descriptor,
+            workspace_descriptor,
+            backup_name,
+        )
         return receipt, receipt_path
     except Exception as exc:
         if isinstance(exc, LoadError):
@@ -1154,6 +1454,8 @@ def load_csvs(
             known_entries=workspace_entries,
             parent_descriptor=target_parent_descriptor,
         )
+        if previous_target_descriptor is not None:
+            os.close(previous_target_descriptor)
         if database_descriptor is not None:
             os.close(database_descriptor)
         if workspace_descriptor is not None:

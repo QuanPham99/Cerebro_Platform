@@ -1417,3 +1417,160 @@ def test_oversized_regular_receipt_collision_uses_expected_plus_one_bounded_read
     assert observed["path"].stat().st_size == oversized_size
     assert target.read_bytes() == target_before
     _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_final_publication_substitution_restores_existing_target(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes that must be restored exactly")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    substituted_bytes = b"attacker substitution inside os.replace"
+    real_replace = loader.os.replace
+    observed = {"substituted": False}
+
+    def substitute_source_inside_publication_replace(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        if (
+            Path(source).name == "database.duckdb"
+            and Path(destination).name == target.name
+            and not observed["substituted"]
+        ):
+            source_directory = kwargs["src_dir_fd"]
+            loader.os.unlink(source, dir_fd=source_directory)
+            replacement = loader.os.open(
+                source,
+                loader.os.O_WRONLY | loader.os.O_CREAT | loader.os.O_EXCL,
+                0o600,
+                dir_fd=source_directory,
+            )
+            try:
+                assert loader.os.write(replacement, substituted_bytes) == len(
+                    substituted_bytes
+                )
+            finally:
+                loader.os.close(replacement)
+            observed["substituted"] = True
+        real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(
+        loader.os, "replace", substitute_source_inside_publication_replace
+    )
+
+    with pytest.raises(loader.LoadError, match="published database"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["substituted"] is True
+    assert target.read_bytes() == target_before
+    assert not target.is_symlink()
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_preflight_aba_swap_cannot_mix_hash_header_and_cast_sources(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    selected = next(
+        table
+        for table in manifest.tables
+        if len(_read_rows(csv_dir / table.file_name)[0]) >= 2
+    )
+    source_file = csv_dir / selected.file_name
+    compliant_bytes = source_file.read_bytes()
+    invalid_rows = _read_rows(source_file)
+    invalid_rows[0][0], invalid_rows[0][1] = (
+        invalid_rows[0][1],
+        invalid_rows[0][0],
+    )
+    _write_rows(source_file, invalid_rows)
+    invalid_bytes = source_file.read_bytes()
+    manifest = _rehash_manifest(manifest, csv_dir)
+    real_read_shape = loader._read_csv_shape
+    real_check_castability = loader._check_castability
+    observed = {"swapped": False, "restored": False}
+
+    def use_compliant_path_for_shape(path: Path) -> tuple[tuple[str, ...], int]:
+        if Path(path) == source_file:
+            source_file.write_bytes(compliant_bytes)
+            observed["swapped"] = True
+        return real_read_shape(path)
+
+    def restore_manifest_bound_path_after_cast(table: Any) -> int:
+        try:
+            return real_check_castability(table)
+        finally:
+            if table.source_file == source_file and observed["swapped"]:
+                source_file.write_bytes(invalid_bytes)
+                observed["restored"] = True
+
+    monkeypatch.setattr(loader, "_read_csv_shape", use_compliant_path_for_shape)
+    monkeypatch.setattr(
+        loader,
+        "_check_castability",
+        restore_manifest_bound_path_after_cast,
+    )
+
+    with pytest.raises(loader.LoadError, match="header mismatch"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+    assert source_file.read_bytes() == invalid_bytes
+    assert observed["swapped"] is observed["restored"]
+
+
+def test_early_snapshot_failure_after_destination_creation_cleans_workspace(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    real_copy_snapshot = loader._copy_verified_snapshot
+    real_fdopen = loader.os.fdopen
+    observed = {"failed_destination_open": False}
+
+    def fail_copy_after_destination_creation(*args: Any, **kwargs: Any) -> Path:
+        def fail_destination_fdopen(
+            descriptor: int,
+            mode: str = "r",
+            *fdopen_args: Any,
+            **fdopen_kwargs: Any,
+        ) -> Any:
+            if mode == "wb" and not observed["failed_destination_open"]:
+                observed["failed_destination_open"] = True
+                raise OSError("injected failure after snapshot destination creation")
+            return real_fdopen(descriptor, mode, *fdopen_args, **fdopen_kwargs)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(loader.os, "fdopen", fail_destination_fdopen)
+            return real_copy_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loader, "_copy_verified_snapshot", fail_copy_after_destination_creation
+    )
+
+    with pytest.raises(loader.LoadError, match="could not create verified snapshot"):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert observed["failed_destination_open"] is True
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target)
