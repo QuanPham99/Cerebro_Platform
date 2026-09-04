@@ -72,27 +72,35 @@ class SemanticRetriever:
                     membership = GraphEdge(id=f"{obj.id}:{endpoint}", source=obj.id, target=endpoint, type="relationship_endpoint", label="endpoint")
                     edges.append(membership)
                     self._add_edge(membership)
-            targets = list(obj.links)
-            targets += [str(value) for value in obj.cerebro.get("dependencies", [])]
-            targets += [str(value) for value in obj.cerebro.get("applies_to", [])]
-            targets += [str(value) for value in obj.cerebro.get("maps_to", [])]
+                continue
+
+            if obj.type == "dataset":
+                targets = list(obj.links)
+                edge_type = "semantic_mapping"
+                label = "contains"
+            elif obj.type == "concept":
+                targets = [str(value) for value in obj.cerebro.get("maps_to", obj.links)]
+                edge_type = "semantic_mapping"
+                label = "maps to"
+            elif obj.type == "metric":
+                targets = [str(value) for value in obj.cerebro.get("dependencies", obj.links)]
+                edge_type = "metric_dependency"
+                label = "depends on"
+            elif obj.type == "policy":
+                targets = [str(value) for value in obj.cerebro.get("applies_to", obj.links)]
+                edge_type = "policy_coverage"
+                label = "applies to"
+            else:
+                continue
+
             for target in targets:
                 if target not in self.by_id:
                     continue
-                # Canonical parent/policy/relationship objects already emit these
-                # connections. Omitting reverse table links keeps the graph legible.
-                if obj.type == "table" and self.by_id[target].type in {"dataset", "relationship", "policy"}:
-                    continue
-                edge_type = "semantic_mapping"
-                if obj.type == "metric":
-                    edge_type = "metric_dependency"
-                elif obj.type == "policy":
-                    edge_type = "policy_coverage"
                 key = (obj.id, target, edge_type)
                 if key in seen:
                     continue
                 seen.add(key)
-                edge = GraphEdge(id=f"{obj.id}->{target}", source=obj.id, target=target, type=edge_type, label=edge_type.replace("_", " "))
+                edge = GraphEdge(id=f"{obj.id}->{target}", source=obj.id, target=target, type=edge_type, label=label)
                 edges.append(edge)
                 self._add_edge(edge)
         return edges
@@ -218,10 +226,10 @@ class SemanticRetriever:
 class OpenAIEmbedder:
     """Optional in-memory embedding adapter; lexical retrieval remains the safe fallback."""
 
-    def __init__(self, model: str = "text-embedding-3-small"):
+    def __init__(self, model: str = "text-embedding-3-small", *, api_key: str | None = None, base_url: str | None = None):
         from openai import OpenAI
 
-        self.client = OpenAI()
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
 
     def __call__(self, texts: list[str]) -> list[list[float]]:
@@ -230,9 +238,16 @@ class OpenAIEmbedder:
 
 
 def embedder_from_environment() -> OpenAIEmbedder | None:
-    if not os.getenv("OPENAI_API_KEY"):
+    from .settings import Settings
+
+    settings = Settings.from_environment()
+    if not settings.llm_api_key or not settings.embedding_model:
         return None
     try:
-        return OpenAIEmbedder(os.getenv("CEREBRO_EMBEDDING_MODEL", "text-embedding-3-small"))
+        return OpenAIEmbedder(
+            settings.embedding_model,
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        )
     except (ImportError, RuntimeError):
         return None

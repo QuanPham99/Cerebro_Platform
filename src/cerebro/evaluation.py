@@ -9,6 +9,35 @@ from .paths import DEFAULT_BUNDLE, ROOT
 from .retrieval import SemanticRetriever
 
 
+def _normalized_relationships(bundle_path: Path | str) -> set[tuple[str, str]]:
+    bundle = load_validated_bundle(bundle_path)
+    normalized: set[tuple[str, str]] = set()
+    for item in bundle.objects:
+        if item.type != "relationship":
+            continue
+        source = f"{item.cerebro.get('source_table')}.{item.cerebro.get('source_column')}"
+        target = f"{item.cerebro.get('target_table')}.{item.cerebro.get('target_column')}"
+        normalized.add(tuple(sorted((source, target))))
+    return normalized
+
+
+def compare_relationship_oracle(
+    candidate_path: Path | str,
+    oracle_path: Path | str = DEFAULT_BUNDLE,
+) -> dict[str, object]:
+    """Compare only after generation; the oracle is never an input to generation."""
+    predicted = _normalized_relationships(candidate_path)
+    expected = _normalized_relationships(oracle_path)
+    matched = predicted & expected
+    return {
+        "precision": len(matched) / len(predicted) if predicted else (1.0 if not expected else 0.0),
+        "recall": len(matched) / len(expected) if expected else 1.0,
+        "matched": len(matched),
+        "missing": [list(item) for item in sorted(expected - predicted)],
+        "invented": [list(item) for item in sorted(predicted - expected)],
+    }
+
+
 def run_evaluation(
     bundle_path: Path | str = DEFAULT_BUNDLE,
     questions_path: Path | str = ROOT / "evaluation" / "golden-questions.yaml",
@@ -25,4 +54,3 @@ def run_evaluation(
         missing = sorted(expected - actual)
         results.append({"id": case["id"], "passed": not missing, "missing": missing, "question": case["question"]})
     return results
-

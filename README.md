@@ -13,19 +13,20 @@ This branch contains a working, spec-driven semantic-layer slice for the bank wo
 - Google Cloud's full Open Knowledge Format repository is vendored as an unmodified Git subtree at commit `ad30107c31c06aec8a7d5636e0d1058118604e6f`.
 - `DuckDBSource` implements Google's `Source` contract and reads only `information_schema` through a read-only connection.
 - The checked-in `knowledge/bank-workshop` golden bundle describes 10 tables, 75 columns, 11 declared relationships, 9 business concepts, 4 metrics, and a sensitive-data policy.
-- A bounded enrichment boundary supports two structured stages through a provider-neutral interface and an optional OpenAI Responses adapter.
+- Bounded definition, relationship, and query-semantics stages use one configurable OpenAI-compatible model gateway and never receive source rows.
 - The in-memory retriever uses lexical ranking, optional `text-embedding-3-small` vectors, reciprocal-rank fusion, and typed one-hop graph expansion.
-- FastAPI serves the bundle, graph, search, details, and grounding; MCP exposes the same grounding contract through local Streamable HTTP.
-- The React/Cytoscape explorer provides an Obsidian-inspired, read-only semantic constellation with search, filters, keyboard navigation, one-hop focus, and a detailed inspector.
+- FastAPI serves semantic retrieval, runtime status, and governed database chat; MCP exposes the same grounding contract through local Streamable HTTP.
+- The React workspace combines the read-only semantic constellation with a conversational Text-to-SQL experience that discloses SQL, results, evidence, warnings, and agent trace.
 
-The production code traces to the seven contracts in [`specs/`](specs/README.md). Semantic definitions and design rationale remain in [`docs/semantic-layer-definition.md`](docs/semantic-layer-definition.md).
+The production code traces to the eight contracts in [`specs/`](specs/README.md). Semantic definitions and design rationale remain in [`docs/semantic-layer-definition.md`](docs/semantic-layer-definition.md). The complete manual test procedure is [`docs/product-tester-guide.md`](docs/product-tester-guide.md).
 
 ### Quick start
 
 Requirements: Python 3.10 or newer, Node.js 20 or newer, and npm.
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e '.[ai]'
+cp .env.example .env
 cd apps/web
 npm install
 npm run build
@@ -43,7 +44,9 @@ For live frontend development, install dependencies and run:
 ./scripts/dev.sh
 ```
 
-This starts the API/MCP service on port 8000 and Vite on port 5173.
+The launcher prefers `.venv/bin/python` when the project virtual environment exists. It starts the API/MCP service on port 8000 and Vite on port 5173, and exits with the backend error instead of starting Vite when the API cannot initialize.
+
+In **Semantic constellation**, open the **Build** tab or the terminal button, explicitly choose **Database only** or **Configured**, and then choose **Generate candidate**. The guided transcript scans the catalog, runs the three typed semantic stages, compiles and validates a separate OKF bundle, and exposes its graph, evidence, provenance, and Markdown. A whole-candidate review decision is recorded before a separately confirmed activation updates HTTP, MCP, graph, document, and chat consumers.
 
 ### Core commands
 
@@ -51,26 +54,41 @@ This starts the API/MCP service on port 8000 and Vite on port 5173.
 # Catalog-only discovery against config/bank-source.yaml
 cerebro scan
 
-# Uses live two-stage enrichment when OPENAI_API_KEY and the ai extra are present;
-# otherwise reports the checked-in golden fallback without modifying it.
-cerebro generate
+# Generate a separate candidate using three live stages when configured,
+# or a valid catalog/relationship-only candidate without credentials.
+cerebro generate --output knowledge/generated/tester-001
+
+# Run a raw database-only test. This never loads source YAML or checked-in knowledge.
+cerebro generate --source-mode database-only --database /absolute/path/to/workshop.duckdb --output knowledge/generated/raw-001
+
+# Validate, review, then explicitly activate the immutable reviewed copy.
+cerebro validate --bundle knowledge/generated/tester-001
+cerebro review --bundle knowledge/generated/tester-001 --reviewer 'Data Owner' --acknowledge-ai-risk
+cerebro activate --bundle knowledge/reviewed/tester-001
 
 # Validate Google OKF syntax plus Cerebro relationship/metric/link contracts
 cerebro validate
 
 # Evaluate all ten representative banking questions
 cerebro evaluate
+
+# Ask one governed database question from the terminal.
+cerebro ask 'How many customers are there by gender?'
 ```
 
-To enable the first live provider adapter:
+Configure any OpenAI-compatible chat-completions endpoint in the ignored `.env` file:
 
-```bash
-python3 -m pip install -e '.[ai]'
-export OPENAI_API_KEY=your_key
-cerebro generate
+```dotenv
+CEREBRO_DATABASE_PATH=/absolute/path/to/workshop.duckdb
+CEREBRO_LLM_BASE_URL=https://api.openai.com/v1
+CEREBRO_LLM_API_KEY=your_key
+CEREBRO_LLM_MODEL=your_endpoint_supported_model
+CEREBRO_LLM_RESPONSE_MODE=auto
+CEREBRO_LLM_TIMEOUT_SECONDS=120
+CEREBRO_LLM_MAX_OUTPUT_TOKENS=8192
 ```
 
-The default generation model is `gpt-5.4-mini`; the default embedding model is `text-embedding-3-small`. Override them with `CEREBRO_OPENAI_MODEL` and `CEREBRO_EMBEDDING_MODEL`. No database rows are included in model input. Without credentials or the optional package, generation and retrieval remain fully functional using the golden OKF bundle and lexical-plus-graph retrieval.
+Run `cerebro doctor` after changing configuration. Model and key changes require no source edits, and secrets are never returned to the browser. No database rows are included in OKF generation. Chat may send only bounded, policy-approved query results to the model; restricted fields and raw confidential values are blocked. Embeddings remain optional and lexical-plus-graph retrieval is the deterministic fallback.
 
 ### Runtime interfaces
 
@@ -81,11 +99,21 @@ The default generation model is `gpt-5.4-mini`; the default embedding model is `
 | `GET /api/concepts/{id}` | Complete OKF/Cerebro object detail |
 | `GET /api/search?q=&types=` | Ranked semantic search |
 | `POST /api/grounding` | Structured grounding packet for application clients |
+| `GET /api/runtime/status` | Redacted model, database, guardrail, and active-bundle readiness |
+| `POST /api/chat` | Bounded conversation, validated read-only SQL, results, and evidence |
+| `POST /api/generation/runs` | Start one configured or database-only candidate run |
+| `GET /api/generation/runs/{id}` | Generation state, replayable events, and candidate summary |
+| `GET /api/generation/runs/{id}/events` | Live Server-Sent Events progress stream |
+| `GET /api/generation/runs/{id}/graph` | Validated candidate graph preview; never activates it |
+| `GET /api/generation/runs/{id}/snapshot` | Sanitized catalog facts and discovery evidence |
+| `GET /api/generation/runs/{id}/documents/{path}` | Generated candidate Markdown |
+| `POST /api/generation/runs/{id}/reviews` | Record an idempotent whole-candidate approval or rejection |
+| `POST /api/generation/runs/{id}/activate` | Verify and activate the immutable approved bundle |
 | MCP `retrieve_grounding` | Concepts, tables, joins, metrics, warnings, classifications, and provenance |
 | MCP `get_concept` | Stable-ID lookup |
 | MCP `expand_neighborhood` | Typed graph expansion up to depth three |
 
-Text-to-SQL generation and query execution intentionally remain separate. Cerebro returns the semantic evidence needed to ground that downstream system.
+Text-to-SQL execution is limited to the configured local DuckDB source. The validator accepts one explicit-column `SELECT`, applies the semantic data policy, enforces time and row limits, and blocks writes and external access before execution.
 
 ## Why Cerebro
 

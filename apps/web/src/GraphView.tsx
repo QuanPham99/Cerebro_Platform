@@ -44,7 +44,7 @@ export const physicalRelationshipRule = {
     'line-color': '#3EA6B8AA',
     'target-arrow-color': '#3EA6B8',
     'target-arrow-shape': 'triangle',
-    'arrow-scale': 0.72,
+    'arrow-scale': 1,
     'source-label': (edge: cytoscape.EdgeSingular) => cardinalityEndpoint(edge, 0),
     'target-label': (edge: cytoscape.EdgeSingular) => cardinalityEndpoint(edge, 1),
     'source-text-offset': 13,
@@ -62,6 +62,53 @@ export const physicalRelationshipRule = {
   },
 } as const
 
+export const semanticRelationshipRules = [
+  {
+    selector: 'edge[type = "semantic_mapping"]',
+    style: {
+      width: 1.4,
+      'line-color': '#A78BFA',
+      'target-arrow-color': '#A78BFA',
+      'target-arrow-shape': 'triangle',
+      'arrow-scale': 1,
+      'line-style': 'solid',
+    },
+  },
+  {
+    selector: 'edge[type = "metric_dependency"]',
+    style: {
+      width: 1.4,
+      'line-color': '#F2B56B',
+      'target-arrow-color': '#F2B56B',
+      'target-arrow-shape': 'triangle',
+      'arrow-scale': 1,
+      'line-style': 'dashed',
+    },
+  },
+  {
+    selector: 'edge[type = "policy_coverage"]',
+    style: {
+      width: 1.4,
+      'line-color': '#F17B91',
+      'target-arrow-color': '#F17B91',
+      'target-arrow-shape': 'triangle',
+      'arrow-scale': 1,
+      'line-style': 'dotted',
+    },
+  },
+  {
+    selector: 'edge[type = "relationship_endpoint"]',
+    style: {
+      width: 1,
+      'line-color': '#66728A',
+      'target-arrow-color': '#66728A',
+      'target-arrow-shape': 'none',
+      'line-style': 'solid',
+      opacity: 0.46,
+    },
+  },
+] as const
+
 export function GraphLegend() {
   return (
     <div className="legend" aria-label="Graph edge legend">
@@ -69,8 +116,10 @@ export function GraphLegend() {
         <code aria-label="Table join cardinality example: many to one">many → one</code>
         <span>table join</span>
       </span>
-      <span><i className="line semantic" /> semantic path</span>
-      <span><i className="line policy" /> governance</span>
+      <span><i className="line semantic directional" /><span><code>concept → table</code> maps to</span></span>
+      <span><i className="line metric directional" /><span><code>metric → table</code> depends on</span></span>
+      <span><i className="line policy directional" /><span><code>policy → table</code> applies to</span></span>
+      <span><i className="line endpoint" /><span>relationship endpoint</span></span>
     </div>
   )
 }
@@ -85,7 +134,7 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
   useImperativeHandle(ref, () => ({
     fit: () => core.current?.fit(undefined, 52),
     reset: () => {
-      core.current?.elements().removeClass('focused dimmed')
+      core.current?.elements().removeClass('focused dimmed edge-selected')
       core.current?.fit(undefined, 52)
     },
   }))
@@ -129,12 +178,13 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
             width: 1,
             'line-color': '#66728A77',
             'target-arrow-color': '#66728A99',
-            'target-arrow-shape': (element: cytoscape.EdgeSingular) => (element.data('type') === 'semantic_mapping' ? 'triangle' : 'none'),
+            'target-arrow-shape': 'none',
             'curve-style': 'bezier',
-            opacity: 0.62,
+            opacity: 0.82,
           },
         },
         physicalRelationshipRule,
+        ...semanticRelationshipRules,
         {
           selector: 'node.focused',
           style: {
@@ -149,11 +199,9 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
           },
         },
         {
-          selector: 'edge.focused',
+          selector: 'edge.focused, edge.hovered, edge.edge-selected',
           style: {
             width: 2.5,
-            'line-color': '#A78BFA',
-            'target-arrow-color': '#A78BFA',
             opacity: 1,
             label: 'data(label)',
             color: '#E7ECF4',
@@ -164,13 +212,25 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
           },
         },
         {
-          selector: 'edge[type = "physical_fk"].focused',
+          selector: 'edge[type = "physical_fk"].focused, edge[type = "physical_fk"].hovered, edge[type = "physical_fk"].edge-selected',
           style: {
             'line-color': '#58C7D9',
             'target-arrow-color': '#58C7D9',
             'text-border-color': '#58C7D9',
             label: '',
           },
+        },
+        {
+          selector: 'edge[type = "semantic_mapping"].focused, edge[type = "semantic_mapping"].hovered, edge[type = "semantic_mapping"].edge-selected',
+          style: { 'line-color': '#A78BFA', 'target-arrow-color': '#A78BFA' },
+        },
+        {
+          selector: 'edge[type = "metric_dependency"].focused, edge[type = "metric_dependency"].hovered, edge[type = "metric_dependency"].edge-selected',
+          style: { 'line-color': '#F2B56B', 'target-arrow-color': '#F2B56B' },
+        },
+        {
+          selector: 'edge[type = "policy_coverage"].focused, edge[type = "policy_coverage"].hovered, edge[type = "policy_coverage"].edge-selected',
+          style: { 'line-color': '#F17B91', 'target-arrow-color': '#F17B91' },
         },
         { selector: '.dimmed', style: { opacity: 0.1 } },
       ] as any),
@@ -189,6 +249,15 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
     cy.on('tap', 'node', (event) => onSelect(event.target.id()))
     cy.on('mouseover', 'node', (event) => event.target.addClass('hovered'))
     cy.on('mouseout', 'node', (event) => event.target.removeClass('hovered'))
+    cy.on('mouseover', 'edge', (event) => event.target.addClass('hovered'))
+    cy.on('mouseout', 'edge', (event) => event.target.removeClass('hovered'))
+    cy.on('tap', 'edge', (event) => {
+      cy.edges().removeClass('edge-selected')
+      event.target.addClass('edge-selected')
+    })
+    cy.on('tap', (event) => {
+      if (event.target === cy) cy.edges().removeClass('edge-selected')
+    })
     core.current = cy
     return () => {
       cy.destroy()

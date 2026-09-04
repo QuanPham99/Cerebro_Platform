@@ -15,6 +15,9 @@ These specifications are the contract for implementation. Production code must t
 5. [005 — Semantic retrieval and MCP](005-semantic-retrieval-mcp.md)
 6. [006 — Knowledge graph UI](006-knowledge-graph-ui.md)
 7. [007 — End-to-end demo](007-end-to-end-demo.md)
+8. [008 — OKF agents and governed database chat](008-okf-agents-and-governed-chat.md)
+9. [009 — Generation observability UI](009-generation-observability-ui.md)
+10. [010 — Database-only generation, review, and activation](010-database-only-review-activation.md)
 
 ## Shared constraints
 
@@ -22,8 +25,8 @@ These specifications are the contract for implementation. Production code must t
 - The source DuckDB is opened read-only. No source rows are sampled, persisted, logged, or sent to an AI provider.
 - Discovered facts, declared facts, AI proposals, and reviewed facts retain distinct provenance.
 - The checked-in golden bundle is the default demo input and makes the demo independent of credentials.
-- One bounded semantic enrichment agent performs two structured stages; infrastructure discovery and validation remain deterministic.
-- Text-to-SQL execution is out of scope. Cerebro provides grounding context only.
+- Bounded semantic agents perform typed definition, relationship, and query-semantics stages; discovery, compilation, validation, and activation remain deterministic.
+- Text-to-SQL execution is read-only, policy-gated, local DuckDB access as specified in 008.
 
 ## Compliance IDs
 

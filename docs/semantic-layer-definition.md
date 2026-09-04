@@ -524,7 +524,7 @@ Cerebro should not create one agent for every layer. Layers 1 and 4 are determin
 | Query semantics | `SemanticEnrichmentAgent` plus `OKFValidator` | Partly | The agent proposes grain and guidance; deterministic code verifies physical claims |
 | Retrieval | `SemanticRetriever` and MCP server | No | Ranking, graph traversal, filtering, and response construction should be reproducible |
 
-For the prototype, one bounded semantic-enrichment agent handles two structured stages:
+For the prototype, one bounded semantic-enrichment workflow handles three structured stages:
 
 ```text
 Stage 1: Business enrichment
@@ -534,12 +534,17 @@ Stage 1: Business enrichment
   table purpose
   classifications
 
-Stage 2: Query enrichment
+Stage 2: Relationship enrichment
+  relationship purpose
+  cardinality and evidence
+  join guidance
+  ambiguity and fan-out warnings
+
+Stage 3: Query enrichment
   grain
   dimensions and measures
-  joins derived from discovered keys
   query guidance
-  ambiguity and fan-out warnings
+  metric and policy proposals
 ```
 
 The stages may use separate prompts, but they share one workflow and one structured output contract. The agent can propose semantics but cannot publish them directly.
