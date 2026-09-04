@@ -79,7 +79,12 @@ def _write_matching_evidence(tmp_path: Path):
     bundle_path = tmp_path / "bundle"
     bundle_path.mkdir()
     (bundle_path / "bundle.yaml").write_text(
-        "name: caf\u00e9-bank\nversion: 1\n",
+        "name: caf\u00e9-bank\n"
+        "version: 1\n"
+        "generation_mode: fallback\n"
+        "source: governed source declaration\n"
+        "google_okf_repository: https://example.test/governed-okf.git\n"
+        "google_okf_commit: 0123456789abcdef0123456789abcdef01234567\n",
         encoding="utf-8",
     )
     bundle_object_path = bundle_path / "accounts.md"
@@ -694,3 +699,119 @@ def test_preflight_report_and_cli_never_expose_values_or_paths(tmp_path, capsys)
     ):
         assert canary not in serialized
         assert canary not in output
+
+
+@pytest.mark.parametrize(
+    ("field", "original", "replacement"),
+    (
+        ("generation_mode", "fallback", "private-generation-mode-canary"),
+        (
+            "source",
+            "governed source declaration",
+            "private-source-declaration-canary",
+        ),
+        (
+            "google_okf_repository",
+            "https://example.test/governed-okf.git",
+            "https://private.invalid/repository-canary.git",
+        ),
+        (
+            "google_okf_commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "ffffffffffffffffffffffffffffffffffffffff",
+        ),
+    ),
+)
+def test_full_bundle_manifest_metadata_drift_changes_hash_and_blocks_receipt(
+    tmp_path: Path,
+    field: str,
+    original: str,
+    replacement: str,
+) -> None:
+    evidence = _write_matching_evidence(tmp_path)
+    bundle_module = import_module("cerebro.bundle")
+    semantic_bundle_sha256 = _provenance()[2]
+    MaterializationReceipt = _contracts()[0]
+    receipt = MaterializationReceipt.model_validate_json(
+        evidence["materialization_receipt_path"].read_bytes()
+    )
+    baseline_bundle = bundle_module.load_validated_bundle(evidence["bundle_path"])
+    expected_metadata = {
+        "name": "caf\u00e9-bank",
+        "version": 1,
+        "generation_mode": "fallback",
+        "source": "governed source declaration",
+        "google_okf_repository": "https://example.test/governed-okf.git",
+        "google_okf_commit": "0123456789abcdef0123456789abcdef01234567",
+    }
+    assert baseline_bundle.manifest_metadata == expected_metadata
+    baseline_hash = semantic_bundle_sha256(baseline_bundle)
+    assert receipt.bundle_sha256 == baseline_hash
+
+    manifest_path = evidence["bundle_path"] / "bundle.yaml"
+    original_text = manifest_path.read_text(encoding="utf-8")
+    governed_line = f"{field}: {original}"
+    assert governed_line in original_text
+    manifest_path.write_text(
+        original_text.replace(governed_line, f"{field}: {replacement}", 1),
+        encoding="utf-8",
+    )
+
+    changed_bundle = bundle_module.load_validated_bundle(evidence["bundle_path"])
+    assert changed_bundle.manifest_metadata[field] == replacement
+    assert baseline_bundle.manifest_metadata == expected_metadata
+    assert semantic_bundle_sha256(changed_bundle) != baseline_hash
+
+    report = _preflight().check_preflight(
+        csv_dir=evidence["csv_dir"],
+        manifest_path=evidence["manifest_path"],
+        bundle_path=evidence["bundle_path"],
+        environ={"CEREBRO_API_KEY": "key", "CEREBRO_MODEL": "organizer-model"},
+        database_path=evidence["database_path"],
+        materialization_receipt_path=evidence["materialization_receipt_path"],
+        provider_capability_receipt_path=evidence["provider_receipt_path"],
+    )
+
+    assert {blocker.code for blocker in report.blockers if blocker.gate == "data"} == {
+        "bundle_hash_mismatch"
+    }
+    assert report.data_prerequisites_ready is False
+    serialized = report.model_dump_json()
+    assert replacement not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_non_mapping_bundle_manifest_fails_closed_without_leakage(
+    tmp_path: Path,
+) -> None:
+    evidence = _write_matching_evidence(tmp_path)
+    bundle_module = import_module("cerebro.bundle")
+    canary = "private-non-mapping-manifest-canary"
+    manifest_path = evidence["bundle_path"] / "bundle.yaml"
+    manifest_path.write_text(f"- {canary}\n", encoding="utf-8")
+
+    with pytest.raises(
+        bundle_module.BundleLoadError,
+        match="bundle manifest must be a mapping",
+    ) as captured:
+        bundle_module.load_validated_bundle(evidence["bundle_path"])
+
+    assert canary not in str(captured.value)
+    assert str(tmp_path) not in str(captured.value)
+
+    report = _preflight().check_preflight(
+        csv_dir=evidence["csv_dir"],
+        manifest_path=evidence["manifest_path"],
+        bundle_path=evidence["bundle_path"],
+        environ={"CEREBRO_API_KEY": "key", "CEREBRO_MODEL": "organizer-model"},
+        database_path=evidence["database_path"],
+        materialization_receipt_path=evidence["materialization_receipt_path"],
+        provider_capability_receipt_path=evidence["provider_receipt_path"],
+    )
+
+    assert {blocker.code for blocker in report.blockers if blocker.gate == "data"} == {
+        "bundle_hash_mismatch"
+    }
+    serialized = report.model_dump_json()
+    assert canary not in serialized
+    assert str(tmp_path) not in serialized

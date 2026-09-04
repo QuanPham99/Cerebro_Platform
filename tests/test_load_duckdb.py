@@ -766,9 +766,16 @@ def test_receipt_is_finalized_immediately_before_database_replace(
         events.append(("receipt", Path(destination)))
         real_link(source, destination)
 
-    def recording_replace(source: Any, destination: Any) -> None:
-        events.append(("database", Path(destination)))
-        real_replace(source, destination)
+    def recording_replace(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        destination_path = Path(destination)
+        if kwargs.get("dst_dir_fd") is not None:
+            destination_path = target.parent / destination_path
+        events.append(("database", destination_path))
+        real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(loader.os, "link", recording_link)
     monkeypatch.setattr(loader.os, "replace", recording_replace)
@@ -1090,8 +1097,9 @@ def test_database_replace_failure_preserves_published_receipt_for_adopter(
     def adopt_receipt_then_fail_database_replace(
         source: Any,
         destination: Any,
+        **kwargs: Any,
     ) -> None:
-        if Path(destination) == target:
+        if Path(destination).name == target.name:
             published = list(receipt_dir.glob("*.json"))
             assert len(published) == 1
             adopted_bytes = published[0].read_bytes()
@@ -1102,7 +1110,7 @@ def test_database_replace_failure_preserves_published_receipt_for_adopter(
             adopted["path"] = published[0]
             adopted["bytes"] = adopted_bytes
             raise OSError("injected database replace failure after adoption")
-        real_replace(source, destination)
+        real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(
         loader.os,
@@ -1150,10 +1158,14 @@ def test_database_replace_failure_never_deletes_preexisting_receipt(
     }
     real_replace = loader.os.replace
 
-    def fail_database_replace(source: Any, destination: Any) -> None:
-        if Path(destination) == target:
+    def fail_database_replace(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        if Path(destination).name == target.name:
             raise OSError("injected database replace failure")
-        real_replace(source, destination)
+        real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(loader.os, "replace", fail_database_replace)
 
@@ -1171,4 +1183,237 @@ def test_database_replace_failure_never_deletes_preexisting_receipt(
     assert {
         path.name: path.read_bytes() for path in receipt_dir.glob("*.json")
     } == receipt_files_before
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_whole_workspace_substitution_after_database_hash_is_descriptor_bound(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing database bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    moved_workspace = tmp_path / "attacker-moved-owned-workspace"
+    substituted_database_bytes = b"substituted unhashed database bytes"
+    unrelated_bytes = b"unrelated tree must survive cleanup"
+    real_build_database = loader._build_database
+    real_write_receipt_temp = loader._write_receipt_temp
+    observed: dict[str, Any] = {}
+
+    def record_built_database(
+        database_path: Path,
+        inventory: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = real_build_database(database_path, inventory, *args, **kwargs)
+        observed.update(
+            workspace=database_path.parent,
+            database_bytes=database_path.read_bytes(),
+        )
+        return result
+
+    def substitute_workspace_after_hash(
+        receipt_workspace: Path,
+        receipt_bytes: bytes,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[int, Path]:
+        workspace = observed["workspace"]
+        workspace.rename(moved_workspace)
+        workspace.mkdir(mode=0o700)
+        unrelated = workspace / "unrelated-tree"
+        unrelated.mkdir()
+        (unrelated / "keep.txt").write_bytes(unrelated_bytes)
+        (workspace / "database.duckdb").write_bytes(substituted_database_bytes)
+        observed["substituted_workspace"] = workspace
+        return real_write_receipt_temp(
+            receipt_workspace,
+            receipt_bytes,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(loader, "_build_database", record_built_database)
+    monkeypatch.setattr(loader, "_write_receipt_temp", substitute_workspace_after_hash)
+
+    try:
+        receipt, _receipt_path = loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    except loader.LoadError:
+        assert target.read_bytes() == target_before
+    else:
+        retained_bytes = observed["database_bytes"]
+        assert target.read_bytes() == retained_bytes
+        assert receipt.database_sha256 == hashlib.sha256(retained_bytes).hexdigest()
+        assert sha256_file(target) == receipt.database_sha256
+
+    substituted_workspace = observed["substituted_workspace"]
+    assert (substituted_workspace / "unrelated-tree" / "keep.txt").read_bytes() == (
+        unrelated_bytes
+    )
+    assert (substituted_workspace / "database.duckdb").read_bytes() == (
+        substituted_database_bytes
+    )
+    assert moved_workspace.is_dir()
+
+
+def test_database_entry_substitution_after_hash_fails_without_target_or_tree_damage(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing database bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    substituted_database_bytes = b"substituted unhashed database bytes"
+    unrelated_bytes = b"unrelated entry must survive cleanup"
+    real_build_database = loader._build_database
+    real_write_receipt_temp = loader._write_receipt_temp
+    observed: dict[str, Any] = {}
+
+    def record_built_database(
+        database_path: Path,
+        inventory: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = real_build_database(database_path, inventory, *args, **kwargs)
+        observed.update(
+            workspace=database_path.parent,
+            database_bytes=database_path.read_bytes(),
+        )
+        return result
+
+    def substitute_database_entry_after_hash(
+        receipt_workspace: Path,
+        receipt_bytes: bytes,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[int, Path]:
+        workspace = observed["workspace"]
+        database_path = workspace / "database.duckdb"
+        retained_database = workspace / "attacker-moved-retained.duckdb"
+        database_path.rename(retained_database)
+        database_path.write_bytes(substituted_database_bytes)
+        unrelated = workspace / "attacker-unrelated.txt"
+        unrelated.write_bytes(unrelated_bytes)
+        observed.update(
+            retained_database=retained_database,
+            substituted_database=database_path,
+            unrelated=unrelated,
+        )
+        return real_write_receipt_temp(
+            receipt_workspace,
+            receipt_bytes,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(loader, "_build_database", record_built_database)
+    monkeypatch.setattr(
+        loader,
+        "_write_receipt_temp",
+        substitute_database_entry_after_hash,
+    )
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == target_before
+    assert observed["retained_database"].read_bytes() == observed["database_bytes"]
+    assert observed["substituted_database"].read_bytes() == (substituted_database_bytes)
+    assert observed["unrelated"].read_bytes() == unrelated_bytes
+
+
+def test_link_no_follow_supported_branch_hard_links_symlink_itself(
+    tmp_path: Path,
+) -> None:
+    loader = _loader()
+    assert loader.os.link in loader.os.supports_follow_symlinks
+    backing = tmp_path / "backing.txt"
+    backing.write_bytes(b"backing bytes")
+    source = tmp_path / "source-link"
+    source.symlink_to(backing.name)
+    destination = tmp_path / "destination-link"
+
+    loader._link_no_follow(source, destination)
+
+    source_stat = source.lstat()
+    destination_stat = destination.lstat()
+    assert source.is_symlink()
+    assert destination.is_symlink()
+    assert destination.readlink() == Path(backing.name)
+    assert (destination_stat.st_dev, destination_stat.st_ino) == (
+        source_stat.st_dev,
+        source_stat.st_ino,
+    )
+
+
+def test_oversized_regular_receipt_collision_uses_expected_plus_one_bounded_read(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing database bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    oversized_size = 16 * 1024 * 1024
+    real_link = loader.os.link
+    real_read = loader.os.read
+    observed: dict[str, Any] = {"read_sizes": []}
+
+    def publish_oversized_regular_collision(source: Any, destination: Any) -> None:
+        receipt_bytes = Path(source).read_bytes()
+        receipt_path = Path(destination)
+        with receipt_path.open("wb") as competing:
+            competing.write(receipt_bytes)
+            competing.truncate(oversized_size)
+        observed.update(
+            path=receipt_path,
+            receipt_length=len(receipt_bytes),
+        )
+        real_link(source, destination)
+
+    def record_bounded_read(descriptor: int, size: int) -> bytes:
+        observed["read_sizes"].append(size)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(loader.os, "link", publish_oversized_regular_collision)
+    monkeypatch.setattr(loader.os, "read", record_bounded_read)
+
+    with pytest.raises(loader.LoadError, match="content-addressed receipt collision"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    expected_limit = observed["receipt_length"] + 1
+    assert observed["read_sizes"] == [expected_limit]
+    assert observed["path"].stat().st_size == oversized_size
+    assert target.read_bytes() == target_before
     _assert_no_invocation_temps(target, receipt_dir)

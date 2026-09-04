@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import os
 import re
-import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -390,6 +389,152 @@ def _validate_regular_descriptor_path(
     return descriptor_stat
 
 
+def _identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _validate_directory_descriptor_path(
+    descriptor: int,
+    path: Path,
+    *,
+    required_mode: int | None = None,
+    error_message: str,
+) -> os.stat_result:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or _identity(descriptor_stat) != _identity(path_stat)
+        or (
+            required_mode is not None
+            and stat.S_IMODE(descriptor_stat.st_mode) != required_mode
+        )
+    ):
+        raise LoadError(error_message)
+    return descriptor_stat
+
+
+def _validate_directory_descriptor_entry(
+    descriptor: int,
+    parent_descriptor: int,
+    name: str,
+    *,
+    required_mode: int | None = None,
+    error_message: str,
+) -> os.stat_result:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        entry_stat = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or not stat.S_ISDIR(entry_stat.st_mode)
+        or _identity(descriptor_stat) != _identity(entry_stat)
+        or (
+            required_mode is not None
+            and stat.S_IMODE(descriptor_stat.st_mode) != required_mode
+        )
+    ):
+        raise LoadError(error_message)
+    return descriptor_stat
+
+
+def _open_directory_descriptor(
+    path: Path,
+    *,
+    required_mode: int | None = None,
+    error_message: str,
+) -> tuple[int, os.stat_result]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    try:
+        descriptor_stat = _validate_directory_descriptor_path(
+            descriptor,
+            path,
+            required_mode=required_mode,
+            error_message=error_message,
+        )
+        return descriptor, descriptor_stat
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _validate_regular_descriptor_entry(
+    descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    *,
+    error_message: str,
+) -> os.stat_result:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        entry_stat = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(entry_stat.st_mode)
+        or _identity(descriptor_stat) != _identity(entry_stat)
+    ):
+        raise LoadError(error_message)
+    return descriptor_stat
+
+
+def _open_regular_directory_entry(
+    directory_descriptor: int,
+    name: str,
+    *,
+    error_message: str,
+) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    try:
+        descriptor_stat = _validate_regular_descriptor_entry(
+            descriptor,
+            directory_descriptor,
+            name,
+            error_message=error_message,
+        )
+        return descriptor, descriptor_stat
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = sha256()
+    offset = 0
+    while chunk := os.pread(descriptor, 1024 * 1024, offset):
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
 def _link_no_follow(source: Path, destination: Path) -> None:
     if os.link in getattr(os, "supports_follow_symlinks", ()):
         os.link(source, destination, follow_symlinks=False)
@@ -456,7 +601,9 @@ def _validate_existing_receipt(receipt_path: Path, receipt_bytes: bytes) -> None
         os.close(descriptor)
 
 
-def _create_private_workspace(target: Path) -> Path:
+def _create_private_workspace(
+    target: Path,
+) -> tuple[Path, int, tuple[int, int]]:
     try:
         workspace = Path(
             tempfile.mkdtemp(
@@ -468,44 +615,110 @@ def _create_private_workspace(target: Path) -> Path:
     except OSError as exc:
         raise LoadError("could not create private materialization workspace") from exc
 
+    descriptor: int | None = None
+    identity: tuple[int, int] | None = None
     try:
-        workspace_mode = workspace.lstat().st_mode
-        if not stat.S_ISDIR(workspace_mode) or stat.S_ISLNK(workspace_mode):
-            raise LoadError("private materialization workspace is not a directory")
-        os.chmod(workspace, 0o700)
-        if stat.S_IMODE(workspace.lstat().st_mode) != 0o700:
-            raise LoadError("private materialization workspace is not mode 0700")
-        return workspace
+        descriptor, _ = _open_directory_descriptor(
+            workspace,
+            error_message="private materialization workspace is not a directory",
+        )
+        os.fchmod(descriptor, 0o700)
+        descriptor_stat = _validate_directory_descriptor_path(
+            descriptor,
+            workspace,
+            required_mode=0o700,
+            error_message="private materialization workspace is not mode 0700",
+        )
+        identity = _identity(descriptor_stat)
+        return workspace, descriptor, identity
     except Exception:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if descriptor is not None:
+            try:
+                descriptor_stat = os.fstat(descriptor)
+                path_stat = os.stat(workspace, follow_symlinks=False)
+                if stat.S_ISDIR(path_stat.st_mode) and _identity(
+                    path_stat
+                ) == _identity(descriptor_stat):
+                    os.rmdir(workspace)
+            except OSError:
+                pass
+            os.close(descriptor)
+        else:
+            try:
+                workspace_stat = os.stat(workspace, follow_symlinks=False)
+                if stat.S_ISDIR(workspace_stat.st_mode):
+                    os.rmdir(workspace)
+            except OSError:
+                pass
         raise
 
 
 def _remove_private_workspace(
     workspace: Path | None,
     *,
-    expected_identity: tuple[int, int] | None = None,
+    descriptor: int | None,
+    expected_identity: tuple[int, int] | None,
+    known_entries: dict[str, tuple[int, int]],
+    parent_descriptor: int | None = None,
+    remove_mismatched_symlinks: bool = False,
 ) -> None:
-    if workspace is None:
+    if workspace is None or descriptor is None or expected_identity is None:
         return
-    if expected_identity is not None:
-        try:
-            workspace_stat = os.stat(workspace, follow_symlinks=False)
-        except OSError:
-            return
-        if (
-            not stat.S_ISDIR(workspace_stat.st_mode)
-            or (workspace_stat.st_dev, workspace_stat.st_ino) != expected_identity
-        ):
-            return
-    # rmtree refuses to traverse a symlink, so cleanup remains scoped to the
-    # invocation-owned directory even if the path is unexpectedly disturbed.
     try:
-        shutil.rmtree(workspace)
-    except FileNotFoundError:
-        pass
+        descriptor_stat = os.fstat(descriptor)
     except OSError:
-        # Cleanup must not mask the materialization result or original failure.
+        return
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or _identity(descriptor_stat) != expected_identity
+    ):
+        return
+
+    for name, entry_identity in sorted(known_entries.items()):
+        if Path(name).name != name:
+            continue
+        try:
+            entry_stat = os.stat(
+                name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            continue
+        matches = _identity(entry_stat) == entry_identity
+        if not matches and not (
+            remove_mismatched_symlinks and stat.S_ISLNK(entry_stat.st_mode)
+        ):
+            continue
+        try:
+            os.unlink(name, dir_fd=descriptor)
+        except OSError:
+            pass
+
+    try:
+        if parent_descriptor is not None:
+            workspace_stat = os.stat(
+                workspace.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            workspace_stat = os.stat(workspace, follow_symlinks=False)
+    except OSError:
+        return
+    if (
+        not stat.S_ISDIR(workspace_stat.st_mode)
+        or _identity(workspace_stat) != expected_identity
+    ):
+        return
+    try:
+        if parent_descriptor is not None:
+            os.rmdir(workspace.name, dir_fd=parent_descriptor)
+        else:
+            os.rmdir(workspace)
+    except OSError:
+        # Unknown or substituted entries make the directory non-empty. Leak it
+        # safely rather than recurse into data this invocation does not own.
         pass
 
 
@@ -594,14 +807,26 @@ def _copy_verified_snapshot(
 def _snapshot_inventory(
     inventory: SourceInventory,
     workspace: Path,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
 ) -> SourceInventory:
     snapshot_tables: list[SourceTableInventory] = []
     for index, table in enumerate(inventory.tables):
+        snapshot = _copy_verified_snapshot(table, workspace, index)
+        snapshot_descriptor, snapshot_stat = _open_regular_directory_entry(
+            workspace_descriptor,
+            snapshot.name,
+            error_message="verified source snapshot entry changed after copying",
+        )
+        try:
+            known_entries[snapshot.name] = _identity(snapshot_stat)
+        finally:
+            os.close(snapshot_descriptor)
         snapshot_tables.append(
             SourceTableInventory(
                 name=table.name,
                 table_id=table.table_id,
-                source_file=_copy_verified_snapshot(table, workspace, index),
+                source_file=snapshot,
                 source_file_sha256=table.source_file_sha256,
                 row_count=table.row_count,
                 columns=table.columns,
@@ -615,67 +840,114 @@ def _snapshot_inventory(
     )
 
 
-def _build_database(path: Path, inventory: SourceInventory) -> None:
-    workspace_mode = path.parent.lstat().st_mode
-    if (
-        not stat.S_ISDIR(workspace_mode)
-        or stat.S_ISLNK(workspace_mode)
-        or stat.S_IMODE(workspace_mode) != 0o700
-    ):
-        raise LoadError("database workspace is not a private mode-0700 directory")
-    if os.path.lexists(path):
+def _build_database(
+    path: Path,
+    inventory: SourceInventory,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> int:
+    _validate_directory_descriptor_path(
+        workspace_descriptor,
+        path.parent,
+        required_mode=0o700,
+        error_message="database workspace is not the pinned mode-0700 directory",
+    )
+    try:
+        os.stat(
+            path.name,
+            dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise LoadError("private database path could not be inspected") from exc
+    else:
         raise LoadError("private database path already exists")
+
     for table in inventory.tables:
-        snapshot_mode = table.source_file.lstat().st_mode
+        expected_identity = known_entries.get(table.source_file.name)
+        try:
+            snapshot_stat = os.stat(
+                table.source_file.name,
+                dir_fd=workspace_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise LoadError("source snapshot escaped the private workspace") from exc
         if (
             table.source_file.parent != path.parent
-            or not stat.S_ISREG(snapshot_mode)
-            or stat.S_ISLNK(snapshot_mode)
+            or expected_identity is None
+            or not stat.S_ISREG(snapshot_stat.st_mode)
+            or _identity(snapshot_stat) != expected_identity
         ):
             raise LoadError("source snapshot escaped the private workspace")
 
     connection: duckdb.DuckDBPyConnection | None = None
+    database_descriptor: int | None = None
     transaction_open = False
     try:
-        connection = duckdb.connect(str(path))
-        connection.execute("BEGIN TRANSACTION")
-        transaction_open = True
-        for table in inventory.tables:
-            if sha256_file(table.source_file) != table.source_file_sha256:
-                raise LoadError(f"verified source snapshot changed: {table.name}")
-            loaded_count = _load_table(
-                connection,
-                table.source_file,
-                table.ddl,
+        try:
+            connection = duckdb.connect(str(path))
+            database_descriptor, database_stat = _open_regular_directory_entry(
+                workspace_descriptor,
+                path.name,
+                error_message="database entry is not the opened regular file",
             )
-            if loaded_count != table.row_count:
-                raise LoadError(
-                    f"loaded row count mismatch for {table.name}: "
-                    f"expected {table.row_count}, got {loaded_count}"
+            known_entries[path.name] = _identity(database_stat)
+            connection.execute("BEGIN TRANSACTION")
+            transaction_open = True
+            for table in inventory.tables:
+                if sha256_file(table.source_file) != table.source_file_sha256:
+                    raise LoadError(f"verified source snapshot changed: {table.name}")
+                loaded_count = _load_table(
+                    connection,
+                    table.source_file,
+                    table.ddl,
                 )
-        _verify_materialization(connection, inventory)
-        for table in inventory.tables:
-            if sha256_file(table.source_file) != table.source_file_sha256:
-                raise LoadError(
-                    f"verified source snapshot changed while loading: {table.name}"
-                )
-        connection.execute("COMMIT")
-        transaction_open = False
+                if loaded_count != table.row_count:
+                    raise LoadError(
+                        f"loaded row count mismatch for {table.name}: "
+                        f"expected {table.row_count}, got {loaded_count}"
+                    )
+            _verify_materialization(connection, inventory)
+            for table in inventory.tables:
+                if sha256_file(table.source_file) != table.source_file_sha256:
+                    raise LoadError(
+                        f"verified source snapshot changed while loading: {table.name}"
+                    )
+            connection.execute("COMMIT")
+            transaction_open = False
+        except Exception:
+            if connection is not None and transaction_open:
+                try:
+                    connection.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+
+        if database_descriptor is None:
+            raise LoadError("database descriptor was not retained")
+        _validate_regular_descriptor_entry(
+            database_descriptor,
+            workspace_descriptor,
+            path.name,
+            error_message="database entry changed when DuckDB closed",
+        )
+        return database_descriptor
     except Exception:
-        if connection is not None and transaction_open:
-            try:
-                connection.execute("ROLLBACK")
-            except duckdb.Error:
-                pass
+        if database_descriptor is not None:
+            os.close(database_descriptor)
         raise
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 def _write_receipt_temp(
     receipt_workspace: Path,
     receipt_bytes: bytes,
+    known_entries: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[int, Path]:
     workspace_mode = receipt_workspace.lstat().st_mode
     if (
@@ -695,6 +967,9 @@ def _write_receipt_temp(
         receipt_temp = Path(raw_path)
         if receipt_temp.parent != receipt_workspace:
             raise LoadError("temporary receipt escaped its private workspace")
+        descriptor_stat = os.fstat(descriptor)
+        if known_entries is not None:
+            known_entries[receipt_temp.name] = _identity(descriptor_stat)
         descriptor_stat = _validate_regular_descriptor_path(
             descriptor,
             receipt_temp,
@@ -744,17 +1019,46 @@ def load_csvs(
         raise LoadError(f"database target directory does not exist: {target_dir}")
     receipts = Path(receipt_dir) if receipt_dir is not None else target_dir
 
+    target_parent_descriptor: int | None = None
     workspace: Path | None = None
+    workspace_descriptor: int | None = None
+    workspace_identity: tuple[int, int] | None = None
+    workspace_entries: dict[str, tuple[int, int]] = {}
+    database_descriptor: int | None = None
     receipt_workspace: Path | None = None
+    receipt_workspace_descriptor: int | None = None
     receipt_workspace_identity: tuple[int, int] | None = None
+    receipt_workspace_entries: dict[str, tuple[int, int]] = {}
     receipt_descriptor: int | None = None
-    receipt_path: Path | None = None
     try:
-        workspace = _create_private_workspace(target)
-        snapshot_inventory = _snapshot_inventory(inventory, workspace)
+        target_parent_descriptor, _ = _open_directory_descriptor(
+            target_dir,
+            error_message="database target directory could not be securely opened",
+        )
+        workspace, workspace_descriptor, workspace_identity = _create_private_workspace(
+            target
+        )
+        _validate_directory_descriptor_entry(
+            workspace_descriptor,
+            target_parent_descriptor,
+            workspace.name,
+            required_mode=0o700,
+            error_message="private workspace is not in the pinned target directory",
+        )
+        snapshot_inventory = _snapshot_inventory(
+            inventory,
+            workspace,
+            workspace_descriptor,
+            workspace_entries,
+        )
         database_temp = workspace / "database.duckdb"
-        _build_database(database_temp, snapshot_inventory)
-        database_hash = sha256_file(database_temp)
+        database_descriptor = _build_database(
+            database_temp,
+            snapshot_inventory,
+            workspace_descriptor,
+            workspace_entries,
+        )
+        database_hash = _sha256_descriptor(database_descriptor)
 
         receipt = MaterializationReceipt(
             source_manifest_sha256=inventory.source_manifest_sha256,
@@ -775,17 +1079,15 @@ def load_csvs(
         receipt_hash = sha256(receipt_bytes).hexdigest()
         receipts.mkdir(parents=True, exist_ok=True)
         receipt_path = receipts / f"{receipt_hash}.json"
-        receipt_workspace = _create_private_workspace(
-            receipts / "materialization-receipt"
-        )
-        receipt_workspace_stat = receipt_workspace.lstat()
-        receipt_workspace_identity = (
-            receipt_workspace_stat.st_dev,
-            receipt_workspace_stat.st_ino,
-        )
+        (
+            receipt_workspace,
+            receipt_workspace_descriptor,
+            receipt_workspace_identity,
+        ) = _create_private_workspace(receipts / "materialization-receipt")
         receipt_descriptor, receipt_temp = _write_receipt_temp(
             receipt_workspace,
             receipt_bytes,
+            receipt_workspace_entries,
         )
 
         _validate_regular_descriptor_path(
@@ -808,7 +1110,26 @@ def load_csvs(
         # replacement fails, leave the harmless orphan in place: its database
         # hash cannot validate against a mismatched target, and another
         # invocation may already have adopted it.
-        os.replace(database_temp, target)
+        _validate_regular_descriptor_entry(
+            database_descriptor,
+            workspace_descriptor,
+            database_temp.name,
+            error_message="database entry changed before publication",
+        )
+        os.replace(
+            database_temp.name,
+            target.name,
+            src_dir_fd=workspace_descriptor,
+            dst_dir_fd=target_parent_descriptor,
+        )
+        _validate_regular_descriptor_entry(
+            database_descriptor,
+            target_parent_descriptor,
+            target.name,
+            error_message="published database is not the retained regular file",
+        )
+        if _sha256_descriptor(database_descriptor) != database_hash:
+            raise LoadError("published database hash changed during publication")
         return receipt, receipt_path
     except Exception as exc:
         if isinstance(exc, LoadError):
@@ -819,6 +1140,23 @@ def load_csvs(
             os.close(receipt_descriptor)
         _remove_private_workspace(
             receipt_workspace,
+            descriptor=receipt_workspace_descriptor,
             expected_identity=receipt_workspace_identity,
+            known_entries=receipt_workspace_entries,
+            remove_mismatched_symlinks=True,
         )
-        _remove_private_workspace(workspace)
+        if receipt_workspace_descriptor is not None:
+            os.close(receipt_workspace_descriptor)
+        _remove_private_workspace(
+            workspace,
+            descriptor=workspace_descriptor,
+            expected_identity=workspace_identity,
+            known_entries=workspace_entries,
+            parent_descriptor=target_parent_descriptor,
+        )
+        if database_descriptor is not None:
+            os.close(database_descriptor)
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+        if target_parent_descriptor is not None:
+            os.close(target_parent_descriptor)

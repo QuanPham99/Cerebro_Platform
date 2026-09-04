@@ -6,7 +6,9 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 
 class Provenance(BaseModel):
-    origin: Literal["discovered", "declared", "ai_proposed", "human_reviewed", "derived"]
+    origin: Literal[
+        "discovered", "declared", "ai_proposed", "human_reviewed", "derived"
+    ]
     source: str
 
 
@@ -14,7 +16,9 @@ class ColumnFact(BaseModel):
     name: str
     data_type: str
     nullable: bool
-    classification: Literal["public", "internal", "confidential", "restricted"] = "internal"
+    classification: Literal["public", "internal", "confidential", "restricted"] = (
+        "internal"
+    )
     provenance: Provenance
 
 
@@ -100,6 +104,7 @@ class SemanticBundle(BaseModel):
     version: str
     root: str
     objects: list[SemanticObject]
+    manifest_metadata: dict[str, Any] = Field(default_factory=dict)
 
     def by_id(self) -> dict[str, SemanticObject]:
         return {obj.id: obj for obj in self.objects}
@@ -321,13 +326,17 @@ class PreflightReport(_StrictFrozenEvidenceModel):
         if not self.offline_ready:
             raise ValueError("offline readiness must remain available")
         data_ready = not any(blocker.gate == "data" for blocker in self.blockers)
-        organizer_ready = not any(blocker.gate == "organizer" for blocker in self.blockers)
+        organizer_ready = not any(
+            blocker.gate == "organizer" for blocker in self.blockers
+        )
         if self.data_prerequisites_ready != data_ready:
             raise ValueError("data readiness must match data blockers")
         if self.organizer_prerequisites_ready != organizer_ready:
             raise ValueError("organizer readiness must match organizer blockers")
         if self.live_prerequisites_ready != (data_ready and organizer_ready):
             raise ValueError("live readiness must require data and organizer readiness")
-        if len(self.blockers) != len({(item.code, item.gate) for item in self.blockers}):
+        if len(self.blockers) != len(
+            {(item.code, item.gate) for item in self.blockers}
+        ):
             raise ValueError("preflight blockers must be unique")
         return self
