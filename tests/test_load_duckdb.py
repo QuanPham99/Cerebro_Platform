@@ -2875,6 +2875,546 @@ def test_target_replacement_after_backup_discard_without_prior_target_is_left_un
     _assert_no_invocation_temps(target, receipt_dir)
 
 
+def _paths_with_bytes_and_identity(
+    root: Path,
+    expected_bytes: bytes,
+    identity: tuple[int, int] | None = None,
+) -> list[Path]:
+    matches: list[Path] = []
+    for candidate in root.rglob("*"):
+        try:
+            candidate_stat = candidate.stat()
+            if not candidate.is_file() or candidate_stat.st_size != len(expected_bytes):
+                continue
+            if (
+                identity is not None
+                and (
+                    candidate_stat.st_dev,
+                    candidate_stat.st_ino,
+                )
+                != identity
+            ):
+                continue
+            if candidate.read_bytes() == expected_bytes:
+                matches.append(candidate)
+        except OSError:
+            continue
+    return matches
+
+
+def test_final_publication_hash_parent_replacement_fails_and_rolls_back_retained_parent(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "workshop.duckdb"
+    target.write_bytes(b"original target bytes before final hash")
+    target_before = target.read_bytes()
+    moved_public = tmp_path / "moved-public-during-final-hash"
+    receipt_dir = tmp_path / "receipts"
+    trigger_path = tmp_path / "replace-parent-trigger"
+    done_path = tmp_path / "replace-parent-done"
+    attacker_target = b"ATTACKER_FINAL_HASH_TARGET_CANARY_RESTART_10"
+    attacker_tree = b"ATTACKER_FINAL_HASH_TREE_CANARY_RESTART_10"
+    real_validate = loader._validate_published_database
+    real_sha256 = loader._sha256_descriptor
+    observed: dict[str, Any] = {
+        "publication_validations": 0,
+        "final_hash_started": False,
+    }
+
+    replacer_script = """
+import sys
+import time
+from pathlib import Path
+
+public = Path(sys.argv[1])
+moved_public = Path(sys.argv[2])
+trigger = Path(sys.argv[3])
+done = Path(sys.argv[4])
+target_name = sys.argv[5]
+attacker_target = bytes.fromhex(sys.argv[6])
+attacker_tree = bytes.fromhex(sys.argv[7])
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline and not trigger.exists():
+    time.sleep(0.005)
+if not trigger.exists():
+    raise SystemExit("timed out waiting for final publication hash")
+public.rename(moved_public)
+public.mkdir(mode=0o700)
+(public / target_name).write_bytes(attacker_target)
+(public / "keep.txt").write_bytes(attacker_tree)
+done.write_text("done", encoding="ascii")
+"""
+    process = loader.subprocess.Popen(
+        [
+            loader.sys.executable,
+            "-I",
+            "-c",
+            replacer_script,
+            str(public),
+            str(moved_public),
+            str(trigger_path),
+            str(done_path),
+            target.name,
+            attacker_target.hex(),
+            attacker_tree.hex(),
+        ],
+        stdin=loader.subprocess.DEVNULL,
+        stdout=loader.subprocess.DEVNULL,
+        stderr=loader.subprocess.PIPE,
+    )
+    observed["process"] = process
+
+    def stop_replacer() -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except loader.subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def count_publication_validation(*args: Any, **kwargs: Any) -> None:
+        observed["publication_validations"] += 1
+        real_validate(*args, **kwargs)
+
+    def replace_parent_during_final_database_hash(descriptor: int) -> str:
+        if (
+            observed["publication_validations"] == 3
+            and not observed["final_hash_started"]
+        ):
+            observed["final_hash_started"] = True
+            trigger_path.write_text("replace", encoding="ascii")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not done_path.exists():
+                if process.poll() is not None:
+                    break
+                time.sleep(0.005)
+            if not done_path.exists():
+                stop_replacer()
+                stderr = b"" if process.stderr is None else process.stderr.read()
+                raise AssertionError(
+                    "foreign parent replacer did not complete: "
+                    + stderr.decode(errors="replace")
+                )
+        return real_sha256(descriptor)
+
+    monkeypatch.setattr(
+        loader,
+        "_validate_published_database",
+        count_publication_validation,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_sha256_descriptor",
+        replace_parent_during_final_database_hash,
+    )
+
+    failure: loader.LoadError | None = None
+    try:
+        try:
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+        except loader.LoadError as error:
+            failure = error
+
+        if process.poll() is None:
+            process.wait(timeout=5)
+        stderr = b"" if process.stderr is None else process.stderr.read()
+        assert process.returncode == 0, stderr.decode(errors="replace")
+        assert observed["publication_validations"] == 3
+        assert observed["final_hash_started"] is True
+        assert target.read_bytes() == attacker_target
+        assert (public / "keep.txt").read_bytes() == attacker_tree
+        assert failure is not None, (
+            "final public-path replacement returned false success"
+        )
+        assert (moved_public / target.name).read_bytes() == target_before
+    finally:
+        stop_replacer()
+
+
+def test_restore_preserves_successive_unknown_targets_without_overwriting(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"old target bytes for two-contender rollback")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    unknown_a_bytes = b"UNKNOWN_A_ROLLBACK_CANARY_RESTART_10"
+    unknown_b_bytes = b"UNKNOWN_B_ROLLBACK_CANARY_RESTART_10"
+    unknown_a_source = tmp_path / "unknown-a-source.duckdb"
+    unknown_b_source = tmp_path / "unknown-b-source.duckdb"
+    real_discard = loader._discard_target_backup_best_effort
+    real_create_candidate = loader._create_target_restore_candidate
+    observed: dict[str, Any] = {"a_installed": False, "b_installed": False}
+
+    def discard_then_install_unknown_a(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        unknown_a_source.write_bytes(unknown_a_bytes)
+        loader.os.replace(unknown_a_source, target)
+        unknown_a_stat = target.stat()
+        observed.update(
+            a_installed=True,
+            a_identity=(unknown_a_stat.st_dev, unknown_a_stat.st_ino),
+        )
+
+    def create_restore_candidate_then_install_unknown_b(
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[int, str]:
+        result = real_create_candidate(*args, **kwargs)
+        if not observed["b_installed"]:
+            assert observed["a_installed"] is True
+            assert not target.exists()
+            unknown_b_source.write_bytes(unknown_b_bytes)
+            loader.os.replace(unknown_b_source, target)
+            unknown_b_stat = target.stat()
+            observed.update(
+                b_installed=True,
+                b_identity=(unknown_b_stat.st_dev, unknown_b_stat.st_ino),
+            )
+        return result
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_install_unknown_a,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_create_target_restore_candidate",
+        create_restore_candidate_then_install_unknown_b,
+    )
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["a_installed"] is True
+    assert observed["b_installed"] is True
+    assert target.read_bytes() == target_before
+    assert _paths_with_bytes_and_identity(
+        tmp_path,
+        unknown_a_bytes,
+        observed["a_identity"],
+    )
+    assert _paths_with_bytes_and_identity(
+        tmp_path,
+        unknown_b_bytes,
+        observed["b_identity"],
+    ), "unknown B was overwritten during restore publication"
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_foreign_locked_substituted_database_entry_survives_fence_cleanup(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"old public target before foreign fence substitution")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    foreign_source = tmp_path / "foreign-f.duckdb"
+    query_database = tmp_path / "query-b.duckdb"
+    ready_path = tmp_path / "foreign-f-ready"
+    real_connect = loader.duckdb.connect
+    foreign_seed = real_connect(str(foreign_source))
+    foreign_seed.execute("CREATE TABLE foreign_owner(value INTEGER)")
+    foreign_seed.execute("INSERT INTO foreign_owner VALUES (41)")
+    foreign_seed.close()
+    foreign_source_stat = foreign_source.stat()
+    foreign_source_identity = (
+        foreign_source_stat.st_dev,
+        foreign_source_stat.st_ino,
+    )
+    observed: dict[str, Any] = {"substituted": False}
+
+    lock_holder_script = """
+import os
+import sys
+from pathlib import Path
+
+import duckdb
+
+connection = duckdb.connect(sys.argv[1])
+Path(sys.argv[2]).write_text(str(os.getpid()), encoding="ascii")
+try:
+    sys.stdin.buffer.read(1)
+finally:
+    connection.close()
+"""
+
+    def release_foreign_process() -> None:
+        process = observed.get("process")
+        if process is None or process.poll() is not None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.write(b"release\n")
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+                process.stdin = None
+        try:
+            process.wait(timeout=5)
+        except loader.subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except loader.subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    def connect_to_b_after_substituting_foreign_locked_f(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(database) == ":memory:" or observed["substituted"]:
+            return real_connect(database, *args, **kwargs)
+
+        database_path = Path(database)
+        initial_connection = real_connect(str(database_path))
+        initial_connection.close()
+        initial_stat = database_path.stat()
+        initial_identity = (initial_stat.st_dev, initial_stat.st_ino)
+        assert initial_identity != foreign_source_identity
+        loader.os.replace(foreign_source, database_path)
+        substituted_stat = database_path.stat()
+        assert (
+            substituted_stat.st_dev,
+            substituted_stat.st_ino,
+        ) == foreign_source_identity
+
+        process = loader.subprocess.Popen(
+            [
+                loader.sys.executable,
+                "-I",
+                "-c",
+                lock_holder_script,
+                str(database_path),
+                str(ready_path),
+            ],
+            stdin=loader.subprocess.PIPE,
+            stdout=loader.subprocess.DEVNULL,
+            stderr=loader.subprocess.PIPE,
+        )
+        observed["process"] = process
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready_path.exists():
+            if process.poll() is not None:
+                break
+            time.sleep(0.005)
+        if not ready_path.exists():
+            release_foreign_process()
+            stderr = b"" if process.stderr is None else process.stderr.read()
+            raise AssertionError(
+                "foreign DuckDB owner did not acquire F: "
+                + stderr.decode(errors="replace")
+            )
+
+        foreign_pid = int(ready_path.read_text(encoding="ascii"))
+        assert foreign_pid == process.pid
+        assert foreign_pid != loader.os.getpid()
+        foreign_stat = database_path.stat()
+        foreign_identity = (foreign_stat.st_dev, foreign_stat.st_ino)
+        foreign_bytes = database_path.read_bytes()
+        connection_b = real_connect(str(query_database), *args, **kwargs)
+        query_stat = query_database.stat()
+        query_identity = (query_stat.st_dev, query_stat.st_ino)
+        assert query_identity != foreign_identity
+        observed.update(
+            substituted=True,
+            foreign_path=database_path,
+            foreign_identity=foreign_identity,
+            foreign_bytes=foreign_bytes,
+            foreign_pid=foreign_pid,
+            query_identity=query_identity,
+            workspace=database_path.parent.parent,
+        )
+        return connection_b
+
+    monkeypatch.setattr(
+        loader.duckdb,
+        "connect",
+        connect_to_b_after_substituting_foreign_locked_f,
+    )
+
+    try:
+        with pytest.raises(loader.LoadError, match="connection.*database") as captured:
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+
+        assert observed["substituted"] is True
+        assert str(observed["foreign_pid"]) not in str(captured.value)
+        assert observed["process"].poll() is None
+        foreign_path = observed["foreign_path"]
+        assert foreign_path.is_file(), "foreign-locked F was deleted during cleanup"
+        foreign_stat = foreign_path.stat()
+        assert (foreign_stat.st_dev, foreign_stat.st_ino) == observed[
+            "foreign_identity"
+        ]
+        assert foreign_path.read_bytes() == observed["foreign_bytes"]
+        assert observed["workspace"].is_dir()
+        assert target.read_bytes() == target_before
+        assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
+    finally:
+        release_foreign_process()
+        workspace = observed.get("workspace")
+        if isinstance(workspace, Path):
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_restore_retry_exhaustion_is_bounded_and_preserves_every_contender(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"old target bytes requiring retained exhaustion artifact")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    initial_contender_bytes = b"RESTORE_CHURN_INITIAL_CANARY_RESTART_10"
+    initial_contender_source = tmp_path / "restore-churn-initial.duckdb"
+    retry_limit = 3
+    monkeypatch.setattr(
+        loader,
+        "_TARGET_RESTORE_RETRY_LIMIT",
+        retry_limit,
+        raising=False,
+    )
+    real_discard = loader._discard_target_backup_best_effort
+    real_hard_link = loader._HARD_LINK
+    observed: dict[str, Any] = {
+        "initial_installed": False,
+        "link_attempts": [],
+    }
+
+    def discard_then_install_initial_contender(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        initial_contender_source.write_bytes(initial_contender_bytes)
+        loader.os.replace(initial_contender_source, target)
+        contender_stat = target.stat()
+        observed.update(
+            initial_installed=True,
+            initial_identity=(contender_stat.st_dev, contender_stat.st_ino),
+        )
+
+    def occupy_target_before_restore_link(
+        source: Any,
+        destination: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if Path(destination).name != target.name:
+            real_hard_link(source, destination, *args, **kwargs)
+            return
+
+        attempt = len(observed["link_attempts"])
+        assert attempt < retry_limit
+        assert kwargs.get("src_dir_fd") is not None
+        assert kwargs.get("dst_dir_fd") is not None
+        assert kwargs.get("follow_symlinks") is False
+        assert not target.exists()
+        contender_bytes = f"RESTORE_CHURN_{attempt}_CANARY_RESTART_10".encode("ascii")
+        contender_source = tmp_path / f"restore-churn-{attempt}.duckdb"
+        contender_source.write_bytes(contender_bytes)
+        loader.os.replace(contender_source, target)
+        contender_stat = target.stat()
+        observed["link_attempts"].append(
+            (
+                contender_bytes,
+                (contender_stat.st_dev, contender_stat.st_ino),
+            )
+        )
+        real_hard_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_install_initial_contender,
+    )
+    supported_no_follow_links = set(loader.os.supports_follow_symlinks)
+    supported_no_follow_links.add(occupy_target_before_restore_link)
+    monkeypatch.setattr(
+        loader.os,
+        "supports_follow_symlinks",
+        supported_no_follow_links,
+        raising=False,
+    )
+    monkeypatch.setattr(loader, "_HARD_LINK", occupy_target_before_restore_link)
+
+    started = time.monotonic()
+    with pytest.raises(loader.LoadError) as captured:
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert observed["initial_installed"] is True, str(captured.value)
+    assert len(observed["link_attempts"]) == retry_limit, (
+        "restore did not use the configured bounded no-overwrite attempts"
+    )
+    contenders = [
+        (initial_contender_bytes, observed["initial_identity"]),
+        *observed["link_attempts"],
+    ]
+    for contender_bytes, contender_identity in contenders:
+        assert _paths_with_bytes_and_identity(
+            tmp_path,
+            contender_bytes,
+            contender_identity,
+        )
+    retained_old_paths = [
+        path
+        for path in _paths_with_bytes_and_identity(tmp_path, target_before)
+        if not any(
+            part.startswith(f".{target.name}.") and ".tmp" in part
+            for part in path.relative_to(tmp_path).parts
+        )
+    ]
+    assert retained_old_paths
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
 def _assert_sanitized_load_error(
     error: BaseException,
     *,

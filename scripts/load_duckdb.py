@@ -46,6 +46,7 @@ _DATA_TYPE = re.compile(
     r"(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])*"
 )
 _HARD_LINK = os.link
+_TARGET_RESTORE_RETRY_LIMIT = 128
 
 
 class LoadError(RuntimeError):
@@ -139,6 +140,13 @@ class _DatabaseLockStateMismatch(LoadError):
         self.observed = observed
 
 
+class _DatabaseLockOwnershipMismatch(LoadError):
+    def __init__(self) -> None:
+        super().__init__(
+            "DuckDB connection lock owner does not match the retained database"
+        )
+
+
 def _probe_database_lock(descriptor: int) -> str:
     """Probe the POSIX whole-file lock owner from a short local child."""
     try:
@@ -182,9 +190,7 @@ def _probe_database_lock(descriptor: int) -> str:
     if owner_pid > 2_147_483_647:
         raise LoadError("database lock probe returned an unsupported result")
     if owner_pid != os.getpid():
-        raise LoadError(
-            "DuckDB connection lock owner does not match the retained database"
-        )
+        raise _DatabaseLockOwnershipMismatch
     return "blocked"
 
 
@@ -1760,6 +1766,18 @@ def _build_database(
     database_descriptor: int | None = None
     transaction_open = False
     path_authority_confirmed = False
+    foreign_owner_revoked = False
+
+    def require_database_lock_state(descriptor: int, expected: str) -> None:
+        nonlocal path_authority_confirmed, foreign_owner_revoked
+        try:
+            _require_database_lock_state(descriptor, expected)
+        except _DatabaseLockOwnershipMismatch:
+            fence_entries.pop(path.name, None)
+            path_authority_confirmed = False
+            foreign_owner_revoked = True
+            raise
+
     try:
         fence_path, fence_descriptor, fence_identity = _create_database_path_fence(
             path,
@@ -1827,7 +1845,7 @@ def _build_database(
                     fence_entries[path.name] = _identity(recovered_stat)
                     path_authority_confirmed = True
                     try:
-                        _require_database_lock_state(database_descriptor, "blocked")
+                        require_database_lock_state(database_descriptor, "blocked")
                     except _DatabaseLockStateMismatch as error:
                         if error.observed == "acquired":
                             fence_entries.pop(path.name, None)
@@ -1837,20 +1855,22 @@ def _build_database(
                         connection.close()
                     finally:
                         connection = None
-                    _require_database_lock_state(database_descriptor, "acquired")
+                    require_database_lock_state(database_descriptor, "acquired")
                     recovered_stat = _validate_regular_descriptor_entry(
                         database_descriptor,
                         fence_descriptor,
                         path.name,
                         error_message="database entry changed after lock recovery",
                     )
+                except _DatabaseLockOwnershipMismatch:
+                    raise
                 except (LoadError, OSError, duckdb.Error):
                     raise LoadError("database entry validation failed") from None
                 raise LoadError("database entry validation failed") from None
             fence_entries[path.name] = _identity(database_stat)
             path_authority_confirmed = True
             try:
-                _require_database_lock_state(database_descriptor, "blocked")
+                require_database_lock_state(database_descriptor, "blocked")
             except _DatabaseLockStateMismatch as error:
                 if error.observed == "acquired":
                     fence_entries.pop(path.name, None)
@@ -1911,7 +1931,7 @@ def _build_database(
                 path.name,
                 error_message="database entry changed while connection was open",
             )
-            _require_database_lock_state(database_descriptor, "blocked")
+            require_database_lock_state(database_descriptor, "blocked")
         except Exception:
             if connection is not None and transaction_open:
                 try:
@@ -1932,7 +1952,7 @@ def _build_database(
             path.name,
             error_message="database entry changed when DuckDB closed",
         )
-        _require_database_lock_state(database_descriptor, "acquired")
+        require_database_lock_state(database_descriptor, "acquired")
         _validate_directory_descriptor_path(
             workspace_descriptor,
             path.parent,
@@ -1980,6 +2000,33 @@ def _build_database(
         )
         return database_descriptor
     except Exception:
+        if (
+            foreign_owner_revoked
+            and database_descriptor is not None
+            and fence_descriptor is not None
+        ):
+            try:
+                recovered_stat = _validate_regular_descriptor_entry(
+                    database_descriptor,
+                    fence_descriptor,
+                    path.name,
+                    error_message="foreign-owned database entry changed before cleanup",
+                )
+                require_database_lock_state(database_descriptor, "acquired")
+                recovered_stat = _validate_regular_descriptor_entry(
+                    database_descriptor,
+                    fence_descriptor,
+                    path.name,
+                    error_message="foreign-owned database entry changed before cleanup",
+                )
+            except _DatabaseLockOwnershipMismatch:
+                pass
+            except (LoadError, OSError):
+                pass
+            else:
+                fence_entries[path.name] = _identity(recovered_stat)
+                path_authority_confirmed = True
+                foreign_owner_revoked = False
         _close_best_effort(database_descriptor)
         raise
     finally:
@@ -2305,6 +2352,16 @@ def _validate_published_database(
         target_name,
         error_message="published database changed while validating publication",
     )
+    _validate_directory_descriptor_path(
+        target_parent_descriptor,
+        target_dir,
+        error_message="database target directory changed at publication boundary",
+    )
+    _validate_regular_descriptor_path(
+        database_descriptor,
+        target_dir / target_name,
+        error_message="public database target is not the retained regular file",
+    )
 
 
 def _create_target_restore_candidate(
@@ -2449,6 +2506,211 @@ def _quarantine_unknown_target(
                 pass
 
 
+def _validate_target_restore_candidate(
+    *,
+    restore_descriptor: int,
+    restore_name: str,
+    workspace_descriptor: int,
+    target_backup: TargetBackup,
+) -> None:
+    candidate_stat = _validate_regular_descriptor_entry(
+        restore_descriptor,
+        workspace_descriptor,
+        restore_name,
+        error_message="previous database restore candidate changed",
+    )
+    if stat.S_IMODE(candidate_stat.st_mode) != 0o400:
+        raise LoadError("previous database restore candidate is not mode 0400")
+    if (
+        _sha256_descriptor(restore_descriptor) != target_backup.sha256
+        or _sha256_descriptor(target_backup.descriptor) != target_backup.sha256
+    ):
+        raise LoadError("retained previous database snapshot changed")
+    candidate_stat = _validate_regular_descriptor_entry(
+        restore_descriptor,
+        workspace_descriptor,
+        restore_name,
+        error_message="previous database restore candidate changed",
+    )
+    if stat.S_IMODE(candidate_stat.st_mode) != 0o400:
+        raise LoadError("previous database restore candidate is not mode 0400")
+
+
+def _target_matches_restore_candidate(
+    *,
+    restore_descriptor: int,
+    target_parent_descriptor: int,
+    target_name: str,
+    expected_hash: str,
+) -> bool:
+    try:
+        target_stat = _validate_regular_descriptor_entry(
+            restore_descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="restored database target changed",
+        )
+        if (
+            stat.S_IMODE(target_stat.st_mode) != 0o400
+            or _sha256_descriptor(restore_descriptor) != expected_hash
+        ):
+            return False
+        _validate_regular_descriptor_entry(
+            restore_descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="restored database target changed",
+        )
+        return True
+    except (LoadError, OSError):
+        return False
+
+
+def _validate_restored_target(
+    *,
+    restore_descriptor: int,
+    target_parent_descriptor: int,
+    target_name: str,
+    target_backup: TargetBackup,
+) -> None:
+    restored_stat = _validate_regular_descriptor_entry(
+        restore_descriptor,
+        target_parent_descriptor,
+        target_name,
+        error_message="restored database is not the retained restore candidate",
+    )
+    if stat.S_IMODE(restored_stat.st_mode) != 0o400:
+        raise LoadError("restored database target is not mode 0400")
+    if (
+        _sha256_descriptor(restore_descriptor) != target_backup.sha256
+        or _sha256_descriptor(target_backup.descriptor) != target_backup.sha256
+    ):
+        raise LoadError("restored database hash does not match the previous target")
+    _validate_regular_descriptor_entry(
+        restore_descriptor,
+        target_parent_descriptor,
+        target_name,
+        error_message="restored database identity changed after restoration",
+    )
+
+
+def _preserve_target_restore_candidate(
+    *,
+    target_parent_descriptor: int,
+    target_name: str,
+    workspace_descriptor: int,
+    restore_descriptor: int,
+    restore_name: str,
+    target_backup: TargetBackup,
+) -> None:
+    _validate_target_restore_candidate(
+        restore_descriptor=restore_descriptor,
+        restore_name=restore_name,
+        workspace_descriptor=workspace_descriptor,
+        target_backup=target_backup,
+    )
+    if _HARD_LINK not in getattr(os, "supports_follow_symlinks", ()):
+        raise LoadError("secure database recovery preservation is not supported")
+
+    preservation_name: str | None = None
+    preservation_descriptor: int | None = None
+    preservation_identity: tuple[int, int] | None = None
+    artifact_linked = False
+    for _ in range(128):
+        candidate = f".{target_name}.recovery-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=target_parent_descriptor)
+        except FileExistsError:
+            continue
+        except OSError:
+            raise LoadError(
+                "previous database recovery artifact could not be preserved"
+            ) from None
+        preservation_name = candidate
+        break
+    if preservation_name is None:
+        raise LoadError("previous database recovery artifact could not be preserved")
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        preservation_descriptor = os.open(
+            preservation_name,
+            flags,
+            dir_fd=target_parent_descriptor,
+        )
+        preservation_stat = _validate_directory_descriptor_entry(
+            preservation_descriptor,
+            target_parent_descriptor,
+            preservation_name,
+            required_mode=0o700,
+            error_message="database recovery preservation directory is not retained",
+        )
+        preservation_identity = _identity(preservation_stat)
+        artifact_name = "previous-database.duckdb"
+        try:
+            _HARD_LINK(
+                restore_name,
+                artifact_name,
+                src_dir_fd=workspace_descriptor,
+                dst_dir_fd=preservation_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            raise LoadError(
+                "previous database recovery artifact could not be preserved"
+            ) from None
+        except OSError:
+            raise LoadError(
+                "previous database recovery artifact could not be preserved"
+            ) from None
+        artifact_linked = True
+        _validate_regular_descriptor_entry(
+            restore_descriptor,
+            preservation_descriptor,
+            artifact_name,
+            error_message="previous database recovery artifact is not retained",
+        )
+        if (
+            _sha256_descriptor(restore_descriptor) != target_backup.sha256
+            or _sha256_descriptor(target_backup.descriptor) != target_backup.sha256
+        ):
+            raise LoadError("previous database recovery artifact hash changed")
+        _validate_regular_descriptor_entry(
+            restore_descriptor,
+            preservation_descriptor,
+            artifact_name,
+            error_message="previous database recovery artifact identity changed",
+        )
+        _validate_directory_descriptor_entry(
+            preservation_descriptor,
+            target_parent_descriptor,
+            preservation_name,
+            required_mode=0o700,
+            error_message="database recovery preservation directory changed",
+        )
+    finally:
+        _close_best_effort(preservation_descriptor)
+        if not artifact_linked and preservation_identity is not None:
+            try:
+                preservation_stat = os.stat(
+                    preservation_name,
+                    dir_fd=target_parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISDIR(preservation_stat.st_mode)
+                    and _identity(preservation_stat) == preservation_identity
+                ):
+                    os.rmdir(preservation_name, dir_fd=target_parent_descriptor)
+            except OSError:
+                pass
+
+
 def _restore_target_after_publication_failure(
     *,
     target_parent_descriptor: int,
@@ -2479,7 +2741,6 @@ def _restore_target_after_publication_failure(
         target_backup,
     ):
         return
-
     if not _entry_matches_retained_file(
         database_descriptor,
         target_parent_descriptor,
@@ -2489,43 +2750,106 @@ def _restore_target_after_publication_failure(
             target_parent_descriptor,
             target_name,
         )
+    retry_limit = _TARGET_RESTORE_RETRY_LIMIT
+    if type(retry_limit) is not int or retry_limit < 1:
+        raise LoadError("invalid database target restore retry limit")
 
     restore_descriptor: int | None = None
+    preservation_attempted = False
     try:
         restore_descriptor, restore_name = _create_target_restore_candidate(
             target_backup,
             workspace_descriptor,
             known_entries,
         )
-        _validate_regular_descriptor_entry(
-            restore_descriptor,
-            workspace_descriptor,
-            restore_name,
-            error_message="previous database restore candidate changed",
-        )
-        try:
-            os.replace(
-                restore_name,
-                target_name,
-                src_dir_fd=workspace_descriptor,
-                dst_dir_fd=target_parent_descriptor,
+        for attempt in range(retry_limit):
+            _validate_target_restore_candidate(
+                restore_descriptor=restore_descriptor,
+                restore_name=restore_name,
+                workspace_descriptor=workspace_descriptor,
+                target_backup=target_backup,
             )
-        except OSError:
-            raise LoadError("failed to restore previous database target") from None
-        _validate_regular_descriptor_entry(
-            restore_descriptor,
-            target_parent_descriptor,
-            target_name,
-            error_message="restored database is not the retained restore candidate",
-        )
-        if _sha256_descriptor(restore_descriptor) != target_backup.sha256:
-            raise LoadError("restored database hash does not match the previous target")
-        _validate_regular_descriptor_entry(
-            restore_descriptor,
-            target_parent_descriptor,
-            target_name,
-            error_message="restored database identity changed after restoration",
-        )
+            if _target_matches_original_backup(
+                target_parent_descriptor,
+                target_name,
+                target_backup,
+            ) or _target_matches_restore_candidate(
+                restore_descriptor=restore_descriptor,
+                target_parent_descriptor=target_parent_descriptor,
+                target_name=target_name,
+                expected_hash=target_backup.sha256,
+            ):
+                return
+
+            _quarantine_unknown_target(
+                target_parent_descriptor,
+                target_name,
+            )
+            try:
+                if _HARD_LINK not in getattr(os, "supports_follow_symlinks", ()):
+                    raise LoadError(
+                        "secure database target restoration is not supported"
+                    )
+                _HARD_LINK(
+                    restore_name,
+                    target_name,
+                    src_dir_fd=workspace_descriptor,
+                    dst_dir_fd=target_parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if _target_matches_original_backup(
+                    target_parent_descriptor,
+                    target_name,
+                    target_backup,
+                ) or _target_matches_restore_candidate(
+                    restore_descriptor=restore_descriptor,
+                    target_parent_descriptor=target_parent_descriptor,
+                    target_name=target_name,
+                    expected_hash=target_backup.sha256,
+                ):
+                    return
+                if attempt + 1 == retry_limit:
+                    preservation_attempted = True
+                    _preserve_target_restore_candidate(
+                        target_parent_descriptor=target_parent_descriptor,
+                        target_name=target_name,
+                        workspace_descriptor=workspace_descriptor,
+                        restore_descriptor=restore_descriptor,
+                        restore_name=restore_name,
+                        target_backup=target_backup,
+                    )
+                    raise LoadError(
+                        "database target restoration retry limit was exhausted"
+                    )
+                _quarantine_unknown_target(
+                    target_parent_descriptor,
+                    target_name,
+                )
+                continue
+            except OSError:
+                raise LoadError("failed to restore previous database target") from None
+
+            _validate_restored_target(
+                restore_descriptor=restore_descriptor,
+                target_parent_descriptor=target_parent_descriptor,
+                target_name=target_name,
+                target_backup=target_backup,
+            )
+            return
+        raise LoadError("database target restoration retry limit was exhausted")
+    except Exception:
+        if restore_descriptor is not None and not preservation_attempted:
+            preservation_attempted = True
+            _preserve_target_restore_candidate(
+                target_parent_descriptor=target_parent_descriptor,
+                target_name=target_name,
+                workspace_descriptor=workspace_descriptor,
+                restore_descriptor=restore_descriptor,
+                restore_name=restore_name,
+                target_backup=target_backup,
+            )
+        raise
     finally:
         _close_best_effort(restore_descriptor)
 
