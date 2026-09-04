@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
-import os
+import os as _stdlib_os
 import re
 import secrets
 import stat
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from hashlib import sha256
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+from pydantic import ValidationError
 
 from cerebro.models import (
     MaterializationReceipt,
@@ -27,6 +30,16 @@ from cerebro.provenance import (
     source_manifest_sha256,
 )
 
+
+class _LoaderOSFacade:
+    """Keep loader fault-injection seams local to this module."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_stdlib_os, name)
+
+
+os = _LoaderOSFacade()
+
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 _DATA_TYPE = re.compile(
     r"[A-Z][A-Z0-9_]*(?: [A-Z][A-Z0-9_]*)*"
@@ -37,6 +50,71 @@ _HARD_LINK = os.link
 
 class LoadError(RuntimeError):
     """The source set could not be safely materialized."""
+
+
+_DATABASE_LOCK_PROBE_TIMEOUT_SECONDS = 2.0
+_DATABASE_LOCK_BLOCKED_EXIT = 73
+_DATABASE_LOCK_UNSUPPORTED_EXIT = 74
+_DATABASE_LOCK_PROBE_SCRIPT = f"""
+import errno
+import fcntl
+import sys
+
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as error:
+    if error.errno in (errno.EACCES, errno.EAGAIN):
+        raise SystemExit({_DATABASE_LOCK_BLOCKED_EXIT})
+    raise SystemExit({_DATABASE_LOCK_UNSUPPORTED_EXIT})
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
+except OSError:
+    raise SystemExit({_DATABASE_LOCK_UNSUPPORTED_EXIT})
+raise SystemExit(0)
+"""
+
+
+def _probe_database_lock(descriptor: int) -> str:
+    """Probe DuckDB's retained-inode flock state in a short local child."""
+    try:
+        descriptor_stat = os.fstat(descriptor)
+    except OSError:
+        raise LoadError("database lock probe descriptor is unavailable") from None
+    if not stat.S_ISREG(descriptor_stat.st_mode):
+        raise LoadError("database lock probe descriptor is not a regular file")
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _DATABASE_LOCK_PROBE_SCRIPT,
+                str(descriptor),
+            ],
+            check=False,
+            close_fds=True,
+            pass_fds=(descriptor,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_DATABASE_LOCK_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise LoadError("database lock probe is unsupported or unavailable") from None
+
+    if completed.returncode == 0:
+        return "acquired"
+    if completed.returncode == _DATABASE_LOCK_BLOCKED_EXIT:
+        return "blocked"
+    raise LoadError("database lock probe returned an unsupported result")
+
+
+def _require_database_lock_state(descriptor: int, expected: str) -> None:
+    if expected not in {"acquired", "blocked"}:
+        raise LoadError("invalid database lock transition expectation")
+    if _probe_database_lock(descriptor) != expected:
+        raise LoadError("DuckDB connection is not bound to the retained database")
 
 
 @dataclass(frozen=True)
@@ -78,19 +156,15 @@ def _quote_identifier(identifier: str) -> str:
 
 
 def _validated_data_type(value: Any, *, table_name: str, column_name: str) -> str:
+    del table_name, column_name
     if not isinstance(value, str) or _DATA_TYPE.fullmatch(value) is None:
-        raise LoadError(f"invalid data type for {table_name}.{column_name}: {value!r}")
+        raise LoadError("invalid data type in active table metadata")
     try:
         canonical = str(duckdb.sqltype(value))
-    except (TypeError, ValueError, duckdb.Error) as exc:
-        raise LoadError(
-            f"invalid data type for {table_name}.{column_name}: {value!r}"
-        ) from exc
+    except (TypeError, ValueError, duckdb.Error):
+        raise LoadError("invalid data type in active table metadata") from None
     if canonical != value:
-        raise LoadError(
-            f"data type for {table_name}.{column_name} must be canonical: "
-            f"{value!r} != {canonical!r}"
-        )
+        raise LoadError("data type in active table metadata must be canonical")
     return value
 
 
@@ -111,28 +185,26 @@ def _active_bundle_tables(
             or _IDENTIFIER.fullmatch(raw_name) is None
             or manifest_table_id(raw_name) != table.id
         ):
-            raise LoadError(f"invalid active table ID: {table.id!r}")
+            raise LoadError("invalid active table ID")
         if raw_name in tables:
-            raise LoadError(f"duplicate active table metadata: {raw_name}")
+            raise LoadError("duplicate active table metadata")
 
         raw_columns = table.cerebro.get("columns")
         if not isinstance(raw_columns, list) or not raw_columns:
-            raise LoadError(f"active table {raw_name} has no column metadata")
+            raise LoadError("active table has no column metadata")
         columns: list[SourceColumn] = []
         names: set[str] = set()
-        for index, raw_column in enumerate(raw_columns):
+        for raw_column in raw_columns:
             if not isinstance(raw_column, dict):
-                raise LoadError(f"invalid column metadata at {raw_name}[{index}]")
+                raise LoadError("invalid column metadata in active table")
             column_name = raw_column.get("name")
             if (
                 not isinstance(column_name, str)
                 or _IDENTIFIER.fullmatch(column_name) is None
             ):
-                raise LoadError(
-                    f"invalid column name for {raw_name}[{index}]: {column_name!r}"
-                )
+                raise LoadError("invalid column name in active table metadata")
             if column_name in names:
-                raise LoadError(f"duplicate column metadata: {raw_name}.{column_name}")
+                raise LoadError("duplicate column metadata")
             names.add(column_name)
             data_type = _validated_data_type(
                 raw_column.get("data_type"),
@@ -178,20 +250,20 @@ def _read_csv_shape(source_file: Path) -> tuple[tuple[str, ...], int]:
             row_count = 0
             for row in reader:
                 if not row:
-                    raise LoadError(f"blank CSV row in {source_file.name}")
+                    raise LoadError("blank CSV row")
                 if len(row) != len(header):
                     raise LoadError(
-                        f"CSV row width mismatch in {source_file.name}: "
-                        f"expected {len(header)}, got {len(row)}"
+                        "CSV row width mismatch "
+                        f"(expected {len(header)}, got {len(row)})"
                     )
                 row_count += 1
             return header, row_count
-    except UnicodeDecodeError as exc:
-        raise LoadError(f"CSV is not valid UTF-8: {source_file.name}") from exc
-    except csv.Error as exc:
-        raise LoadError(f"invalid CSV syntax in {source_file.name}: {exc}") from exc
-    except OSError as exc:
-        raise LoadError(f"could not read CSV {source_file.name}: {exc}") from exc
+    except UnicodeDecodeError:
+        raise LoadError("CSV is not valid UTF-8") from None
+    except csv.Error:
+        raise LoadError("invalid CSV syntax") from None
+    except OSError:
+        raise LoadError("could not read CSV file") from None
 
 
 def _execute_ddl(
@@ -211,10 +283,10 @@ def _check_castability(table: SourceTableInventory) -> int:
         return _execute_ddl(connection, table.source_file, table.ddl)
     except LoadError:
         raise
-    except duckdb.Error as exc:
+    except duckdb.Error:
         raise LoadError(
-            f"CSV values for {table.name} cannot cast to bundle-declared types: {exc}"
-        ) from exc
+            f"CSV values for table {table.name} cannot cast to declared types"
+        ) from None
     finally:
         connection.close()
 
@@ -243,6 +315,7 @@ def _read_csv_shape_descriptor(
     descriptor: int,
     display_name: str,
 ) -> tuple[tuple[str, ...], int]:
+    del display_name
     duplicate = -1
     try:
         duplicate = os.dup(descriptor)
@@ -258,20 +331,20 @@ def _read_csv_shape_descriptor(
             row_count = 0
             for row in reader:
                 if not row:
-                    raise LoadError(f"blank CSV row in {display_name}")
+                    raise LoadError("blank CSV row")
                 if len(row) != len(header):
                     raise LoadError(
-                        f"CSV row width mismatch in {display_name}: "
-                        f"expected {len(header)}, got {len(row)}"
+                        "CSV row width mismatch "
+                        f"(expected {len(header)}, got {len(row)})"
                     )
                 row_count += 1
             return header, row_count
-    except UnicodeDecodeError as exc:
-        raise LoadError(f"CSV is not valid UTF-8: {display_name}") from exc
-    except csv.Error as exc:
-        raise LoadError(f"invalid CSV syntax in {display_name}: {exc}") from exc
-    except OSError as exc:
-        raise LoadError(f"could not read CSV {display_name}: {exc}") from exc
+    except UnicodeDecodeError:
+        raise LoadError("CSV is not valid UTF-8") from None
+    except csv.Error:
+        raise LoadError("invalid CSV syntax") from None
+    except OSError:
+        raise LoadError("could not read CSV file") from None
     finally:
         if duplicate >= 0:
             os.close(duplicate)
@@ -280,8 +353,10 @@ def _read_csv_shape_descriptor(
 def _retained_descriptor_path(descriptor: int) -> Path:
     try:
         descriptor_stat = os.fstat(descriptor)
-    except OSError as exc:
-        raise LoadError("private preflight snapshot descriptor is unavailable") from exc
+    except OSError:
+        raise LoadError(
+            "private preflight snapshot descriptor is unavailable"
+        ) from None
     probe_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     for root in (Path("/dev/fd"), Path("/proc/self/fd")):
         candidate = root / str(descriptor)
@@ -384,10 +459,8 @@ def _copy_preflight_snapshot(
         result_descriptor = retained_descriptor
         retained_descriptor = None
         return result_descriptor, snapshot_hash
-    except OSError as exc:
-        raise LoadError(
-            f"could not create private preflight snapshot for {source_file.name}"
-        ) from exc
+    except OSError:
+        raise LoadError("could not create private preflight snapshot") from None
     finally:
         if source_descriptor >= 0:
             os.close(source_descriptor)
@@ -406,13 +479,11 @@ def _validate_csv_file_set(
         actual_names = {
             entry.name for entry in root.iterdir() if entry.suffix == ".csv"
         }
-    except OSError as exc:
-        raise LoadError("CSV file set could not be enumerated") from exc
+    except OSError:
+        raise LoadError("CSV file set could not be enumerated") from None
 
     if actual_names != expected_names:
-        missing = sorted(expected_names - actual_names)
-        extra = sorted(actual_names - expected_names)
-        raise LoadError(f"CSV file set mismatch (missing={missing}, extra={extra})")
+        raise LoadError("CSV file set mismatch")
     if len(actual_names) != expected_count:
         raise LoadError("CSV file count does not match the expected active table count")
 
@@ -431,19 +502,14 @@ def preflight_csvs(
     bundle_hash = semantic_bundle_sha256(bundle_snapshot)
     root = Path(csv_dir)
     if not root.is_dir():
-        raise LoadError(f"CSV directory does not exist: {root}")
+        raise LoadError("CSV directory does not exist")
 
     bundle_tables = _active_bundle_tables(bundle_snapshot)
     manifest_tables = {table.name: table for table in manifest.tables}
     bundle_names = set(bundle_tables)
     manifest_names = set(manifest_tables)
     if bundle_names != manifest_names or len(bundle_tables) != len(manifest.tables):
-        missing = sorted(bundle_names - manifest_names)
-        extra = sorted(manifest_names - bundle_names)
-        raise LoadError(
-            "active bundle table set does not match source manifest "
-            f"(missing={missing}, extra={extra})"
-        )
+        raise LoadError("active bundle table set does not match source manifest")
 
     expected_csv_names = {table.file_name for table in manifest.tables}
     _validate_csv_file_set(root, expected_csv_names, len(bundle_tables))
@@ -505,10 +571,7 @@ def preflight_csvs(
 
             try:
                 if actual_hash != manifest_table.sha256:
-                    errors.append(
-                        f"SHA-256 mismatch for {manifest_table.file_name}: "
-                        f"expected {manifest_table.sha256}, got {actual_hash}"
-                    )
+                    errors.append("SHA-256 mismatch for source file")
 
                 try:
                     actual_header, actual_count = _read_csv_shape_descriptor(
@@ -516,14 +579,12 @@ def preflight_csvs(
                         manifest_table.file_name,
                     )
                     if actual_header != expected_header:
-                        errors.append(
-                            f"header mismatch for {manifest_table.file_name}: "
-                            f"expected {expected_header}, got {actual_header}"
-                        )
+                        errors.append("header mismatch for CSV file")
                     if actual_count != manifest_table.row_count:
                         errors.append(
-                            f"row count mismatch for {manifest_table.file_name}: "
-                            f"expected {manifest_table.row_count}, got {actual_count}"
+                            "row count mismatch for CSV file "
+                            f"(expected {manifest_table.row_count}, "
+                            f"got {actual_count})"
                         )
                 except LoadError as exc:
                     errors.append(str(exc))
@@ -543,22 +604,17 @@ def preflight_csvs(
                     cast_count = _check_castability(snapshot_inventory)
                     if cast_count != manifest_table.row_count:
                         errors.append(
-                            f"cast row count mismatch for {manifest_table.file_name}: "
-                            f"expected {manifest_table.row_count}, got {cast_count}"
+                            "cast row count mismatch for CSV file "
+                            f"(expected {manifest_table.row_count}, "
+                            f"got {cast_count})"
                         )
                 except LoadError as exc:
                     errors.append(str(exc))
-                except OSError as exc:
-                    errors.append(
-                        f"could not rewind retained snapshot for "
-                        f"{manifest_table.file_name}: {exc}"
-                    )
+                except OSError:
+                    errors.append("could not rewind retained source snapshot")
 
                 if _sha256_descriptor(snapshot_descriptor) != actual_hash:
-                    errors.append(
-                        f"private preflight snapshot changed while validating "
-                        f"{manifest_table.file_name}"
-                    )
+                    errors.append("private preflight snapshot changed while validating")
             finally:
                 os.close(snapshot_descriptor)
 
@@ -602,8 +658,8 @@ def _load_table(
         return _execute_ddl(connection, source_file, ddl)
     except LoadError:
         raise
-    except duckdb.Error as exc:
-        raise LoadError(f"failed loading {source_file.name}: {exc}") from exc
+    except duckdb.Error:
+        raise LoadError("failed loading materialized table") from None
 
 
 def _verify_materialization(
@@ -619,10 +675,7 @@ def _verify_materialization(
     }
     expected_tables = {table.name for table in inventory.tables}
     if actual_tables != expected_tables:
-        raise LoadError(
-            "materialized table set mismatch: "
-            f"expected {sorted(expected_tables)}, got {sorted(actual_tables)}"
-        )
+        raise LoadError("materialized table set mismatch")
 
     for table in inventory.tables:
         actual_columns = tuple(
@@ -638,10 +691,7 @@ def _verify_materialization(
             (column.name, column.data_type) for column in table.columns
         )
         if actual_columns != expected_columns:
-            raise LoadError(
-                f"materialized schema mismatch for {table.name}: "
-                f"expected {expected_columns}, got {actual_columns}"
-            )
+            raise LoadError(f"materialized schema mismatch for table {table.name}")
         actual_count = connection.execute(
             f"SELECT count(*) FROM {_quote_identifier(table.name)}"
         ).fetchone()
@@ -662,8 +712,8 @@ def _validate_regular_descriptor_path(
     try:
         descriptor_stat = os.fstat(descriptor)
         path_stat = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     if (
         not stat.S_ISREG(descriptor_stat.st_mode)
         or not stat.S_ISREG(path_stat.st_mode)
@@ -697,8 +747,8 @@ def _validate_directory_descriptor_path(
     try:
         descriptor_stat = os.fstat(descriptor)
         path_stat = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     if (
         not stat.S_ISDIR(descriptor_stat.st_mode)
         or not stat.S_ISDIR(path_stat.st_mode)
@@ -727,8 +777,8 @@ def _validate_directory_descriptor_entry(
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     if (
         not stat.S_ISDIR(descriptor_stat.st_mode)
         or not stat.S_ISDIR(entry_stat.st_mode)
@@ -756,8 +806,8 @@ def _open_directory_descriptor(
     )
     try:
         descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     try:
         descriptor_stat = _validate_directory_descriptor_path(
             descriptor,
@@ -785,8 +835,8 @@ def _validate_regular_descriptor_entry(
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     if (
         not stat.S_ISREG(descriptor_stat.st_mode)
         or not stat.S_ISREG(entry_stat.st_mode)
@@ -806,8 +856,8 @@ def _open_regular_directory_entry(
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=directory_descriptor)
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     try:
         if known_entries is not None:
             _register_created_entry(descriptor, name, known_entries)
@@ -933,8 +983,8 @@ def _create_read_only_workspace_copy(
         result = retained_descriptor
         retained_descriptor = None
         return result, created_identity, retained_hash
-    except OSError as exc:
-        raise LoadError(error_message) from exc
+    except OSError:
+        raise LoadError(error_message) from None
     finally:
         _close_best_effort(writable_descriptor)
         _close_best_effort(retained_descriptor)
@@ -949,13 +999,18 @@ def _link_no_follow(
 ) -> None:
     if _HARD_LINK not in getattr(os, "supports_follow_symlinks", ()):
         raise LoadError("secure receipt publication is not supported")
-    os.link(
-        source_name,
-        destination_name,
-        src_dir_fd=src_dir_fd,
-        dst_dir_fd=dst_dir_fd,
-        follow_symlinks=False,
-    )
+    try:
+        os.link(
+            source_name,
+            destination_name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        raise
+    except OSError:
+        raise LoadError("receipt finalize failure") from None
 
 
 def _read_bounded_descriptor(descriptor: int, limit: int) -> bytes:
@@ -977,8 +1032,8 @@ def _read_bounded_descriptor_from_start(descriptor: int, limit: int) -> bytes:
                 min(64 * 1024, limit - len(contents)),
                 len(contents),
             )
-        except OSError as exc:
-            raise LoadError("retained receipt content could not be read") from exc
+        except OSError:
+            raise LoadError("retained receipt content could not be read") from None
         if not chunk:
             break
         contents.extend(chunk)
@@ -1007,8 +1062,8 @@ def _validate_retained_receipt(
         raise LoadError(error_message)
     try:
         retained = MaterializationReceipt.model_validate_json(retained_bytes)
-    except Exception as exc:
-        raise LoadError(error_message) from exc
+    except ValidationError:
+        raise LoadError(error_message) from None
     if canonical_json_bytes(retained) != receipt_bytes:
         raise LoadError(error_message)
     _validate_regular_descriptor_entry(
@@ -1032,8 +1087,8 @@ def _validate_existing_receipt(
     )
     try:
         descriptor = os.open(name, flags, dir_fd=directory_descriptor)
-    except OSError as exc:
-        raise LoadError("pre-existing receipt could not be securely opened") from exc
+    except OSError:
+        raise LoadError("pre-existing receipt could not be securely opened") from None
 
     try:
         descriptor_stat = _validate_regular_descriptor_entry(
@@ -1049,14 +1104,14 @@ def _validate_existing_receipt(
                 descriptor,
                 len(receipt_bytes) + 1,
             )
-        except OSError as exc:
-            raise LoadError("pre-existing receipt could not be read") from exc
+        except OSError:
+            raise LoadError("pre-existing receipt could not be read") from None
         if existing_bytes != receipt_bytes:
             raise LoadError("content-addressed receipt collision")
         try:
             existing = MaterializationReceipt.model_validate_json(existing_bytes)
-        except Exception as exc:
-            raise LoadError("pre-existing receipt is invalid") from exc
+        except ValidationError:
+            raise LoadError("pre-existing receipt is invalid") from None
         if canonical_json_bytes(existing) != receipt_bytes:
             raise LoadError("pre-existing receipt is not canonical")
         _validate_regular_descriptor_entry(
@@ -1093,8 +1148,8 @@ def _validate_published_receipt(
             name,
             receipt_bytes,
         )
-    except LoadError as exc:
-        raise LoadError(error_message) from exc
+    except LoadError:
+        raise LoadError(error_message) from None
 
 
 def _create_private_workspace(
@@ -1109,10 +1164,10 @@ def _create_private_workspace(
             os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
         except FileExistsError:
             continue
-        except OSError as exc:
+        except OSError:
             raise LoadError(
                 "could not create private materialization workspace"
-            ) from exc
+            ) from None
         workspace_name = candidate
         break
     if workspace_name is None:
@@ -1245,13 +1300,13 @@ def _open_regular_source(source_file: Path) -> int:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
     try:
         descriptor = os.open(source_file, flags)
-    except OSError as exc:
-        raise LoadError(f"could not securely open source {source_file.name}") from exc
+    except OSError:
+        raise LoadError("could not securely open source file") from None
 
     try:
         descriptor_stat = os.fstat(descriptor)
         if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise LoadError(f"source is not a regular file: {source_file.name}")
+            raise LoadError("source is not a regular file")
         if no_follow == 0:
             path_stat = os.stat(source_file, follow_symlinks=False)
             if (
@@ -1259,9 +1314,7 @@ def _open_regular_source(source_file: Path) -> int:
                 or path_stat.st_dev != descriptor_stat.st_dev
                 or path_stat.st_ino != descriptor_stat.st_ino
             ):
-                raise LoadError(
-                    f"source path is not the opened regular file: {source_file.name}"
-                )
+                raise LoadError("source path is not the opened regular file")
         return descriptor
     except Exception:
         os.close(descriptor)
@@ -1292,12 +1345,10 @@ def _copy_verified_snapshot(
     except LoadError as exc:
         if str(exc).startswith("could not securely open source"):
             raise
-        raise LoadError(
-            f"could not create verified snapshot for {table.source_file.name}"
-        ) from exc
+        raise LoadError("could not create verified snapshot") from None
     if snapshot_hash != table.source_file_sha256:
         os.close(snapshot_descriptor)
-        raise LoadError(f"source changed after preflight: {table.source_file.name}")
+        raise LoadError("source changed after preflight")
     try:
         return _retained_descriptor_path(snapshot_descriptor), snapshot_descriptor
     except Exception:
@@ -1361,8 +1412,8 @@ def _create_database_path_fence(
             os.mkdir(candidate, 0o700, dir_fd=workspace_descriptor)
         except FileExistsError:
             continue
-        except OSError as exc:
-            raise LoadError("could not create private database path fence") from exc
+        except OSError:
+            raise LoadError("could not create private database path fence") from None
         fence_name = candidate
         try:
             created_stat = os.stat(
@@ -1370,10 +1421,10 @@ def _create_database_path_fence(
                 dir_fd=workspace_descriptor,
                 follow_symlinks=False,
             )
-        except OSError as exc:
+        except OSError:
             raise LoadError(
                 "private database path fence could not be retained"
-            ) from exc
+            ) from None
         if not stat.S_ISDIR(created_stat.st_mode):
             raise LoadError("private database path fence is not a directory")
         fence_identity = _identity(created_stat)
@@ -1527,10 +1578,10 @@ def _promote_built_database_from_fence(
         )
     except FileNotFoundError:
         pass
-    except OSError as exc:
+    except OSError:
         raise LoadError(
             "private database publication path could not be inspected"
-        ) from exc
+        ) from None
     else:
         raise LoadError("private database publication path already exists")
     if _HARD_LINK not in getattr(os, "supports_follow_symlinks", ()):
@@ -1547,8 +1598,8 @@ def _promote_built_database_from_fence(
             dst_dir_fd=workspace_descriptor,
             follow_symlinks=False,
         )
-    except OSError as exc:
-        raise LoadError("database could not leave the private path fence") from exc
+    except OSError:
+        raise LoadError("database could not leave the private path fence") from None
     _validate_regular_descriptor_entry(
         database_descriptor,
         workspace_descriptor,
@@ -1563,8 +1614,8 @@ def _promote_built_database_from_fence(
     )
     try:
         os.unlink(path.name, dir_fd=fence_descriptor)
-    except OSError as exc:
-        raise LoadError("database path-fence entry could not be released") from exc
+    except OSError:
+        raise LoadError("database path-fence entry could not be released") from None
     fence_entries.pop(path.name, None)
 
 
@@ -1589,8 +1640,8 @@ def _build_database(
         )
     except FileNotFoundError:
         pass
-    except OSError as exc:
-        raise LoadError("private database path could not be inspected") from exc
+    except OSError:
+        raise LoadError("private database path could not be inspected") from None
     else:
         raise LoadError("private database path already exists")
 
@@ -1652,13 +1703,60 @@ def _build_database(
                 connection.close()
                 connection = None
                 raise
-            path_authority_confirmed = True
-            database_descriptor, _ = _open_regular_directory_entry(
+            database_flags = (
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                database_descriptor = os.open(
+                    path.name,
+                    database_flags,
+                    dir_fd=fence_descriptor,
+                )
+            except OSError:
+                raise LoadError("database entry could not be securely opened") from None
+            try:
+                database_stat = _validate_regular_descriptor_entry(
+                    database_descriptor,
+                    fence_descriptor,
+                    path.name,
+                    error_message="database entry is not the opened regular file",
+                )
+            except LoadError:
+                try:
+                    recovered_stat = _validate_regular_descriptor_entry(
+                        database_descriptor,
+                        fence_descriptor,
+                        path.name,
+                        error_message="database entry validation did not recover",
+                    )
+                    _require_database_lock_state(database_descriptor, "blocked")
+                    try:
+                        connection.close()
+                    finally:
+                        connection = None
+                    _require_database_lock_state(database_descriptor, "acquired")
+                    recovered_stat = _validate_regular_descriptor_entry(
+                        database_descriptor,
+                        fence_descriptor,
+                        path.name,
+                        error_message="database entry changed after lock recovery",
+                    )
+                except (LoadError, OSError, duckdb.Error):
+                    raise LoadError("database entry validation failed") from None
+                fence_entries[path.name] = _identity(recovered_stat)
+                path_authority_confirmed = True
+                raise LoadError("database entry validation failed") from None
+            _require_database_lock_state(database_descriptor, "blocked")
+            database_stat = _validate_regular_descriptor_entry(
+                database_descriptor,
                 fence_descriptor,
                 path.name,
-                error_message="database entry is not the opened regular file",
-                known_entries=fence_entries,
+                error_message=(
+                    "database entry changed during connection lock validation"
+                ),
             )
+            fence_entries[path.name] = _identity(database_stat)
+            path_authority_confirmed = True
             connection.execute("BEGIN TRANSACTION")
             transaction_open = True
             for table, descriptor in zip(
@@ -1670,10 +1768,10 @@ def _build_database(
                     raise LoadError(f"verified source snapshot changed: {table.name}")
                 try:
                     os.lseek(descriptor, 0, os.SEEK_SET)
-                except OSError as exc:
+                except OSError:
                     raise LoadError(
                         f"could not rewind verified source snapshot: {table.name}"
-                    ) from exc
+                    ) from None
                 loaded_count = _load_table(
                     connection,
                     table.source_file,
@@ -1700,6 +1798,13 @@ def _build_database(
                     )
             connection.execute("COMMIT")
             transaction_open = False
+            _validate_regular_descriptor_entry(
+                database_descriptor,
+                fence_descriptor,
+                path.name,
+                error_message="database entry changed while connection was open",
+            )
+            _require_database_lock_state(database_descriptor, "blocked")
         except Exception:
             if connection is not None and transaction_open:
                 try:
@@ -1714,6 +1819,13 @@ def _build_database(
 
         if database_descriptor is None:
             raise LoadError("database descriptor was not retained")
+        _validate_regular_descriptor_entry(
+            database_descriptor,
+            fence_descriptor,
+            path.name,
+            error_message="database entry changed when DuckDB closed",
+        )
+        _require_database_lock_state(database_descriptor, "acquired")
         _validate_directory_descriptor_path(
             workspace_descriptor,
             path.parent,
@@ -1741,8 +1853,8 @@ def _build_database(
             )
         except FileNotFoundError:
             pass
-        except OSError as exc:
-            raise LoadError("database WAL could not be inspected after close") from exc
+        except OSError:
+            raise LoadError("database WAL could not be inspected after close") from None
         else:
             _register_expected_database_entry_best_effort(
                 fence_descriptor,
@@ -1792,8 +1904,8 @@ def _write_receipt_temp(
     del receipt_workspace  # The retained descriptor is the authority.
     try:
         workspace_stat = os.fstat(workspace_descriptor)
-    except OSError as exc:
-        raise LoadError("receipt workspace descriptor is unavailable") from exc
+    except OSError:
+        raise LoadError("receipt workspace descriptor is unavailable") from None
     if (
         not stat.S_ISDIR(workspace_stat.st_mode)
         or stat.S_IMODE(workspace_stat.st_mode) != 0o700
@@ -1822,8 +1934,8 @@ def _write_receipt_temp(
                 )
             except FileExistsError:
                 continue
-            except OSError as exc:
-                raise LoadError("could not create temporary receipt") from exc
+            except OSError:
+                raise LoadError("could not create temporary receipt") from None
             receipt_temp_name = candidate
             break
         if receipt_temp_name is None:
@@ -1909,8 +2021,8 @@ def _prepare_existing_target_backup(
         )
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        raise LoadError("existing database target could not be inspected") from exc
+    except OSError:
+        raise LoadError("existing database target could not be inspected") from None
     if not stat.S_ISREG(target_stat.st_mode):
         raise LoadError("existing database target is not a regular file")
 
@@ -1964,8 +2076,8 @@ def _prepare_existing_target_backup(
         )
         backup_descriptor = None
         return result
-    except OSError as exc:
-        raise LoadError("existing database target could not be snapshotted") from exc
+    except OSError:
+        raise LoadError("existing database target could not be snapshotted") from None
     finally:
         _close_best_effort(target_descriptor)
         _close_best_effort(backup_descriptor)
@@ -2032,8 +2144,8 @@ def _validate_target_before_publication(
             )
         except FileNotFoundError:
             return
-        except OSError as exc:
-            raise LoadError("database target could not be revalidated") from exc
+        except OSError:
+            raise LoadError("database target could not be revalidated") from None
         raise LoadError("database target appeared before publication")
 
     descriptor: int | None = None
@@ -2107,10 +2219,10 @@ def _restore_target_after_publication_failure(
             return
         try:
             os.unlink(target_name, dir_fd=target_parent_descriptor)
-        except OSError as exc:
+        except OSError:
             raise LoadError(
                 "failed to remove the invocation-created database after publication"
-            ) from exc
+            ) from None
         return
 
     if _target_matches_original_backup(
@@ -2140,8 +2252,8 @@ def _restore_target_after_publication_failure(
                 src_dir_fd=workspace_descriptor,
                 dst_dir_fd=target_parent_descriptor,
             )
-        except OSError as exc:
-            raise LoadError("failed to restore previous database target") from exc
+        except OSError:
+            raise LoadError("failed to restore previous database target") from None
         _validate_regular_descriptor_entry(
             restore_descriptor,
             target_parent_descriptor,
@@ -2204,7 +2316,7 @@ def load_csvs(
     target = Path(db_path)
     target_dir = target.parent
     if not target_dir.is_dir():
-        raise LoadError(f"database target directory does not exist: {target_dir}")
+        raise LoadError("database target directory does not exist")
     receipts = Path(receipt_dir) if receipt_dir is not None else target_dir
 
     target_parent_descriptor: int | None = None
@@ -2280,8 +2392,8 @@ def load_csvs(
         if receipts == target_dir:
             try:
                 receipt_parent_descriptor = os.dup(target_parent_descriptor)
-            except OSError as exc:
-                raise LoadError("receipt directory could not be retained") from exc
+            except OSError:
+                raise LoadError("receipt directory could not be retained") from None
             _validate_directory_descriptor_path(
                 receipt_parent_descriptor,
                 receipts,
@@ -2336,6 +2448,8 @@ def load_csvs(
                 receipt_name,
                 receipt_bytes,
             )
+        except OSError:
+            raise LoadError("receipt publication failure") from None
         else:
             receipt_uses_retained_inode = True
             _validate_retained_receipt(
@@ -2395,16 +2509,29 @@ def load_csvs(
                 receipt_bytes=receipt_bytes,
                 error_message="published receipt content changed before database publication",
             )
+            _validate_directory_descriptor_path(
+                target_parent_descriptor,
+                target_dir,
+                error_message="database target directory changed before publication",
+            )
             _validate_target_before_publication(
                 target_parent_descriptor,
                 target.name,
                 target_backup,
             )
-            os.replace(
-                database_temp.name,
-                target.name,
-                src_dir_fd=workspace_descriptor,
-                dst_dir_fd=target_parent_descriptor,
+            try:
+                os.replace(
+                    database_temp.name,
+                    target.name,
+                    src_dir_fd=workspace_descriptor,
+                    dst_dir_fd=target_parent_descriptor,
+                )
+            except OSError:
+                raise LoadError("database replace failure after adoption") from None
+            _validate_directory_descriptor_path(
+                target_parent_descriptor,
+                target_dir,
+                error_message="database target directory changed during publication",
             )
             _validate_csv_file_set(
                 source_root,
@@ -2437,6 +2564,13 @@ def load_csvs(
                 workspace_descriptor,
             )
             _validate_directory_descriptor_path(
+                target_parent_descriptor,
+                target_dir,
+                error_message=(
+                    "database target directory changed after backup cleanup"
+                ),
+            )
+            _validate_directory_descriptor_path(
                 receipt_parent_descriptor,
                 receipts,
                 error_message="receipt directory changed at success boundary",
@@ -2448,6 +2582,11 @@ def load_csvs(
                 name=receipt_name,
                 receipt_bytes=receipt_bytes,
                 error_message="published receipt content changed at success boundary",
+            )
+            _validate_directory_descriptor_path(
+                target_parent_descriptor,
+                target_dir,
+                error_message="database target directory changed at success boundary",
             )
         except Exception:
             _restore_target_after_publication_failure(
@@ -2464,7 +2603,7 @@ def load_csvs(
     except Exception as exc:
         if isinstance(exc, LoadError):
             raise
-        raise LoadError(f"DuckDB materialization failed: {exc}") from exc
+        raise LoadError("DuckDB materialization failed") from None
     finally:
         for descriptor in source_snapshot_descriptors:
             _close_best_effort(descriptor)

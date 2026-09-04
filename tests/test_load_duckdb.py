@@ -2573,3 +2573,395 @@ def test_close_best_effort_does_not_retry_reused_same_inode_descriptor(
                 real_close(descriptor)
             except OSError:
                 pass
+
+
+def _assert_sanitized_load_error(
+    error: BaseException,
+    *,
+    forbidden: tuple[str, ...],
+) -> None:
+    message = str(error)
+    for value in forbidden:
+        assert value not in message
+    assert error.__cause__ is None
+
+
+def test_duckdb_lock_probe_observes_connection_close_transition(
+    tmp_path: Path,
+) -> None:
+    loader = _loader()
+    database = tmp_path / "lock-transition.duckdb"
+    connection: duckdb.DuckDBPyConnection | None = duckdb.connect(str(database))
+    descriptor = loader.os.open(database, loader.os.O_RDWR)
+    try:
+        assert loader._probe_database_lock(descriptor) == "blocked"
+        connection.close()
+        connection = None
+        assert loader._probe_database_lock(descriptor) == "acquired"
+    finally:
+        if connection is not None:
+            connection.close()
+        loader.os.close(descriptor)
+
+
+def test_database_entry_swap_after_connect_fails_without_publication_or_unknown_cleanup(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"previous target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    attacker_bytes = b"ATTACKER_DATABASE_ENTRY_CANARY_RESTART_8"
+    real_connect = loader.duckdb.connect
+    observed: dict[str, Any] = {"swapped": False}
+
+    def swap_entry_after_real_connect(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        connection = real_connect(database, *args, **kwargs)
+        if str(database) != ":memory:" and not observed["swapped"]:
+            database_path = Path(database)
+            database_path.unlink()
+            database_path.write_bytes(attacker_bytes)
+            observed.update(
+                swapped=True,
+                database_path=database_path,
+                workspace=database_path.parent.parent,
+            )
+        return connection
+
+    monkeypatch.setattr(loader.duckdb, "connect", swap_entry_after_real_connect)
+
+    try:
+        with pytest.raises(loader.LoadError, match="connection.*database"):
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+
+        assert observed["swapped"] is True
+        assert observed["database_path"].read_bytes() == attacker_bytes
+        assert target.read_bytes() == target_before
+        assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
+    finally:
+        workspace = observed.get("workspace")
+        if isinstance(workspace, Path):
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_database_connect_transient_aba_fails_closed(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"previous target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    real_connect = loader.duckdb.connect
+    observed: dict[str, Any] = {"swapped": False}
+
+    def connect_to_b_then_restore_a(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(database) == ":memory:" or observed["swapped"]:
+            return real_connect(database, *args, **kwargs)
+
+        database_path = Path(database)
+        connection_a = real_connect(database, *args, **kwargs)
+        connection_a.close()
+        a_bytes = database_path.read_bytes()
+        retained_a = database_path.with_name("retained-a.duckdb")
+        database_path.rename(retained_a)
+
+        database_b = database_path.with_name("different-b.duckdb")
+        connection_b = real_connect(str(database_b), *args, **kwargs)
+        database_b.unlink()
+        retained_a.rename(database_path)
+        observed.update(
+            swapped=True,
+            database_path=database_path,
+            a_bytes=a_bytes,
+            workspace=database_path.parent.parent,
+        )
+        return connection_b
+
+    monkeypatch.setattr(loader.duckdb, "connect", connect_to_b_then_restore_a)
+
+    try:
+        with pytest.raises(loader.LoadError, match="connection.*database"):
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+
+        assert observed["swapped"] is True
+        assert observed["database_path"].read_bytes() == observed["a_bytes"]
+        assert target.read_bytes() == target_before
+        assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
+    finally:
+        workspace = observed.get("workspace")
+        if isinstance(workspace, Path):
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_target_parent_substitution_rolls_back_retained_parent_without_touching_replacement(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "workshop.duckdb"
+    target.write_bytes(b"original retained-parent target bytes")
+    target_before = target.read_bytes()
+    moved_public = tmp_path / "moved-public"
+    receipt_dir = tmp_path / "receipts"
+    attacker_target = b"ATTACKER_REQUESTED_TARGET_CANARY_RESTART_8"
+    attacker_tree = b"ATTACKER_REPLACEMENT_TREE_CANARY_RESTART_8"
+    real_replace = loader.os.replace
+    observed = {"substituted": False}
+
+    def substitute_target_parent_inside_database_replace(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        if (
+            Path(source).name == "database.duckdb"
+            and Path(destination).name == target.name
+            and not observed["substituted"]
+        ):
+            public.rename(moved_public)
+            public.mkdir()
+            target.write_bytes(attacker_target)
+            (public / "keep.txt").write_bytes(attacker_tree)
+            observed["substituted"] = True
+        real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(
+        loader.os,
+        "replace",
+        substitute_target_parent_inside_database_replace,
+    )
+
+    with pytest.raises(loader.LoadError, match="target directory"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["substituted"] is True
+    assert target.read_bytes() == attacker_target
+    assert (public / "keep.txt").read_bytes() == attacker_tree
+    assert (moved_public / target.name).read_bytes() == target_before
+    assert not list(public.glob(f".{target.name}.*.tmp*"))
+    assert not list(moved_public.glob(f".{target.name}.*.tmp*"))
+
+
+def test_castability_load_error_sanitizes_source_value_paths_and_expression(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    source_root = tmp_path / "PRIVATE_SOURCE_PATH_CANARY_RESTART_8"
+    source_root.mkdir()
+    csv_dir, manifest = write_bundle_csv_fixture(source_root, bundle)
+    table = next(
+        table
+        for table in _active_tables(bundle)
+        if any(column["data_type"] == "BIGINT" for column in table.cerebro["columns"])
+    )
+    column_index = next(
+        index
+        for index, column in enumerate(table.cerebro["columns"])
+        if column["data_type"] == "BIGINT"
+    )
+    source_file = csv_dir / f"{_raw_name(table)}.csv"
+    rows = _read_rows(source_file)
+    source_cell = "PRIVATE_SOURCE_CELL_CANARY_RESTART_8"
+    rows[1][column_index] = source_cell
+    _write_rows(source_file, rows)
+    manifest = _rehash_manifest(manifest, csv_dir)
+
+    with pytest.raises(loader.LoadError, match="cast") as raised:
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+    _assert_sanitized_load_error(
+        raised.value,
+        forbidden=(
+            source_cell,
+            str(source_root),
+            str(csv_dir),
+            str(source_file),
+            "/dev/fd",
+            "/proc/self/fd",
+            "CAST(",
+            "Could not convert string",
+        ),
+    )
+
+
+def test_same_width_header_error_sanitizes_header_cells_and_paths(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+) -> None:
+    loader = _loader()
+    source_root = tmp_path / "PRIVATE_HEADER_PATH_CANARY_RESTART_8"
+    source_root.mkdir()
+    csv_dir, manifest = write_bundle_csv_fixture(source_root, bundle)
+    table = manifest.tables[0]
+    source_file = csv_dir / table.file_name
+    rows = _read_rows(source_file)
+    expected_header = tuple(rows[0])
+    malicious_header = "PRIVATE_HEADER_CELL_CANARY_RESTART_8"
+    rows[0][0] = malicious_header
+    observed_header = tuple(rows[0])
+    _write_rows(source_file, rows)
+    manifest = _rehash_manifest(manifest, csv_dir)
+
+    with pytest.raises(loader.LoadError, match="header") as raised:
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+    _assert_sanitized_load_error(
+        raised.value,
+        forbidden=(
+            malicious_header,
+            *expected_header,
+            repr(expected_header),
+            repr(observed_header),
+            str(source_root),
+            str(csv_dir),
+            str(source_file),
+        ),
+    )
+
+
+def test_materialization_duckdb_error_is_sanitized(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "PRIVATE_TARGET_PATH_CANARY_RESTART_8.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    source_path = csv_dir / manifest.tables[0].file_name
+    temp_path = tmp_path / ".PRIVATE_TEMP_PATH_CANARY_RESTART_8/database.duckdb"
+    raw_exception = (
+        "PRIVATE_DUCKDB_EXCEPTION_CANARY_RESTART_8 "
+        f"{source_path} {temp_path} {target} /dev/fd/987 "
+        'CAST("private_column" AS BIGINT)'
+    )
+    real_preflight = loader.preflight_csvs
+    observed = {"armed": False}
+
+    def preflight_then_arm_failure(*args: Any, **kwargs: Any) -> Any:
+        inventory = real_preflight(*args, **kwargs)
+
+        def fail_materialization_execute(*_args: Any, **_kwargs: Any) -> int:
+            raise duckdb.Error(raw_exception)
+
+        monkeypatch.setattr(loader, "_execute_ddl", fail_materialization_execute)
+        observed["armed"] = True
+        return inventory
+
+    monkeypatch.setattr(loader, "preflight_csvs", preflight_then_arm_failure)
+
+    with pytest.raises(loader.LoadError, match="failed loading") as raised:
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["armed"] is True
+    assert target.read_bytes() == target_before
+    _assert_sanitized_load_error(
+        raised.value,
+        forbidden=(
+            raw_exception,
+            "PRIVATE_DUCKDB_EXCEPTION_CANARY_RESTART_8",
+            str(source_path),
+            str(temp_path),
+            str(target),
+            "/dev/fd",
+            "CAST(",
+        ),
+    )
+
+
+def test_generic_materialization_wrapper_error_is_sanitized(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "PRIVATE_GENERIC_TARGET_CANARY_RESTART_8.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    source_path = csv_dir / manifest.tables[0].file_name
+    temp_path = tmp_path / ".PRIVATE_GENERIC_TEMP_CANARY_RESTART_8/database.duckdb"
+    raw_exception = (
+        "PRIVATE_GENERIC_EXCEPTION_CANARY_RESTART_8 "
+        f"{source_path} {temp_path} {target} /dev/fd/654 "
+        'CAST("private_column" AS BIGINT)'
+    )
+
+    def fail_with_generic_exception(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError(raw_exception)
+
+    monkeypatch.setattr(loader, "_snapshot_inventory", fail_with_generic_exception)
+
+    with pytest.raises(
+        loader.LoadError, match="DuckDB materialization failed"
+    ) as raised:
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == target_before
+    _assert_sanitized_load_error(
+        raised.value,
+        forbidden=(
+            raw_exception,
+            "PRIVATE_GENERIC_EXCEPTION_CANARY_RESTART_8",
+            str(source_path),
+            str(temp_path),
+            str(target),
+            "/dev/fd",
+            "CAST(",
+        ),
+    )
