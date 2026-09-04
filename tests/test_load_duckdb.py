@@ -1574,3 +1574,159 @@ def test_early_snapshot_failure_after_destination_creation_cleans_workspace(
     assert observed["failed_destination_open"] is True
     assert target.read_bytes() == target_before
     _assert_no_invocation_temps(target)
+
+
+def test_private_preflight_snapshot_substitution_cannot_mix_validated_bytes(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    selected = next(
+        table
+        for table in manifest.tables
+        if len(_read_rows(csv_dir / table.file_name)[0]) >= 2
+    )
+    source_file = csv_dir / selected.file_name
+    compliant_bytes = source_file.read_bytes()
+    invalid_rows = _read_rows(source_file)
+    invalid_rows[0][0], invalid_rows[0][1] = (
+        invalid_rows[0][1],
+        invalid_rows[0][0],
+    )
+    _write_rows(source_file, invalid_rows)
+    invalid_bytes = source_file.read_bytes()
+    manifest = _rehash_manifest(manifest, csv_dir)
+    real_copy = loader._copy_preflight_snapshot
+    observed = {"substituted": False}
+
+    def substitute_private_path_after_hash(
+        copy_source: Path,
+        snapshot: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = real_copy(copy_source, snapshot, *args, **kwargs)
+        if Path(copy_source) == source_file and snapshot.exists():
+            snapshot.unlink()
+            snapshot.write_bytes(compliant_bytes)
+            observed["substituted"] = True
+        return result
+
+    monkeypatch.setattr(
+        loader,
+        "_copy_preflight_snapshot",
+        substitute_private_path_after_hash,
+    )
+
+    with pytest.raises(loader.LoadError, match="header mismatch"):
+        loader.preflight_csvs(csv_dir, bundle, manifest)
+
+    assert observed["substituted"] is False
+    assert source_file.read_bytes() == invalid_bytes
+
+
+def test_preflight_workspace_replacement_is_not_recursively_deleted(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    real_copy = loader._copy_preflight_snapshot
+    canary_bytes = b"unrelated replacement tree must survive cleanup"
+    observed: dict[str, Any] = {"substituted": False}
+
+    def substitute_workspace_after_first_copy(
+        source_file: Path,
+        snapshot: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = real_copy(source_file, snapshot, *args, **kwargs)
+        if not observed["substituted"]:
+            workspace = snapshot.parent
+            moved_workspace = workspace.with_name(f"{workspace.name}-moved-by-test")
+            workspace.rename(moved_workspace)
+            workspace.mkdir(mode=0o700)
+            canary = workspace / "keep.txt"
+            canary.write_bytes(canary_bytes)
+            observed.update(
+                substituted=True,
+                workspace=workspace,
+                moved_workspace=moved_workspace,
+                canary=canary,
+            )
+        return result
+
+    monkeypatch.setattr(
+        loader,
+        "_copy_preflight_snapshot",
+        substitute_workspace_after_first_copy,
+    )
+
+    try:
+        with pytest.raises(loader.LoadError):
+            loader.preflight_csvs(csv_dir, bundle, manifest)
+
+        assert observed["substituted"] is True
+        assert observed["canary"].read_bytes() == canary_bytes
+        assert observed["moved_workspace"].is_dir()
+    finally:
+        for key in ("workspace", "moved_workspace"):
+            path = observed.get(key)
+            if isinstance(path, Path):
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def test_snapshot_destination_fstat_failure_cleans_workspace(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    real_copy = loader._copy_verified_snapshot
+    real_open = loader.os.open
+    real_fstat = loader.os.fstat
+    observed: dict[str, Any] = {"failed": False}
+
+    def fail_copy_destination_fstat(*args: Any, **kwargs: Any) -> Path:
+        def record_destination_open(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path).name.startswith("source-") and dir_fd is not None:
+                observed.setdefault("destination_descriptor", descriptor)
+            return descriptor
+
+        def fail_first_destination_fstat(descriptor: int) -> Any:
+            if (
+                descriptor == observed.get("destination_descriptor")
+                and not observed["failed"]
+            ):
+                observed["failed"] = True
+                raise OSError("injected destination fstat failure")
+            return real_fstat(descriptor)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(loader.os, "open", record_destination_open)
+            scoped.setattr(loader.os, "fstat", fail_first_destination_fstat)
+            return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_copy_verified_snapshot", fail_copy_destination_fstat)
+
+    with pytest.raises(loader.LoadError, match="could not create verified snapshot"):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert observed["failed"] is True
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target)

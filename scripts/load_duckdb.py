@@ -210,10 +210,97 @@ def _check_castability(table: SourceTableInventory) -> int:
         connection.close()
 
 
-def _copy_preflight_snapshot(source_file: Path, snapshot: Path) -> str:
-    """Copy and hash one securely opened source into a private snapshot."""
+def _register_created_entry(
+    descriptor: int,
+    name: str,
+    known_entries: dict[str, tuple[int, int]],
+) -> os.stat_result:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+    except OSError as initial_error:
+        # A one-shot metadata fault must not leave an otherwise identifiable
+        # created entry outside conservative cleanup ownership.
+        try:
+            descriptor_stat = os.fstat(descriptor)
+        except OSError:
+            raise initial_error
+        known_entries[name] = _identity(descriptor_stat)
+        raise
+    known_entries[name] = _identity(descriptor_stat)
+    return descriptor_stat
+
+
+def _read_csv_shape_descriptor(
+    descriptor: int,
+    display_name: str,
+) -> tuple[tuple[str, ...], int]:
+    duplicate = -1
+    try:
+        duplicate = os.dup(descriptor)
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        source = os.fdopen(duplicate, "r", encoding="utf-8", newline="")
+        duplicate = -1
+        with source:
+            reader = csv.reader(source, strict=True)
+            raw_header = next(reader, None)
+            if raw_header is None:
+                return (), 0
+            header = tuple(raw_header)
+            row_count = 0
+            for row in reader:
+                if not row:
+                    raise LoadError(f"blank CSV row in {display_name}")
+                if len(row) != len(header):
+                    raise LoadError(
+                        f"CSV row width mismatch in {display_name}: "
+                        f"expected {len(header)}, got {len(row)}"
+                    )
+                row_count += 1
+            return header, row_count
+    except UnicodeDecodeError as exc:
+        raise LoadError(f"CSV is not valid UTF-8: {display_name}") from exc
+    except csv.Error as exc:
+        raise LoadError(f"invalid CSV syntax in {display_name}: {exc}") from exc
+    except OSError as exc:
+        raise LoadError(f"could not read CSV {display_name}: {exc}") from exc
+    finally:
+        if duplicate >= 0:
+            os.close(duplicate)
+
+
+def _retained_descriptor_path(descriptor: int) -> Path:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+    except OSError as exc:
+        raise LoadError("private preflight snapshot descriptor is unavailable") from exc
+    probe_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    for root in (Path("/dev/fd"), Path("/proc/self/fd")):
+        candidate = root / str(descriptor)
+        try:
+            probe_descriptor = os.open(candidate, probe_flags)
+        except OSError:
+            continue
+        try:
+            probe_stat = os.fstat(probe_descriptor)
+            if stat.S_ISREG(probe_stat.st_mode) and _identity(probe_stat) == _identity(
+                descriptor_stat
+            ):
+                return candidate
+        finally:
+            os.close(probe_descriptor)
+    raise LoadError("runtime cannot expose a retained preflight descriptor")
+
+
+def _copy_preflight_snapshot(
+    source_file: Path,
+    snapshot: Path,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> tuple[int, str]:
+    """Copy one source into an unlinked, retained read-only snapshot."""
     source_descriptor = _open_regular_source(source_file)
     destination_descriptor: int | None = None
+    retained_descriptor: int | None = None
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -223,12 +310,26 @@ def _copy_preflight_snapshot(source_file: Path, snapshot: Path) -> str:
     )
     digest = sha256()
     try:
-        destination_descriptor = os.open(snapshot, flags, 0o600)
-        _validate_regular_descriptor_path(
-            destination_descriptor,
-            snapshot,
-            error_message="private preflight snapshot is not the opened regular file",
+        destination_descriptor = os.open(
+            snapshot.name,
+            flags,
+            0o600,
+            dir_fd=workspace_descriptor,
         )
+        destination_stat = _register_created_entry(
+            destination_descriptor,
+            snapshot.name,
+            known_entries,
+        )
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise LoadError("private preflight snapshot is not a regular file")
+        _validate_regular_descriptor_entry(
+            destination_descriptor,
+            workspace_descriptor,
+            snapshot.name,
+            error_message="private preflight snapshot changed after creation",
+        )
+
         with os.fdopen(source_descriptor, "rb") as source:
             source_descriptor = -1
             with os.fdopen(
@@ -241,17 +342,39 @@ def _copy_preflight_snapshot(source_file: Path, snapshot: Path) -> str:
                     destination.write(chunk)
                 destination.flush()
                 os.fsync(destination_descriptor)
+
         os.fchmod(destination_descriptor, 0o400)
-        descriptor_stat = _validate_regular_descriptor_path(
+        descriptor_stat = _validate_regular_descriptor_entry(
             destination_descriptor,
-            snapshot,
+            workspace_descriptor,
+            snapshot.name,
             error_message="private preflight snapshot changed after copying",
         )
         if stat.S_IMODE(descriptor_stat.st_mode) != 0o400:
             raise LoadError("private preflight snapshot is not mode 0400")
-        if _sha256_descriptor(destination_descriptor) != digest.hexdigest():
+        snapshot_hash = digest.hexdigest()
+        if _sha256_descriptor(destination_descriptor) != snapshot_hash:
             raise LoadError("private preflight snapshot hash changed after copying")
-        return digest.hexdigest()
+
+        read_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        retained_descriptor = os.open(
+            snapshot.name,
+            read_flags,
+            dir_fd=workspace_descriptor,
+        )
+        _validate_regular_descriptor_entry(
+            retained_descriptor,
+            workspace_descriptor,
+            snapshot.name,
+            error_message="retained preflight snapshot is not the copied inode",
+        )
+        os.unlink(snapshot.name, dir_fd=workspace_descriptor)
+        known_entries.pop(snapshot.name, None)
+        result_descriptor = retained_descriptor
+        retained_descriptor = None
+        return result_descriptor, snapshot_hash
     except OSError as exc:
         raise LoadError(
             f"could not create private preflight snapshot for {source_file.name}"
@@ -261,6 +384,8 @@ def _copy_preflight_snapshot(source_file: Path, snapshot: Path) -> str:
             os.close(source_descriptor)
         if destination_descriptor is not None:
             os.close(destination_descriptor)
+        if retained_descriptor is not None:
+            os.close(retained_descriptor)
 
 
 def preflight_csvs(
@@ -300,42 +425,59 @@ def preflight_csvs(
 
     errors: list[str] = []
     inventory_tables: list[SourceTableInventory] = []
+    preflight_parent = Path(tempfile.gettempdir())
+    parent_descriptor: int | None = None
+    workspace: Path | None = None
+    workspace_descriptor: int | None = None
+    workspace_identity: tuple[int, int] | None = None
+    workspace_entries: dict[str, tuple[int, int]] = {}
     try:
-        with tempfile.TemporaryDirectory(prefix="cerebro-preflight-") as raw_workspace:
-            preflight_workspace = Path(raw_workspace)
-            workspace_mode = preflight_workspace.lstat().st_mode
-            if (
-                not stat.S_ISDIR(workspace_mode)
-                or stat.S_ISLNK(workspace_mode)
-                or stat.S_IMODE(workspace_mode) != 0o700
-            ):
-                raise LoadError(
-                    "private preflight workspace is not a mode-0700 directory"
-                )
+        parent_descriptor, _ = _open_directory_descriptor(
+            preflight_parent,
+            error_message="private preflight parent could not be securely opened",
+        )
+        workspace, workspace_descriptor, workspace_identity = _create_private_workspace(
+            preflight_parent / "cerebro-preflight"
+        )
+        _validate_directory_descriptor_entry(
+            workspace_descriptor,
+            parent_descriptor,
+            workspace.name,
+            required_mode=0o700,
+            error_message="private preflight workspace is not in the pinned parent",
+        )
 
-            for index, name in enumerate(sorted(bundle_tables)):
-                manifest_table = manifest_tables[name]
-                source_file = root / manifest_table.file_name
-                columns = bundle_tables[name]
-                expected_header = tuple(column.name for column in columns)
-                ddl = _table_ddl(name, columns)
-                table_inventory = SourceTableInventory(
-                    name=name,
-                    table_id=manifest_table_id(name),
-                    source_file=source_file,
-                    source_file_sha256=manifest_table.sha256,
-                    row_count=manifest_table.row_count,
-                    columns=columns,
-                    ddl=ddl,
-                )
-                inventory_tables.append(table_inventory)
-                snapshot = preflight_workspace / f"source-{index:04d}.csv"
+        for index, name in enumerate(sorted(bundle_tables)):
+            manifest_table = manifest_tables[name]
+            source_file = root / manifest_table.file_name
+            columns = bundle_tables[name]
+            expected_header = tuple(column.name for column in columns)
+            ddl = _table_ddl(name, columns)
+            table_inventory = SourceTableInventory(
+                name=name,
+                table_id=manifest_table_id(name),
+                source_file=source_file,
+                source_file_sha256=manifest_table.sha256,
+                row_count=manifest_table.row_count,
+                columns=columns,
+                ddl=ddl,
+            )
+            inventory_tables.append(table_inventory)
+            snapshot = workspace / f"source-{index:04d}.csv"
+            snapshot_descriptor: int | None = None
 
-                try:
-                    actual_hash = _copy_preflight_snapshot(source_file, snapshot)
-                except LoadError as exc:
-                    errors.append(str(exc))
-                    continue
+            try:
+                snapshot_descriptor, actual_hash = _copy_preflight_snapshot(
+                    source_file,
+                    snapshot,
+                    workspace_descriptor,
+                    workspace_entries,
+                )
+            except LoadError as exc:
+                errors.append(str(exc))
+                continue
+
+            try:
                 if actual_hash != manifest_table.sha256:
                     errors.append(
                         f"SHA-256 mismatch for {manifest_table.file_name}: "
@@ -343,7 +485,10 @@ def preflight_csvs(
                     )
 
                 try:
-                    actual_header, actual_count = _read_csv_shape(snapshot)
+                    actual_header, actual_count = _read_csv_shape_descriptor(
+                        snapshot_descriptor,
+                        manifest_table.file_name,
+                    )
                     if actual_header != expected_header:
                         errors.append(
                             f"header mismatch for {manifest_table.file_name}: "
@@ -357,16 +502,18 @@ def preflight_csvs(
                 except LoadError as exc:
                     errors.append(str(exc))
 
+                descriptor_path = _retained_descriptor_path(snapshot_descriptor)
                 snapshot_inventory = SourceTableInventory(
                     name=table_inventory.name,
                     table_id=table_inventory.table_id,
-                    source_file=snapshot,
+                    source_file=descriptor_path,
                     source_file_sha256=table_inventory.source_file_sha256,
                     row_count=table_inventory.row_count,
                     columns=table_inventory.columns,
                     ddl=table_inventory.ddl,
                 )
                 try:
+                    os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
                     cast_count = _check_castability(snapshot_inventory)
                     if cast_count != manifest_table.row_count:
                         errors.append(
@@ -375,8 +522,39 @@ def preflight_csvs(
                         )
                 except LoadError as exc:
                     errors.append(str(exc))
-    except OSError as exc:
-        raise LoadError("private CSV preflight workspace failed") from exc
+                except OSError as exc:
+                    errors.append(
+                        f"could not rewind retained snapshot for "
+                        f"{manifest_table.file_name}: {exc}"
+                    )
+
+                if _sha256_descriptor(snapshot_descriptor) != actual_hash:
+                    errors.append(
+                        f"private preflight snapshot changed while validating "
+                        f"{manifest_table.file_name}"
+                    )
+            finally:
+                os.close(snapshot_descriptor)
+
+        _validate_directory_descriptor_entry(
+            workspace_descriptor,
+            parent_descriptor,
+            workspace.name,
+            required_mode=0o700,
+            error_message="private preflight workspace changed during validation",
+        )
+    finally:
+        _remove_private_workspace(
+            workspace,
+            descriptor=workspace_descriptor,
+            expected_identity=workspace_identity,
+            known_entries=workspace_entries,
+            parent_descriptor=parent_descriptor,
+        )
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
     if errors:
         raise LoadError("CSV preflight failed: " + "; ".join(errors))
@@ -861,8 +1039,11 @@ def _copy_verified_snapshot(
             0o600,
             dir_fd=workspace_descriptor,
         )
-        destination_stat = os.fstat(destination_descriptor)
-        known_entries[snapshot.name] = _identity(destination_stat)
+        destination_stat = _register_created_entry(
+            destination_descriptor,
+            snapshot.name,
+            known_entries,
+        )
         if not stat.S_ISREG(destination_stat.st_mode):
             raise LoadError("verified source snapshot is not a regular file")
         _validate_regular_descriptor_entry(
