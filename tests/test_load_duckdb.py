@@ -723,6 +723,10 @@ def test_database_temp_uses_private_workspace_not_claimable_parent_path(
                     "path_existed": loader.os.path.lexists(database_path),
                     "parent_is_symlink": database_path.parent.is_symlink(),
                     "parent_mode": database_path.parent.stat().st_mode & 0o777,
+                    "workspace_is_symlink": database_path.parent.parent.is_symlink(),
+                    "workspace_mode": (
+                        database_path.parent.parent.stat().st_mode & 0o777
+                    ),
                     "snapshots": tuple(
                         (snapshot, snapshot.is_file(), snapshot.is_symlink())
                         for snapshot in snapshots
@@ -749,11 +753,13 @@ def test_database_temp_uses_private_workspace_not_claimable_parent_path(
     database = observed[0]
     database_path = database["path"]
     assert database_path.name == "database.duckdb"
-    assert database_path.parent.parent == target.parent
-    assert database_path.parent != target.parent
+    assert database_path.parent.parent.parent == target.parent
+    assert database_path.parent.parent != target.parent
     assert not database["path_existed"]
     assert not database["parent_is_symlink"]
+    assert not database["workspace_is_symlink"]
     assert database["parent_mode"] == 0o700
+    assert database["workspace_mode"] == 0o700
     assert database["snapshots"] == ()
     assert loaded_sources[0].parent in (Path("/dev/fd"), Path("/proc/self/fd"))
     assert loaded_sources[0].name.isdigit()
@@ -2322,3 +2328,248 @@ def test_receipt_workspace_substitution_creates_no_temp_in_replacement_tree(
             workspace = observed.get(key)
             if isinstance(workspace, Path):
                 shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_concurrent_old_target_writer_cannot_corrupt_rollback_snapshot(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"original target bytes that rollback must preserve")
+    target_before = target.read_bytes()
+    retained_writer = loader.os.open(target, loader.os.O_RDWR)
+    real_replace = loader.os.replace
+    observed = {"mutated": False}
+
+    def mutate_old_inode_after_database_replace(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        if Path(destination).name == target.name and not observed["mutated"]:
+            real_replace(source, destination, **kwargs)
+            loader.os.ftruncate(retained_writer, 0)
+            loader.os.lseek(retained_writer, 0, loader.os.SEEK_SET)
+            changed = b"concurrent writer changed retained old inode"
+            assert loader.os.write(retained_writer, changed) == len(changed)
+            loader.os.fsync(retained_writer)
+            observed["mutated"] = True
+            raise OSError("injected failure after old target inode mutation")
+        real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(
+        loader.os,
+        "replace",
+        mutate_old_inode_after_database_replace,
+    )
+
+    try:
+        with pytest.raises(loader.LoadError):
+            loader.load_csvs(csv_dir, target, bundle, manifest)
+    finally:
+        loader.os.close(retained_writer)
+
+    assert observed["mutated"] is True
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target)
+
+
+def test_receipt_rewrite_at_success_boundary_rolls_back_target(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    malicious_bytes = b'{"corrupted":"after-final-validation"}'
+    real_discard = loader._discard_target_backup_best_effort
+    observed: dict[str, Any] = {"mutated": False}
+
+    def discard_then_rewrite_receipt(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        receipts = list(receipt_dir.glob("*.json"))
+        assert len(receipts) == 1
+        receipt_path = receipts[0]
+        receipt_path.chmod(0o600)
+        receipt_path.write_bytes(malicious_bytes)
+        observed.update(mutated=True, receipt_path=receipt_path)
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_rewrite_receipt,
+    )
+
+    with pytest.raises(loader.LoadError, match="receipt.*content"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["mutated"] is True
+    assert target.read_bytes() == target_before
+    assert observed["receipt_path"].read_bytes() == malicious_bytes
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_database_workspace_substitution_during_connect_leaves_no_database_temp(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    real_build = loader._build_database
+    real_connect = loader.duckdb.connect
+    canary_bytes = b"replacement workspace canary"
+    observed: dict[str, Any] = {"substituted": False}
+
+    def capture_workspace(
+        database_path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        observed["workspace"] = database_path.parent
+        return real_build(database_path, *args, **kwargs)
+
+    def substitute_workspace_at_connect(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(database) != ":memory:" and not observed["substituted"]:
+            workspace = observed["workspace"]
+            moved_workspace = workspace.with_name(f"{workspace.name}-retained-by-test")
+            workspace.rename(moved_workspace)
+            workspace.mkdir(mode=0o700)
+            canary = workspace / "keep.txt"
+            canary.write_bytes(canary_bytes)
+            observed.update(
+                substituted=True,
+                replacement_workspace=workspace,
+                moved_workspace=moved_workspace,
+                canary=canary,
+            )
+        return real_connect(database, *args, **kwargs)
+
+    def fail_receipt_publication(*args: Any, **kwargs: Any) -> None:
+        raise OSError("injected receipt publication failure")
+
+    monkeypatch.setattr(loader, "_build_database", capture_workspace)
+    monkeypatch.setattr(loader.duckdb, "connect", substitute_workspace_at_connect)
+    monkeypatch.setattr(loader, "_link_no_follow", fail_receipt_publication)
+
+    try:
+        with pytest.raises(loader.LoadError):
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+
+        replacement_workspace = observed["replacement_workspace"]
+        moved_workspace = observed["moved_workspace"]
+        assert observed["canary"].read_bytes() == canary_bytes
+        assert not list(replacement_workspace.glob("database.duckdb*"))
+        assert not list(moved_workspace.glob("database.duckdb*"))
+        assert target.read_bytes() == target_before
+    finally:
+        for key in ("replacement_workspace", "moved_workspace"):
+            workspace = observed.get(key)
+            if isinstance(workspace, Path):
+                shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_csv_set_drift_during_database_replace_rolls_back_target(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    unexpected = csv_dir / "unexpected.csv"
+    real_replace = loader.os.replace
+    observed = {"added": False}
+
+    def add_csv_inside_database_replace(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        if Path(destination).name == target.name and not observed["added"]:
+            unexpected.write_text("value\n1\n", encoding="utf-8")
+            observed["added"] = True
+        real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(loader.os, "replace", add_csv_inside_database_replace)
+
+    with pytest.raises(loader.LoadError, match="CSV file set"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["added"] is True
+    assert unexpected.is_file()
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_close_best_effort_does_not_retry_reused_same_inode_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    retained = tmp_path / "retained.txt"
+    retained.write_bytes(b"retained bytes")
+    victim = loader.os.open(retained, loader.os.O_RDONLY)
+    replacement_source = loader.os.open(retained, loader.os.O_RDONLY)
+    real_close = loader.os.close
+    real_fstat = loader.os.fstat
+    observed = {"victim_close_calls": 0, "reused_number": False}
+
+    def release_reuse_then_report_error(descriptor: int) -> None:
+        if descriptor == victim:
+            observed["victim_close_calls"] += 1
+            if observed["victim_close_calls"] == 1:
+                real_close(descriptor)
+                loader.os.dup2(replacement_source, victim, inheritable=False)
+                observed["reused_number"] = True
+                raise OSError("close reported failure after releasing descriptor")
+        real_close(descriptor)
+
+    monkeypatch.setattr(loader.os, "close", release_reuse_then_report_error)
+
+    try:
+        loader._close_best_effort(victim)
+        assert observed == {"victim_close_calls": 1, "reused_number": True}
+        assert loader.stat.S_ISREG(real_fstat(victim).st_mode)
+    finally:
+        for descriptor in (victim, replacement_source):
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass

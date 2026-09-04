@@ -63,6 +63,15 @@ class SourceInventory:
     tables: tuple[SourceTableInventory, ...]
 
 
+@dataclass(frozen=True)
+class TargetBackup:
+    descriptor: int
+    sha256: str
+    workspace_name: str
+    workspace_identity: tuple[int, int]
+    original_identity: tuple[int, int]
+
+
 def _quote_identifier(identifier: str) -> str:
     # Callers pass only names accepted by _IDENTIFIER.
     return f'"{identifier}"'
@@ -672,31 +681,6 @@ def _identity(value: os.stat_result) -> tuple[int, int]:
 def _close_best_effort(descriptor: int | None) -> None:
     if descriptor is None or descriptor < 0:
         return
-
-    try:
-        retained_stat = os.fstat(descriptor)
-    except OSError:
-        retained_stat = None
-
-    try:
-        os.close(descriptor)
-        return
-    except OSError:
-        pass
-
-    # A test seam or an interrupted close can fail before releasing the FD.
-    # Retry only while fstat proves that the numeric FD still identifies the
-    # same object; never risk closing a descriptor that has been reused.
-    if retained_stat is None:
-        return
-    try:
-        current_stat = os.fstat(descriptor)
-    except OSError:
-        return
-    if _identity(current_stat) != _identity(retained_stat) or stat.S_IFMT(
-        current_stat.st_mode
-    ) != stat.S_IFMT(retained_stat.st_mode):
-        return
     try:
         os.close(descriptor)
     except OSError:
@@ -848,6 +832,114 @@ def _sha256_descriptor(descriptor: int) -> str:
     return digest.hexdigest()
 
 
+def _copy_descriptor_contents(
+    source_descriptor: int, destination_descriptor: int
+) -> str:
+    digest = sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(source_descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_descriptor, view)
+            if written <= 0:
+                raise LoadError("descriptor snapshot write was incomplete")
+            view = view[written:]
+        offset += len(chunk)
+
+
+def _create_read_only_workspace_copy(
+    source_descriptor: int,
+    workspace_descriptor: int,
+    name: str,
+    known_entries: dict[str, tuple[int, int]],
+    *,
+    expected_hash: str | None,
+    error_message: str,
+) -> tuple[int, tuple[int, int], str]:
+    if Path(name).name != name:
+        raise LoadError(error_message)
+    writable_descriptor: int | None = None
+    retained_descriptor: int | None = None
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        writable_descriptor = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=workspace_descriptor,
+        )
+        created_stat = _register_created_entry(
+            writable_descriptor,
+            name,
+            known_entries,
+        )
+        created_identity = _identity(created_stat)
+        _validate_regular_descriptor_entry(
+            writable_descriptor,
+            workspace_descriptor,
+            name,
+            error_message=error_message,
+        )
+        copied_hash = _copy_descriptor_contents(
+            source_descriptor,
+            writable_descriptor,
+        )
+        os.fsync(writable_descriptor)
+        os.fchmod(writable_descriptor, 0o400)
+        os.fsync(writable_descriptor)
+        readonly_stat = _validate_regular_descriptor_entry(
+            writable_descriptor,
+            workspace_descriptor,
+            name,
+            error_message=error_message,
+        )
+        if (
+            _identity(readonly_stat) != created_identity
+            or stat.S_IMODE(readonly_stat.st_mode) != 0o400
+        ):
+            raise LoadError(error_message)
+
+        read_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        retained_descriptor = os.open(
+            name,
+            read_flags,
+            dir_fd=workspace_descriptor,
+        )
+        retained_stat = _validate_regular_descriptor_entry(
+            retained_descriptor,
+            workspace_descriptor,
+            name,
+            error_message=error_message,
+        )
+        if _identity(retained_stat) != created_identity:
+            raise LoadError(error_message)
+        retained_hash = _sha256_descriptor(retained_descriptor)
+        if retained_hash != copied_hash or (
+            expected_hash is not None and retained_hash != expected_hash
+        ):
+            raise LoadError(error_message)
+        result = retained_descriptor
+        retained_descriptor = None
+        return result, created_identity, retained_hash
+    except OSError as exc:
+        raise LoadError(error_message) from exc
+    finally:
+        _close_best_effort(writable_descriptor)
+        _close_best_effort(retained_descriptor)
+
+
 def _link_no_follow(
     source_name: str,
     destination_name: str,
@@ -975,6 +1067,34 @@ def _validate_existing_receipt(
         )
     finally:
         _close_best_effort(descriptor)
+
+
+def _validate_published_receipt(
+    *,
+    uses_retained_inode: bool,
+    retained_descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    receipt_bytes: bytes,
+    error_message: str,
+) -> None:
+    if uses_retained_inode:
+        _validate_retained_receipt(
+            retained_descriptor,
+            directory_descriptor,
+            name,
+            receipt_bytes,
+            error_message=error_message,
+        )
+        return
+    try:
+        _validate_existing_receipt(
+            directory_descriptor,
+            name,
+            receipt_bytes,
+        )
+    except LoadError as exc:
+        raise LoadError(error_message) from exc
 
 
 def _create_private_workspace(
@@ -1228,6 +1348,226 @@ def _snapshot_inventory(
     )
 
 
+def _create_database_path_fence(
+    path: Path,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> tuple[Path, int, tuple[int, int]]:
+    fence_name: str | None = None
+    fence_identity: tuple[int, int] | None = None
+    for _ in range(128):
+        candidate = f".database-{secrets.token_hex(16)}.fence"
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=workspace_descriptor)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise LoadError("could not create private database path fence") from exc
+        fence_name = candidate
+        try:
+            created_stat = os.stat(
+                fence_name,
+                dir_fd=workspace_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise LoadError(
+                "private database path fence could not be retained"
+            ) from exc
+        if not stat.S_ISDIR(created_stat.st_mode):
+            raise LoadError("private database path fence is not a directory")
+        fence_identity = _identity(created_stat)
+        known_entries[fence_name] = fence_identity
+        break
+    if fence_name is None or fence_identity is None:
+        raise LoadError("could not allocate private database path fence")
+
+    fence_path = path.parent / fence_name
+    fence_descriptor: int | None = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fence_descriptor = os.open(
+            fence_name,
+            flags,
+            dir_fd=workspace_descriptor,
+        )
+        os.fchmod(fence_descriptor, 0o700)
+        descriptor_stat = _validate_directory_descriptor_entry(
+            fence_descriptor,
+            workspace_descriptor,
+            fence_name,
+            required_mode=0o700,
+            error_message="private database path fence changed during creation",
+        )
+        if _identity(descriptor_stat) != fence_identity:
+            raise LoadError("private database path fence changed during creation")
+        _validate_directory_descriptor_path(
+            fence_descriptor,
+            fence_path,
+            required_mode=0o700,
+            error_message="private database path fence is not pathname-bound",
+        )
+        return fence_path, fence_descriptor, fence_identity
+    except Exception:
+        if fence_descriptor is not None:
+            _remove_private_workspace(
+                fence_path,
+                descriptor=fence_descriptor,
+                expected_identity=fence_identity,
+                known_entries={},
+                parent_descriptor=workspace_descriptor,
+            )
+        elif fence_identity is not None:
+            try:
+                entry_stat = os.stat(
+                    fence_name,
+                    dir_fd=workspace_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISDIR(entry_stat.st_mode)
+                    and _identity(entry_stat) == fence_identity
+                ):
+                    os.rmdir(fence_name, dir_fd=workspace_descriptor)
+            except OSError:
+                pass
+        try:
+            os.stat(
+                fence_name,
+                dir_fd=workspace_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            known_entries.pop(fence_name, None)
+        except OSError:
+            pass
+        _close_best_effort(fence_descriptor)
+        raise
+
+
+def _register_expected_database_entry_best_effort(
+    directory_descriptor: int,
+    name: str,
+    known_entries: dict[str, tuple[int, int]],
+) -> None:
+    if name in known_entries:
+        return
+    descriptor: int | None = None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+        descriptor_stat = _validate_regular_descriptor_entry(
+            descriptor,
+            directory_descriptor,
+            name,
+            error_message="database fence entry is not the opened regular file",
+        )
+        known_entries[name] = _identity(descriptor_stat)
+    except (LoadError, OSError):
+        pass
+    finally:
+        _close_best_effort(descriptor)
+
+
+def _remove_database_path_fence_best_effort(
+    fence_path: Path | None,
+    *,
+    fence_descriptor: int | None,
+    fence_identity: tuple[int, int] | None,
+    fence_entries: dict[str, tuple[int, int]],
+    workspace_descriptor: int,
+    workspace_entries: dict[str, tuple[int, int]],
+) -> None:
+    if fence_path is None:
+        return
+    _remove_private_workspace(
+        fence_path,
+        descriptor=fence_descriptor,
+        expected_identity=fence_identity,
+        known_entries=fence_entries,
+        parent_descriptor=workspace_descriptor,
+    )
+    try:
+        os.stat(
+            fence_path.name,
+            dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        workspace_entries.pop(fence_path.name, None)
+    except OSError:
+        pass
+
+
+def _promote_built_database_from_fence(
+    path: Path,
+    database_descriptor: int,
+    fence_descriptor: int,
+    fence_entries: dict[str, tuple[int, int]],
+    workspace_descriptor: int,
+    workspace_entries: dict[str, tuple[int, int]],
+) -> None:
+    database_stat = _validate_regular_descriptor_entry(
+        database_descriptor,
+        fence_descriptor,
+        path.name,
+        error_message="database entry changed before leaving the path fence",
+    )
+    database_identity = _identity(database_stat)
+    try:
+        os.stat(
+            path.name,
+            dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise LoadError(
+            "private database publication path could not be inspected"
+        ) from exc
+    else:
+        raise LoadError("private database publication path already exists")
+    if _HARD_LINK not in getattr(os, "supports_follow_symlinks", ()):
+        raise LoadError("secure database path-fence publication is not supported")
+
+    # Record only the retained inode as cleanup-owned before the atomic
+    # create-if-absent link. A competing entry with any other identity leaks.
+    workspace_entries[path.name] = database_identity
+    try:
+        _HARD_LINK(
+            path.name,
+            path.name,
+            src_dir_fd=fence_descriptor,
+            dst_dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise LoadError("database could not leave the private path fence") from exc
+    _validate_regular_descriptor_entry(
+        database_descriptor,
+        workspace_descriptor,
+        path.name,
+        error_message="promoted database is not the retained regular file",
+    )
+    _validate_regular_descriptor_entry(
+        database_descriptor,
+        fence_descriptor,
+        path.name,
+        error_message="database path-fence entry changed during promotion",
+    )
+    try:
+        os.unlink(path.name, dir_fd=fence_descriptor)
+    except OSError as exc:
+        raise LoadError("database path-fence entry could not be released") from exc
+    fence_entries.pop(path.name, None)
+
+
 def _build_database(
     path: Path,
     inventory: SourceInventory,
@@ -1266,17 +1606,58 @@ def _build_database(
         if _sha256_descriptor(descriptor) != table.source_file_sha256:
             raise LoadError(f"verified source snapshot changed: {table.name}")
 
+    fence_path: Path | None = None
+    fence_descriptor: int | None = None
+    fence_identity: tuple[int, int] | None = None
+    fence_entries: dict[str, tuple[int, int]] = {}
     connection: duckdb.DuckDBPyConnection | None = None
     database_descriptor: int | None = None
     transaction_open = False
+    path_authority_confirmed = False
     try:
+        fence_path, fence_descriptor, fence_identity = _create_database_path_fence(
+            path,
+            workspace_descriptor,
+            known_entries,
+        )
+        database_path = fence_path / path.name
+        _validate_directory_descriptor_path(
+            workspace_descriptor,
+            path.parent,
+            required_mode=0o700,
+            error_message="database workspace changed before DuckDB connect",
+        )
+        _validate_directory_descriptor_path(
+            fence_descriptor,
+            fence_path,
+            required_mode=0o700,
+            error_message="database path fence changed before DuckDB connect",
+        )
         try:
-            connection = duckdb.connect(str(path))
+            connection = duckdb.connect(str(database_path))
+            try:
+                _validate_directory_descriptor_path(
+                    workspace_descriptor,
+                    path.parent,
+                    required_mode=0o700,
+                    error_message="database workspace changed during DuckDB connect",
+                )
+                _validate_directory_descriptor_path(
+                    fence_descriptor,
+                    fence_path,
+                    required_mode=0o700,
+                    error_message="database path fence changed during DuckDB connect",
+                )
+            except Exception:
+                connection.close()
+                connection = None
+                raise
+            path_authority_confirmed = True
             database_descriptor, _ = _open_regular_directory_entry(
-                workspace_descriptor,
+                fence_descriptor,
                 path.name,
                 error_message="database entry is not the opened regular file",
-                known_entries=known_entries,
+                known_entries=fence_entries,
             )
             connection.execute("BEGIN TRANSACTION")
             transaction_open = True
@@ -1329,20 +1710,76 @@ def _build_database(
         finally:
             if connection is not None:
                 connection.close()
+                connection = None
 
         if database_descriptor is None:
             raise LoadError("database descriptor was not retained")
+        _validate_directory_descriptor_path(
+            workspace_descriptor,
+            path.parent,
+            required_mode=0o700,
+            error_message="database workspace changed before DuckDB publication",
+        )
+        _validate_directory_descriptor_path(
+            fence_descriptor,
+            fence_path,
+            required_mode=0o700,
+            error_message="database path fence changed before DuckDB publication",
+        )
         _validate_regular_descriptor_entry(
             database_descriptor,
-            workspace_descriptor,
+            fence_descriptor,
             path.name,
             error_message="database entry changed when DuckDB closed",
         )
+        wal_name = f"{path.name}.wal"
+        try:
+            os.stat(
+                wal_name,
+                dir_fd=fence_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise LoadError("database WAL could not be inspected after close") from exc
+        else:
+            _register_expected_database_entry_best_effort(
+                fence_descriptor,
+                wal_name,
+                fence_entries,
+            )
+            raise LoadError("database WAL remained after DuckDB closed")
+
+        _promote_built_database_from_fence(
+            path,
+            database_descriptor,
+            fence_descriptor,
+            fence_entries,
+            workspace_descriptor,
+            known_entries,
+        )
         return database_descriptor
     except Exception:
-        if database_descriptor is not None:
-            os.close(database_descriptor)
+        _close_best_effort(database_descriptor)
         raise
+    finally:
+        if path_authority_confirmed and fence_descriptor is not None:
+            for expected_name in (path.name, f"{path.name}.wal"):
+                _register_expected_database_entry_best_effort(
+                    fence_descriptor,
+                    expected_name,
+                    fence_entries,
+                )
+        _remove_database_path_fence_best_effort(
+            fence_path,
+            fence_descriptor=fence_descriptor,
+            fence_identity=fence_identity,
+            fence_entries=fence_entries,
+            workspace_descriptor=workspace_descriptor,
+            workspace_entries=known_entries,
+        )
+        _close_best_effort(fence_descriptor)
 
 
 def _write_receipt_temp(
@@ -1463,7 +1900,7 @@ def _prepare_existing_target_backup(
     target_name: str,
     workspace_descriptor: int,
     known_entries: dict[str, tuple[int, int]],
-) -> tuple[int, str, str] | None:
+) -> TargetBackup | None:
     try:
         target_stat = os.stat(
             target_name,
@@ -1478,47 +1915,60 @@ def _prepare_existing_target_backup(
         raise LoadError("existing database target is not a regular file")
 
     target_descriptor: int | None = None
+    backup_descriptor: int | None = None
     try:
         target_descriptor, target_stat = _open_regular_directory_entry(
             target_parent_descriptor,
             target_name,
             error_message="existing database target changed while opening",
         )
-        target_hash = _sha256_descriptor(target_descriptor)
+        original_identity = _identity(target_stat)
+        target_hash_before = _sha256_descriptor(target_descriptor)
         backup_name = "previous-target.duckdb"
-        # Register the expected identity before linking. A failed or hostile
-        # link cannot make cleanup remove an entry with any other identity.
-        known_entries[backup_name] = _identity(target_stat)
-        link_arguments: dict[str, Any] = {
-            "src_dir_fd": target_parent_descriptor,
-            "dst_dir_fd": workspace_descriptor,
-        }
-        if _HARD_LINK in getattr(os, "supports_follow_symlinks", ()):
-            link_arguments["follow_symlinks"] = False
-        try:
-            _HARD_LINK(target_name, backup_name, **link_arguments)
-        except OSError as exc:
-            raise LoadError("existing database target could not be backed up") from exc
-
-        _validate_regular_descriptor_entry(
+        (
+            backup_descriptor,
+            backup_identity,
+            copied_hash,
+        ) = _create_read_only_workspace_copy(
             target_descriptor,
             workspace_descriptor,
             backup_name,
-            error_message="database backup is not the retained target inode",
+            known_entries,
+            expected_hash=target_hash_before,
+            error_message="existing database target could not be snapshotted",
         )
         _validate_regular_descriptor_entry(
             target_descriptor,
             target_parent_descriptor,
             target_name,
-            error_message="existing database target changed during backup",
+            error_message="existing database target changed during snapshot",
         )
-        if _sha256_descriptor(target_descriptor) != target_hash:
-            raise LoadError("existing database target changed during backup")
-        return target_descriptor, target_hash, backup_name
-    except Exception:
-        if target_descriptor is not None:
-            os.close(target_descriptor)
-        raise
+        target_hash_after = _sha256_descriptor(target_descriptor)
+        _validate_regular_descriptor_entry(
+            target_descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="existing database target changed during snapshot",
+        )
+        if not (
+            target_hash_before == copied_hash == target_hash_after
+            and _identity(os.fstat(target_descriptor)) == original_identity
+        ):
+            raise LoadError("existing database target changed during snapshot")
+        result = TargetBackup(
+            descriptor=backup_descriptor,
+            sha256=copied_hash,
+            workspace_name=backup_name,
+            workspace_identity=backup_identity,
+            original_identity=original_identity,
+        )
+        backup_descriptor = None
+        return result
+    except OSError as exc:
+        raise LoadError("existing database target could not be snapshotted") from exc
+    finally:
+        _close_best_effort(target_descriptor)
+        _close_best_effort(backup_descriptor)
 
 
 def _entry_matches_retained_file(
@@ -1539,17 +1989,116 @@ def _entry_matches_retained_file(
         return False
 
 
+def _target_matches_original_backup(
+    target_parent_descriptor: int,
+    target_name: str,
+    backup: TargetBackup,
+) -> bool:
+    descriptor: int | None = None
+    try:
+        descriptor, descriptor_stat = _open_regular_directory_entry(
+            target_parent_descriptor,
+            target_name,
+            error_message="database target is not the opened regular file",
+        )
+        if _identity(descriptor_stat) != backup.original_identity:
+            return False
+        if _sha256_descriptor(descriptor) != backup.sha256:
+            return False
+        descriptor_stat = _validate_regular_descriptor_entry(
+            descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="database target changed while validating",
+        )
+        return _identity(descriptor_stat) == backup.original_identity
+    except (LoadError, OSError):
+        return False
+    finally:
+        _close_best_effort(descriptor)
+
+
+def _validate_target_before_publication(
+    target_parent_descriptor: int,
+    target_name: str,
+    backup: TargetBackup | None,
+) -> None:
+    if backup is None:
+        try:
+            os.stat(
+                target_name,
+                dir_fd=target_parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise LoadError("database target could not be revalidated") from exc
+        raise LoadError("database target appeared before publication")
+
+    descriptor: int | None = None
+    try:
+        descriptor, descriptor_stat = _open_regular_directory_entry(
+            target_parent_descriptor,
+            target_name,
+            error_message="existing database target changed before publication",
+        )
+        if _identity(descriptor_stat) != backup.original_identity:
+            raise LoadError("existing database target changed before publication")
+        if _sha256_descriptor(descriptor) != backup.sha256:
+            raise LoadError("existing database target changed before publication")
+        descriptor_stat = _validate_regular_descriptor_entry(
+            descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="existing database target changed before publication",
+        )
+        if _identity(descriptor_stat) != backup.original_identity:
+            raise LoadError("existing database target changed before publication")
+    finally:
+        _close_best_effort(descriptor)
+
+
+def _create_target_restore_candidate(
+    backup: TargetBackup,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> tuple[int, str]:
+    if _sha256_descriptor(backup.descriptor) != backup.sha256:
+        raise LoadError("retained previous database snapshot changed")
+    candidate_name = f"restore-target-{secrets.token_hex(16)}.duckdb"
+    candidate_descriptor, _candidate_identity, candidate_hash = (
+        _create_read_only_workspace_copy(
+            backup.descriptor,
+            workspace_descriptor,
+            candidate_name,
+            known_entries,
+            expected_hash=backup.sha256,
+            error_message="previous database restore candidate could not be created",
+        )
+    )
+    try:
+        if (
+            candidate_hash != backup.sha256
+            or _sha256_descriptor(backup.descriptor) != backup.sha256
+        ):
+            raise LoadError("retained previous database snapshot changed")
+        return candidate_descriptor, candidate_name
+    except Exception:
+        _close_best_effort(candidate_descriptor)
+        raise
+
+
 def _restore_target_after_publication_failure(
     *,
     target_parent_descriptor: int,
     target_name: str,
     workspace_descriptor: int,
     database_descriptor: int,
-    previous_target_descriptor: int | None,
-    previous_target_hash: str | None,
-    backup_name: str | None,
+    target_backup: TargetBackup | None,
+    known_entries: dict[str, tuple[int, int]],
 ) -> None:
-    if previous_target_descriptor is None:
+    if target_backup is None:
         if not _entry_matches_retained_file(
             database_descriptor,
             target_parent_descriptor,
@@ -1564,59 +2113,75 @@ def _restore_target_after_publication_failure(
             ) from exc
         return
 
-    if previous_target_hash is None or backup_name is None:
-        raise LoadError("previous database recovery state is incomplete")
-    if _entry_matches_retained_file(
-        previous_target_descriptor,
+    if _target_matches_original_backup(
         target_parent_descriptor,
         target_name,
-        previous_target_hash,
+        target_backup,
     ):
         return
 
-    _validate_regular_descriptor_entry(
-        previous_target_descriptor,
-        workspace_descriptor,
-        backup_name,
-        error_message="previous database backup changed before restoration",
-    )
+    restore_descriptor: int | None = None
     try:
-        os.replace(
-            backup_name,
-            target_name,
-            src_dir_fd=workspace_descriptor,
-            dst_dir_fd=target_parent_descriptor,
+        restore_descriptor, restore_name = _create_target_restore_candidate(
+            target_backup,
+            workspace_descriptor,
+            known_entries,
         )
-    except OSError as exc:
-        raise LoadError("failed to restore previous database target") from exc
-    _validate_regular_descriptor_entry(
-        previous_target_descriptor,
-        target_parent_descriptor,
-        target_name,
-        error_message="restored database is not the retained previous target",
-    )
-    if _sha256_descriptor(previous_target_descriptor) != previous_target_hash:
-        raise LoadError("restored database hash does not match the previous target")
+        _validate_regular_descriptor_entry(
+            restore_descriptor,
+            workspace_descriptor,
+            restore_name,
+            error_message="previous database restore candidate changed",
+        )
+        try:
+            os.replace(
+                restore_name,
+                target_name,
+                src_dir_fd=workspace_descriptor,
+                dst_dir_fd=target_parent_descriptor,
+            )
+        except OSError as exc:
+            raise LoadError("failed to restore previous database target") from exc
+        _validate_regular_descriptor_entry(
+            restore_descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="restored database is not the retained restore candidate",
+        )
+        if _sha256_descriptor(restore_descriptor) != target_backup.sha256:
+            raise LoadError("restored database hash does not match the previous target")
+        _validate_regular_descriptor_entry(
+            restore_descriptor,
+            target_parent_descriptor,
+            target_name,
+            error_message="restored database identity changed after restoration",
+        )
+    finally:
+        _close_best_effort(restore_descriptor)
 
 
 def _discard_target_backup_best_effort(
-    previous_target_descriptor: int | None,
+    target_backup: TargetBackup | None,
     workspace_descriptor: int,
-    backup_name: str | None,
 ) -> None:
-    if previous_target_descriptor is None or backup_name is None:
+    if target_backup is None:
         return
     try:
-        _validate_regular_descriptor_entry(
-            previous_target_descriptor,
+        backup_stat = _validate_regular_descriptor_entry(
+            target_backup.descriptor,
             workspace_descriptor,
-            backup_name,
+            target_backup.workspace_name,
             error_message="database backup changed before cleanup",
         )
-        os.unlink(backup_name, dir_fd=workspace_descriptor)
+        if (
+            _identity(backup_stat) != target_backup.workspace_identity
+            or _sha256_descriptor(target_backup.descriptor) != target_backup.sha256
+        ):
+            return
+        os.unlink(target_backup.workspace_name, dir_fd=workspace_descriptor)
     except (LoadError, OSError):
-        # Publication already succeeded. Never turn a conservative cleanup
-        # leak into a reported failure after mutating the caller's target.
+        # Keep the retained descriptor as rollback authority. Unknown entries
+        # are never removed merely because they occupy the backup name.
         pass
 
 
@@ -1644,9 +2209,7 @@ def load_csvs(
 
     target_parent_descriptor: int | None = None
     receipt_parent_descriptor: int | None = None
-    previous_target_descriptor: int | None = None
-    previous_target_hash: str | None = None
-    backup_name: str | None = None
+    target_backup: TargetBackup | None = None
     workspace: Path | None = None
     workspace_descriptor: int | None = None
     workspace_identity: tuple[int, int] | None = None
@@ -1792,32 +2355,20 @@ def load_csvs(
             receipts,
             error_message="receipt directory changed after publication",
         )
-        if receipt_uses_retained_inode:
-            _validate_retained_receipt(
-                receipt_descriptor,
-                receipt_parent_descriptor,
-                receipt_name,
-                receipt_bytes,
-                error_message="published receipt content changed",
-            )
-        else:
-            _validate_existing_receipt(
-                receipt_parent_descriptor,
-                receipt_name,
-                receipt_bytes,
-            )
-        previous_target = _prepare_existing_target_backup(
+        _validate_published_receipt(
+            uses_retained_inode=receipt_uses_retained_inode,
+            retained_descriptor=receipt_descriptor,
+            directory_descriptor=receipt_parent_descriptor,
+            name=receipt_name,
+            receipt_bytes=receipt_bytes,
+            error_message="published receipt content changed",
+        )
+        target_backup = _prepare_existing_target_backup(
             target_parent_descriptor,
             target.name,
             workspace_descriptor,
             workspace_entries,
         )
-        if previous_target is not None:
-            (
-                previous_target_descriptor,
-                previous_target_hash,
-                backup_name,
-            ) = previous_target
 
         try:
             _validate_csv_file_set(
@@ -1836,11 +2387,29 @@ def load_csvs(
                 database_temp.name,
                 error_message="database entry changed before publication",
             )
+            _validate_published_receipt(
+                uses_retained_inode=receipt_uses_retained_inode,
+                retained_descriptor=receipt_descriptor,
+                directory_descriptor=receipt_parent_descriptor,
+                name=receipt_name,
+                receipt_bytes=receipt_bytes,
+                error_message="published receipt content changed before database publication",
+            )
+            _validate_target_before_publication(
+                target_parent_descriptor,
+                target.name,
+                target_backup,
+            )
             os.replace(
                 database_temp.name,
                 target.name,
                 src_dir_fd=workspace_descriptor,
                 dst_dir_fd=target_parent_descriptor,
+            )
+            _validate_csv_file_set(
+                source_root,
+                expected_csv_names,
+                len(inventory.tables),
             )
             _validate_regular_descriptor_entry(
                 database_descriptor,
@@ -1850,24 +2419,35 @@ def load_csvs(
             )
             if _sha256_descriptor(database_descriptor) != database_hash:
                 raise LoadError("published database hash changed during publication")
-            if receipt_uses_retained_inode:
-                _validate_retained_receipt(
-                    receipt_descriptor,
-                    receipt_parent_descriptor,
-                    receipt_name,
-                    receipt_bytes,
-                    error_message="published receipt content changed during publication",
-                )
-            else:
-                _validate_existing_receipt(
-                    receipt_parent_descriptor,
-                    receipt_name,
-                    receipt_bytes,
-                )
+            _validate_published_receipt(
+                uses_retained_inode=receipt_uses_retained_inode,
+                retained_descriptor=receipt_descriptor,
+                directory_descriptor=receipt_parent_descriptor,
+                name=receipt_name,
+                receipt_bytes=receipt_bytes,
+                error_message="published receipt content changed during publication",
+            )
             _validate_directory_descriptor_path(
                 receipt_parent_descriptor,
                 receipts,
                 error_message="receipt directory changed during database publication",
+            )
+            _discard_target_backup_best_effort(
+                target_backup,
+                workspace_descriptor,
+            )
+            _validate_directory_descriptor_path(
+                receipt_parent_descriptor,
+                receipts,
+                error_message="receipt directory changed at success boundary",
+            )
+            _validate_published_receipt(
+                uses_retained_inode=receipt_uses_retained_inode,
+                retained_descriptor=receipt_descriptor,
+                directory_descriptor=receipt_parent_descriptor,
+                name=receipt_name,
+                receipt_bytes=receipt_bytes,
+                error_message="published receipt content changed at success boundary",
             )
         except Exception:
             _restore_target_after_publication_failure(
@@ -1875,17 +2455,11 @@ def load_csvs(
                 target_name=target.name,
                 workspace_descriptor=workspace_descriptor,
                 database_descriptor=database_descriptor,
-                previous_target_descriptor=previous_target_descriptor,
-                previous_target_hash=previous_target_hash,
-                backup_name=backup_name,
+                target_backup=target_backup,
+                known_entries=workspace_entries,
             )
             raise
 
-        _discard_target_backup_best_effort(
-            previous_target_descriptor,
-            workspace_descriptor,
-            backup_name,
-        )
         return receipt, receipt_path
     except Exception as exc:
         if isinstance(exc, LoadError):
@@ -1912,7 +2486,9 @@ def load_csvs(
             known_entries=workspace_entries,
             parent_descriptor=target_parent_descriptor,
         )
-        _close_best_effort(previous_target_descriptor)
+        _close_best_effort(
+            target_backup.descriptor if target_backup is not None else None
+        )
         _close_best_effort(database_descriptor)
         _close_best_effort(workspace_descriptor)
         _close_best_effort(target_parent_descriptor)
