@@ -6,7 +6,7 @@ Overall status: **COMPLIANT**
 
 ## Delivered scope
 
-The five-day prototype implements catalog-only DuckDB discovery, two-stage structured semantic enrichment with credential-free fallback, a checked-in and validated OKF banking bundle, explainable in-memory retrieval, REST and Streamable HTTP MCP interfaces, and a read-only semantic graph UI.
+The original five-day baseline implemented catalog-only DuckDB discovery, two-stage structured semantic enrichment with credential-free fallback, a checked-in and validated OKF banking bundle, explainable in-memory retrieval, REST and Streamable HTTP MCP interfaces, and a read-only semantic graph UI. The current relationship-generation and governed-chat extension is recorded below.
 
 ## Compliance matrix
 
@@ -50,8 +50,14 @@ The runtime smoke test started the combined FastAPI/static UI service, received 
 
 - Live AI output is validated but is not auto-published; the reviewed golden bundle remains active.
 - Embeddings are held in memory and are rebuilt on startup when configured.
-- Authentication, tenancy, durable indexing, human approval workflows, SQL generation, and SQL execution remain out of scope.
+- Authentication, tenancy, durable indexing, and a multi-user human approval workflow remain out of scope.
 - The source database declares no PK/FK constraints, so all keys and relationships retain manifest provenance rather than being presented as discovered database facts.
+
+## 2026-09-03 extension
+
+Specification 008 extends the retrieval-only baseline with a three-stage semantic generation workflow, explicit relationship proposals, deterministic candidate compilation, validation-gated activation, and governed database chat. SQL is generated only inside the chat orchestrator, validated against the active semantic bundle, and executed through a read-only DuckDB connection with row and time limits. The original MCP retrieval tools remain SQL-free.
+
+Current verification adds 25 Python tests and 8 frontend tests, including relationship generation, provider fallback, bundle activation, SQL safety rules, an end-to-end chat orchestration test, and the chat interface. See `docs/product-tester-guide.md` for the current acceptance procedure and credentialed test cases.
 
 ## Final determination
 

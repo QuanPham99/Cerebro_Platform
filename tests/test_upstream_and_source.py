@@ -15,8 +15,8 @@ def test_pinned_upstream_metadata_and_document_contract():
     assert document.frontmatter["type"] == "concept"
 
 
-def test_duckdb_source_contract_and_counts():
-    source = DuckDBSource()
+def test_duckdb_source_contract_and_counts(bank_source_config):
+    source = DuckDBSource(bank_source_config)
     assert isinstance(source, Source)
     snapshot = source.scan()
     assert len(snapshot.tables) == 10
@@ -36,4 +36,3 @@ def test_missing_source_is_actionable(tmp_path: Path):
     config.write_text("name: missing\nversion: 1\ndatabase_path: /does/not/exist.duckdb\n")
     with pytest.raises(FileNotFoundError, match="DuckDB source not found"):
         DuckDBSource(config)
-

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import hashlib
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import duckdb
 import yaml
@@ -31,18 +34,34 @@ class DuckDBSource(Source):
 
     name = "duckdb"
 
-    def __init__(self, config_path: Path | str = DEFAULT_CONFIG):
-        self.config = load_source_config(config_path)
-        self.database_path = Path(self.config["database_path"])
+    def __init__(
+        self,
+        config_path: Path | str = DEFAULT_CONFIG,
+        database_path: Path | str | None = None,
+        *,
+        source_mode: Literal["configured", "database_only"] = "configured",
+        schema: str | None = None,
+    ):
+        self.source_mode = source_mode
+        self.config = load_source_config(config_path) if source_mode == "configured" else {}
+        environment_path = os.getenv("CEREBRO_DATABASE_PATH")
+        configured_path = database_path or (environment_path.strip() if environment_path and environment_path.strip() else None)
+        if configured_path is None and source_mode == "configured":
+            configured_path = self.config.get("database_path")
+        if configured_path is None:
+            raise FileNotFoundError("DuckDB source path is required")
+        self.database_path = Path(os.path.expandvars(str(configured_path))).expanduser()
         if not self.database_path.exists():
             raise FileNotFoundError(f"DuckDB source not found: {self.database_path}")
-        self.schema = self.config.get("schema", "main")
+        self.schema = schema or os.getenv("CEREBRO_DATABASE_SCHEMA") or self.config.get("schema", "main")
         self._snapshot: CatalogSnapshot | None = None
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self.database_path), read_only=True)
 
     def scan(self) -> CatalogSnapshot:
+        if self.source_mode == "database_only":
+            return self._scan_database_only()
         declared_tables = self.config.get("tables", {})
         classifications = self.config.get("classifications", {})
         classified = {
@@ -94,6 +113,7 @@ class DuckDBSource(Source):
             for item in self.config.get("relationships", [])
         ]
         snapshot = CatalogSnapshot(
+            source_mode="configured",
             source_name=self.config["name"],
             source_version=str(self.config["version"]),
             database_path=str(self.database_path),
@@ -105,8 +125,111 @@ class DuckDBSource(Source):
                 origin="declared",
                 source=str(self.config.get("schema_reference_path", "not configured")),
             ),
+            discovery_evidence={
+                "config_loaded": True,
+                "web_enrichment": "disabled",
+                "row_sampling": "disabled",
+                "rows_read": 0,
+                "catalog_queries": 2,
+            },
         )
         self._validate_expected(snapshot)
+        self._snapshot = snapshot
+        return snapshot
+
+    def _scan_database_only(self) -> CatalogSnapshot:
+        discovered = Provenance(origin="discovered", source="DuckDB catalog")
+        with self._connect() as connection:
+            table_rows = connection.execute(
+                "SELECT table_name, coalesce(comment, '') FROM duckdb_tables() "
+                "WHERE schema_name = ? AND NOT internal AND NOT temporary ORDER BY table_name",
+                [self.schema],
+            ).fetchall()
+            column_rows = connection.execute(
+                "SELECT table_name, column_name, data_type, is_nullable, coalesce(comment, '') "
+                "FROM duckdb_columns() WHERE schema_name = ? AND NOT internal "
+                "ORDER BY table_name, column_index",
+                [self.schema],
+            ).fetchall()
+            constraint_rows = connection.execute(
+                "SELECT table_name, constraint_type, constraint_column_names, referenced_table, "
+                "referenced_column_names, constraint_name FROM duckdb_constraints() "
+                "WHERE schema_name = ? ORDER BY table_name, constraint_index",
+                [self.schema],
+            ).fetchall()
+
+        columns_by_table: dict[str, list[ColumnFact]] = {name: [] for name, _ in table_rows}
+        for table_name, name, data_type, nullable, comment in column_rows:
+            if table_name in columns_by_table:
+                columns_by_table[table_name].append(
+                    ColumnFact(
+                        name=name,
+                        data_type=data_type,
+                        nullable=bool(nullable),
+                        description=comment or "",
+                        provenance=discovered,
+                    )
+                )
+        primary_keys: dict[str, str] = {}
+        relationships: list[RelationshipFact] = []
+        for table_name, constraint_type, columns, referenced_table, referenced_columns, constraint_name in constraint_rows:
+            columns = list(columns or [])
+            referenced_columns = list(referenced_columns or [])
+            if constraint_type == "PRIMARY KEY" and len(columns) == 1:
+                primary_keys[table_name] = columns[0]
+            elif constraint_type == "FOREIGN KEY" and len(columns) == 1 and len(referenced_columns) == 1 and referenced_table:
+                relationships.append(
+                    RelationshipFact(
+                        id=str(constraint_name or f"fk_{table_name}_{columns[0]}_{referenced_table}_{referenced_columns[0]}"),
+                        source_table=table_name,
+                        source_column=columns[0],
+                        target_table=referenced_table,
+                        target_column=referenced_columns[0],
+                        cardinality="many-to-one",
+                        provenance=discovered,
+                    )
+                )
+        tables = [
+            TableFact(
+                name=name,
+                schema_name=self.schema,
+                description=comment or "",
+                primary_key=primary_keys.get(name),
+                columns=columns_by_table[name],
+                provenance={"catalog": discovered},
+            )
+            for name, comment in table_rows
+        ]
+        catalog_payload = {
+            "schema_name": self.schema,
+            "tables": [table.model_dump(mode="json") for table in tables],
+            "relationships": [item.model_dump(mode="json") for item in relationships],
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(catalog_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        snapshot = CatalogSnapshot(
+            source_mode="database_only",
+            source_name=self.database_path.stem,
+            source_version=fingerprint[:16],
+            database_path=str(self.database_path),
+            schema_name=self.schema,
+            tables=tables,
+            relationships=relationships,
+            rules=[],
+            schema_reference=discovered,
+            discovery_evidence={
+                "config_loaded": False,
+                "web_enrichment": "disabled",
+                "row_sampling": "disabled",
+                "rows_read": 0,
+                "catalog_queries": 3,
+                "native_comments": sum(bool(table.description) for table in tables)
+                + sum(bool(column.description) for table in tables for column in table.columns),
+                "primary_keys": len(primary_keys),
+                "foreign_keys": len(relationships),
+            },
+        )
         self._snapshot = snapshot
         return snapshot
 
@@ -148,5 +271,5 @@ class DuckDBSource(Source):
 
     def sample_rows(self, ref: ConceptRef, n: int = 5) -> None:
         raise SamplingDisabledError(
-            f"Row sampling is disabled for source {self.config['name']} ({ref.id_str})"
+            f"Row sampling is disabled for source {self.config.get('name', self.database_path.stem)} ({ref.id_str})"
         )

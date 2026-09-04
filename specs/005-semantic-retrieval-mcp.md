@@ -10,9 +10,9 @@ Retrieve relevant OKF objects using lexical/vector fusion and graph expansion, t
 
 ## Non-Goals
 
-- SQL generation or execution.
+- SQL generation or execution within this retrieval subsystem; the separately gated consumer is specified in 008.
 - Persistent vector infrastructure.
-- Conversation memory or autonomous planning.
+- Conversation memory or autonomous planning within the retriever; bounded client history and orchestration are specified in 008.
 
 ## Functional Requirements
 
@@ -23,6 +23,8 @@ Retrieve relevant OKF objects using lexical/vector fusion and graph expansion, t
 - FR-405: Serve active bundle, graph, concept detail, and search HTTP endpoints.
 - FR-406: Expose MCP tools `retrieve_grounding`, `get_concept`, and `expand_neighborhood` over local Streamable HTTP.
 - FR-407: Grounding includes semantic version, mode, concepts, tables, columns, joins, grain, metrics, filters, warnings, classifications, provenance, and ranking evidence.
+- FR-408: The graph emits one canonical directional edge for each semantic contract: concept maps to table, metric depends on table, policy applies to table, dataset contains table, and physical relationships point from source table to target table. Reverse table back-references and duplicate generic relationship edges are omitted.
+- FR-409: The graph viewer distinguishes concept, metric, policy, physical, and relationship-endpoint edges by source-aligned color, line pattern, arrow presence, and a direction-explicit legend. Human-readable edge labels appear on hover, tap, or focused neighborhoods.
 
 ## Acceptance Criteria
 
@@ -31,10 +33,12 @@ Retrieve relevant OKF objects using lexical/vector fusion and graph expansion, t
 - AC-403: Missing embeddings never prevent server startup.
 - AC-404: MCP tool responses validate against the same schemas as HTTP responses.
 - AC-405: Unknown IDs and malformed parameters return typed errors.
+- AC-406: Active and candidate graph responses contain the same canonical edge directions and no reverse duplicates.
+- AC-407: Concept, metric, policy, and physical edges have visible target arrows; relationship endpoint edges remain arrowless.
 
 ## Edge Cases
 
-- Empty query, disconnected graph, duplicate scores, zero vector norm, and restricted concepts.
+- Empty query, disconnected graph, duplicate/reverse edges, zero vector norm, and restricted concepts.
 
 ## Interfaces / Contracts
 
@@ -60,3 +64,5 @@ Production identity and tenant isolation are deferred.
 | T-402 | FR-405 | API tests success, filtering, and typed errors. |
 | T-403 | FR-406, FR-407 | MCP client invokes all three tools and validates output. |
 | T-404 | AC-402 | Golden-question evaluation asserts required top-10 IDs. |
+| T-405 | FR-408, AC-406 | Assert exact source, target, type, and label for every canonical edge family and absence of reverse duplicates. |
+| T-406 | FR-409, AC-407 | Assert typed Cytoscape styles, focused/hovered labels, and direction-explicit legend content. |
