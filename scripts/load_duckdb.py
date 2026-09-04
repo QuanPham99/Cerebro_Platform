@@ -1766,16 +1766,14 @@ def _build_database(
     database_descriptor: int | None = None
     transaction_open = False
     path_authority_confirmed = False
-    foreign_owner_revoked = False
 
     def require_database_lock_state(descriptor: int, expected: str) -> None:
-        nonlocal path_authority_confirmed, foreign_owner_revoked
+        nonlocal path_authority_confirmed
         try:
             _require_database_lock_state(descriptor, expected)
         except _DatabaseLockOwnershipMismatch:
             fence_entries.pop(path.name, None)
             path_authority_confirmed = False
-            foreign_owner_revoked = True
             raise
 
     try:
@@ -2000,33 +1998,6 @@ def _build_database(
         )
         return database_descriptor
     except Exception:
-        if (
-            foreign_owner_revoked
-            and database_descriptor is not None
-            and fence_descriptor is not None
-        ):
-            try:
-                recovered_stat = _validate_regular_descriptor_entry(
-                    database_descriptor,
-                    fence_descriptor,
-                    path.name,
-                    error_message="foreign-owned database entry changed before cleanup",
-                )
-                require_database_lock_state(database_descriptor, "acquired")
-                recovered_stat = _validate_regular_descriptor_entry(
-                    database_descriptor,
-                    fence_descriptor,
-                    path.name,
-                    error_message="foreign-owned database entry changed before cleanup",
-                )
-            except _DatabaseLockOwnershipMismatch:
-                pass
-            except (LoadError, OSError):
-                pass
-            else:
-                fence_entries[path.name] = _identity(recovered_stat)
-                path_authority_confirmed = True
-                foreign_owner_revoked = False
         _close_best_effort(database_descriptor)
         raise
     finally:
@@ -2235,6 +2206,54 @@ def _prepare_existing_target_backup(
     finally:
         _close_best_effort(target_descriptor)
         _close_best_effort(backup_descriptor)
+
+
+def _validate_named_target_backup(
+    target_backup: TargetBackup,
+    workspace_descriptor: int,
+) -> None:
+    backup_stat = _validate_regular_descriptor_entry(
+        target_backup.descriptor,
+        workspace_descriptor,
+        target_backup.workspace_name,
+        error_message="database backup is not the retained regular file",
+    )
+    if (
+        _identity(backup_stat) != target_backup.workspace_identity
+        or stat.S_IMODE(backup_stat.st_mode) != 0o400
+    ):
+        raise LoadError("database backup identity or mode changed")
+    if _sha256_descriptor(target_backup.descriptor) != target_backup.sha256:
+        raise LoadError("database backup hash changed")
+    backup_stat = _validate_regular_descriptor_entry(
+        target_backup.descriptor,
+        workspace_descriptor,
+        target_backup.workspace_name,
+        error_message="database backup changed while validating",
+    )
+    if (
+        _identity(backup_stat) != target_backup.workspace_identity
+        or stat.S_IMODE(backup_stat.st_mode) != 0o400
+    ):
+        raise LoadError("database backup identity or mode changed")
+
+
+def _revoke_target_backup_cleanup_authority(
+    target_backup: TargetBackup,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> None:
+    _validate_named_target_backup(target_backup, workspace_descriptor)
+    known_entries.pop(target_backup.workspace_name, None)
+
+
+def _authorize_target_backup_cleanup(
+    target_backup: TargetBackup,
+    workspace_descriptor: int,
+    known_entries: dict[str, tuple[int, int]],
+) -> None:
+    _validate_named_target_backup(target_backup, workspace_descriptor)
+    known_entries[target_backup.workspace_name] = target_backup.workspace_identity
 
 
 def _entry_matches_retained_file(
@@ -2669,23 +2688,27 @@ def _preserve_target_restore_candidate(
                 "previous database recovery artifact could not be preserved"
             ) from None
         artifact_linked = True
-        _validate_regular_descriptor_entry(
+        artifact_stat = _validate_regular_descriptor_entry(
             restore_descriptor,
             preservation_descriptor,
             artifact_name,
             error_message="previous database recovery artifact is not retained",
         )
+        if stat.S_IMODE(artifact_stat.st_mode) != 0o400:
+            raise LoadError("previous database recovery artifact is not mode 0400")
         if (
             _sha256_descriptor(restore_descriptor) != target_backup.sha256
             or _sha256_descriptor(target_backup.descriptor) != target_backup.sha256
         ):
             raise LoadError("previous database recovery artifact hash changed")
-        _validate_regular_descriptor_entry(
+        artifact_stat = _validate_regular_descriptor_entry(
             restore_descriptor,
             preservation_descriptor,
             artifact_name,
             error_message="previous database recovery artifact identity changed",
         )
+        if stat.S_IMODE(artifact_stat.st_mode) != 0o400:
+            raise LoadError("previous database recovery artifact is not mode 0400")
         _validate_directory_descriptor_entry(
             preservation_descriptor,
             target_parent_descriptor,
@@ -2727,19 +2750,27 @@ def _restore_target_after_publication_failure(
             target_name,
         ):
             return
-        try:
-            os.unlink(target_name, dir_fd=target_parent_descriptor)
-        except OSError:
-            raise LoadError(
-                "failed to remove the invocation-created database after publication"
-            ) from None
+        _quarantine_unknown_target(
+            target_parent_descriptor,
+            target_name,
+        )
         return
 
+    _revoke_target_backup_cleanup_authority(
+        target_backup,
+        workspace_descriptor,
+        known_entries,
+    )
     if _target_matches_original_backup(
         target_parent_descriptor,
         target_name,
         target_backup,
     ):
+        _authorize_target_backup_cleanup(
+            target_backup,
+            workspace_descriptor,
+            known_entries,
+        )
         return
     if not _entry_matches_retained_file(
         database_descriptor,
@@ -2755,7 +2786,7 @@ def _restore_target_after_publication_failure(
         raise LoadError("invalid database target restore retry limit")
 
     restore_descriptor: int | None = None
-    preservation_attempted = False
+    preservation_verified = False
     try:
         restore_descriptor, restore_name = _create_target_restore_candidate(
             target_backup,
@@ -2773,12 +2804,24 @@ def _restore_target_after_publication_failure(
                 target_parent_descriptor,
                 target_name,
                 target_backup,
-            ) or _target_matches_restore_candidate(
+            ):
+                _authorize_target_backup_cleanup(
+                    target_backup,
+                    workspace_descriptor,
+                    known_entries,
+                )
+                return
+            if _target_matches_restore_candidate(
                 restore_descriptor=restore_descriptor,
                 target_parent_descriptor=target_parent_descriptor,
                 target_name=target_name,
                 expected_hash=target_backup.sha256,
             ):
+                _authorize_target_backup_cleanup(
+                    target_backup,
+                    workspace_descriptor,
+                    known_entries,
+                )
                 return
 
             _quarantine_unknown_target(
@@ -2802,23 +2845,26 @@ def _restore_target_after_publication_failure(
                     target_parent_descriptor,
                     target_name,
                     target_backup,
-                ) or _target_matches_restore_candidate(
+                ):
+                    _authorize_target_backup_cleanup(
+                        target_backup,
+                        workspace_descriptor,
+                        known_entries,
+                    )
+                    return
+                if _target_matches_restore_candidate(
                     restore_descriptor=restore_descriptor,
                     target_parent_descriptor=target_parent_descriptor,
                     target_name=target_name,
                     expected_hash=target_backup.sha256,
                 ):
+                    _authorize_target_backup_cleanup(
+                        target_backup,
+                        workspace_descriptor,
+                        known_entries,
+                    )
                     return
                 if attempt + 1 == retry_limit:
-                    preservation_attempted = True
-                    _preserve_target_restore_candidate(
-                        target_parent_descriptor=target_parent_descriptor,
-                        target_name=target_name,
-                        workspace_descriptor=workspace_descriptor,
-                        restore_descriptor=restore_descriptor,
-                        restore_name=restore_name,
-                        target_backup=target_backup,
-                    )
                     raise LoadError(
                         "database target restoration retry limit was exhausted"
                     )
@@ -2836,11 +2882,15 @@ def _restore_target_after_publication_failure(
                 target_name=target_name,
                 target_backup=target_backup,
             )
+            _authorize_target_backup_cleanup(
+                target_backup,
+                workspace_descriptor,
+                known_entries,
+            )
             return
         raise LoadError("database target restoration retry limit was exhausted")
     except Exception:
-        if restore_descriptor is not None and not preservation_attempted:
-            preservation_attempted = True
+        if restore_descriptor is not None and not preservation_verified:
             _preserve_target_restore_candidate(
                 target_parent_descriptor=target_parent_descriptor,
                 target_name=target_name,
@@ -2848,6 +2898,13 @@ def _restore_target_after_publication_failure(
                 restore_descriptor=restore_descriptor,
                 restore_name=restore_name,
                 target_backup=target_backup,
+            )
+            preservation_verified = True
+        if preservation_verified:
+            _authorize_target_backup_cleanup(
+                target_backup,
+                workspace_descriptor,
+                known_entries,
             )
         raise
     finally:
@@ -2861,21 +2918,10 @@ def _discard_target_backup_best_effort(
     if target_backup is None:
         return
     try:
-        backup_stat = _validate_regular_descriptor_entry(
-            target_backup.descriptor,
-            workspace_descriptor,
-            target_backup.workspace_name,
-            error_message="database backup changed before cleanup",
-        )
-        if (
-            _identity(backup_stat) != target_backup.workspace_identity
-            or _sha256_descriptor(target_backup.descriptor) != target_backup.sha256
-        ):
-            return
-        os.unlink(target_backup.workspace_name, dir_fd=workspace_descriptor)
+        _validate_named_target_backup(target_backup, workspace_descriptor)
     except (LoadError, OSError):
-        # Keep the retained descriptor as rollback authority. Unknown entries
-        # are never removed merely because they occupy the backup name.
+        # Keep the named copy under its creation-provenance cleanup authority.
+        # Final success cleanup removes it; rollback revokes that authority first.
         pass
 
 

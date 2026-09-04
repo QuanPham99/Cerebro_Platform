@@ -2691,8 +2691,18 @@ finally:
         decoy_pid = int(ready_path.read_text(encoding="ascii"))
         assert decoy_pid == process.pid
         assert decoy_pid != loader.os.getpid()
+        decoy_stat = database_path.stat()
+        decoy_identity = (decoy_stat.st_dev, decoy_stat.st_ino)
+        decoy_bytes = database_path.read_bytes()
         connection_b = real_connect(str(query_database), *args, **kwargs)
-        observed.update(connected=True, decoy_pid=decoy_pid)
+        observed.update(
+            connected=True,
+            decoy_pid=decoy_pid,
+            decoy_path=database_path,
+            decoy_identity=decoy_identity,
+            decoy_bytes=decoy_bytes,
+            workspace=database_path.parent.parent,
+        )
         return ReleaseDecoyWhenClosed(connection_b)
 
     monkeypatch.setattr(
@@ -2716,9 +2726,17 @@ finally:
         assert observed["process"].poll() == 0
         assert target.read_bytes() == target_before
         assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
-        _assert_no_invocation_temps(target, receipt_dir)
+        decoy_path = observed["decoy_path"]
+        assert decoy_path.is_file(), "foreign decoy was deleted after lock release"
+        decoy_stat = decoy_path.stat()
+        assert (decoy_stat.st_dev, decoy_stat.st_ino) == observed["decoy_identity"]
+        assert decoy_path.read_bytes() == observed["decoy_bytes"]
+        assert observed["workspace"].is_dir()
     finally:
         terminate_decoy_process()
+        workspace = observed.get("workspace")
+        if isinstance(workspace, Path):
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 @pytest.mark.parametrize(
@@ -3427,6 +3445,568 @@ def _assert_sanitized_load_error(
         assert value not in formatted
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+def test_foreign_owner_revocation_is_monotonic_after_lock_release(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"old public target before monotonic foreign revocation")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    foreign_source = tmp_path / "foreign-owner-f.duckdb"
+    query_database = tmp_path / "foreign-owner-query-b.duckdb"
+    ready_path = tmp_path / "foreign-owner-f-ready"
+    foreign_canary = "PRIVATE_FOREIGN_OWNER_CANARY_RESTART_11"
+    real_connect = loader.duckdb.connect
+    real_require_lock_state = loader._require_database_lock_state
+    foreign_seed = real_connect(str(foreign_source))
+    foreign_seed.execute("CREATE TABLE foreign_owner(value VARCHAR)")
+    foreign_seed.execute("INSERT INTO foreign_owner VALUES (?)", [foreign_canary])
+    foreign_seed.close()
+    foreign_source_stat = foreign_source.stat()
+    foreign_source_identity = (
+        foreign_source_stat.st_dev,
+        foreign_source_stat.st_ino,
+    )
+    observed: dict[str, Any] = {
+        "substituted": False,
+        "owner_mismatches": 0,
+        "released_before_cleanup": False,
+    }
+
+    lock_holder_script = """
+import os
+import sys
+from pathlib import Path
+
+import duckdb
+
+connection = duckdb.connect(sys.argv[1])
+Path(sys.argv[2]).write_text(str(os.getpid()), encoding="ascii")
+try:
+    sys.stdin.buffer.read(1)
+finally:
+    connection.close()
+"""
+
+    def terminate_foreign_process() -> None:
+        process = observed.get("process")
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except loader.subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def release_and_join_foreign_process() -> None:
+        process = observed["process"]
+        if process.poll() is None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(b"release\n")
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+                process.stdin = None
+            try:
+                process.wait(timeout=5)
+            except loader.subprocess.TimeoutExpired as exc:
+                terminate_foreign_process()
+                raise AssertionError("foreign DuckDB owner did not exit") from exc
+        stderr = b"" if process.stderr is None else process.stderr.read()
+        assert process.returncode == 0, stderr.decode(errors="replace")
+
+    def connect_to_b_after_substituting_foreign_locked_f(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(database) == ":memory:" or observed["substituted"]:
+            return real_connect(database, *args, **kwargs)
+
+        database_path = Path(database)
+        initial_connection = real_connect(str(database_path))
+        initial_connection.close()
+        initial_stat = database_path.stat()
+        assert (initial_stat.st_dev, initial_stat.st_ino) != foreign_source_identity
+        loader.os.replace(foreign_source, database_path)
+        substituted_stat = database_path.stat()
+        assert (
+            substituted_stat.st_dev,
+            substituted_stat.st_ino,
+        ) == foreign_source_identity
+
+        process = loader.subprocess.Popen(
+            [
+                loader.sys.executable,
+                "-I",
+                "-c",
+                lock_holder_script,
+                str(database_path),
+                str(ready_path),
+            ],
+            stdin=loader.subprocess.PIPE,
+            stdout=loader.subprocess.DEVNULL,
+            stderr=loader.subprocess.PIPE,
+        )
+        observed["process"] = process
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready_path.exists():
+            if process.poll() is not None:
+                break
+            time.sleep(0.005)
+        if not ready_path.exists():
+            terminate_foreign_process()
+            stderr = b"" if process.stderr is None else process.stderr.read()
+            raise AssertionError(
+                "foreign DuckDB owner did not acquire F: "
+                + stderr.decode(errors="replace")
+            )
+
+        foreign_pid = int(ready_path.read_text(encoding="ascii"))
+        assert foreign_pid == process.pid
+        assert foreign_pid != loader.os.getpid()
+        foreign_stat = database_path.stat()
+        foreign_identity = (foreign_stat.st_dev, foreign_stat.st_ino)
+        foreign_bytes = database_path.read_bytes()
+        connection_b = real_connect(str(query_database), *args, **kwargs)
+        query_stat = query_database.stat()
+        query_identity = (query_stat.st_dev, query_stat.st_ino)
+        assert query_identity != foreign_identity
+        observed.update(
+            substituted=True,
+            foreign_path=database_path,
+            foreign_identity=foreign_identity,
+            foreign_bytes=foreign_bytes,
+            foreign_pid=foreign_pid,
+            query_identity=query_identity,
+            workspace=database_path.parent.parent,
+        )
+        return connection_b
+
+    def release_foreign_after_first_owner_mismatch(
+        descriptor: int,
+        expected: str,
+    ) -> None:
+        try:
+            real_require_lock_state(descriptor, expected)
+        except loader._DatabaseLockOwnershipMismatch:
+            observed["owner_mismatches"] += 1
+            assert observed["owner_mismatches"] == 1
+            release_and_join_foreign_process()
+            observed["released_before_cleanup"] = True
+            raise
+
+    monkeypatch.setattr(
+        loader.duckdb,
+        "connect",
+        connect_to_b_after_substituting_foreign_locked_f,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_require_database_lock_state",
+        release_foreign_after_first_owner_mismatch,
+    )
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(loader.LoadError) as captured:
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15
+        assert observed["substituted"] is True
+        assert observed["owner_mismatches"] == 1
+        assert observed["released_before_cleanup"] is True
+        assert observed["process"].poll() == 0
+        assert str(captured.value) == (
+            "DuckDB connection lock owner does not match the retained database"
+        )
+        assert target.read_bytes() == target_before
+        assert not receipt_dir.exists() or not list(receipt_dir.glob("*.json"))
+        _assert_sanitized_load_error(
+            captured.value,
+            forbidden=(
+                foreign_canary,
+                str(observed["foreign_pid"]),
+                str(observed["foreign_path"]),
+                str(observed["workspace"]),
+            ),
+        )
+        foreign_path = observed["foreign_path"]
+        assert foreign_path.is_file(), (
+            "foreign-owner revocation was reversed after its lock was released"
+        )
+        foreign_stat = foreign_path.stat()
+        assert (foreign_stat.st_dev, foreign_stat.st_ino) == observed[
+            "foreign_identity"
+        ]
+        assert foreign_path.read_bytes() == observed["foreign_bytes"]
+        assert observed["workspace"].is_dir()
+    finally:
+        terminate_foreign_process()
+        workspace = observed.get("workspace")
+        if isinstance(workspace, Path):
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_no_prior_target_race_after_identity_check_preserves_foreign_entry(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    receipt_dir = tmp_path / "receipts"
+    entrant_bytes = b"PRIVATE_NO_PRIOR_TARGET_ENTRANT_CANARY_RESTART_11"
+    entrant_source = tmp_path / "no-prior-target-entrant.duckdb"
+    failure_canary = "PRIVATE_POST_PUBLICATION_FAILURE_CANARY_RESTART_11"
+    real_discard = loader._discard_target_backup_best_effort
+    real_entry_matches = loader._entry_matches_retained_file
+    observed: dict[str, Any] = {
+        "post_publication_failure": False,
+        "identity_match_calls": 0,
+        "raced": False,
+    }
+
+    def fail_after_discard(
+        target_backup: Any,
+        workspace_descriptor: int,
+    ) -> None:
+        assert target_backup is None
+        real_discard(target_backup, workspace_descriptor)
+        observed["post_publication_failure"] = True
+        raise OSError(failure_canary)
+
+    def replace_after_real_identity_match(
+        descriptor: int,
+        directory_descriptor: int,
+        name: str,
+        expected_hash: str | None = None,
+    ) -> bool:
+        result = real_entry_matches(
+            descriptor,
+            directory_descriptor,
+            name,
+            expected_hash=expected_hash,
+        )
+        if (
+            observed["post_publication_failure"]
+            and result
+            and name == target.name
+            and not observed["raced"]
+        ):
+            observed["identity_match_calls"] += 1
+            entrant_source.write_bytes(entrant_bytes)
+            loader.os.replace(entrant_source, target)
+            entrant_stat = target.stat()
+            observed.update(
+                raced=True,
+                entrant_identity=(entrant_stat.st_dev, entrant_stat.st_ino),
+            )
+        return result
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        fail_after_discard,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_entry_matches_retained_file",
+        replace_after_real_identity_match,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(loader.LoadError) as captured:
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert observed["post_publication_failure"] is True
+    assert observed["identity_match_calls"] == 1
+    assert observed["raced"] is True
+    assert str(captured.value) == "DuckDB materialization failed"
+    _assert_sanitized_load_error(
+        captured.value,
+        forbidden=(
+            failure_canary,
+            entrant_bytes.decode("ascii"),
+            str(entrant_source),
+            str(target),
+        ),
+    )
+    receipt_paths = list(receipt_dir.glob("*.json")) if receipt_dir.exists() else []
+    assert len(receipt_paths) <= 1
+    for receipt_path in receipt_paths:
+        receipt = loader.MaterializationReceipt.model_validate_json(
+            receipt_path.read_bytes()
+        )
+        assert receipt.database_sha256 != hashlib.sha256(entrant_bytes).hexdigest()
+    assert _paths_with_bytes_and_identity(
+        tmp_path,
+        entrant_bytes,
+        observed["entrant_identity"],
+    ), "raced foreign entrant was deleted instead of quarantined"
+
+
+def test_recovery_artifact_failure_retains_verified_backup_fallback(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"old target bytes requiring verified backup fallback")
+    target_before = target.read_bytes()
+    target_before_hash = hashlib.sha256(target_before).hexdigest()
+    receipt_dir = tmp_path / "receipts"
+    initial_contender_bytes = b"RECOVERY_FAILURE_INITIAL_CANARY_RESTART_11"
+    initial_contender_source = tmp_path / "recovery-failure-initial.duckdb"
+    artifact_failure_canary = "PRIVATE_RECOVERY_ARTIFACT_FAILURE_CANARY_RESTART_11"
+    retry_limit = 3
+    monkeypatch.setattr(
+        loader,
+        "_TARGET_RESTORE_RETRY_LIMIT",
+        retry_limit,
+        raising=False,
+    )
+    real_discard = loader._discard_target_backup_best_effort
+    real_hard_link = loader._HARD_LINK
+    observed: dict[str, Any] = {
+        "initial_installed": False,
+        "link_attempts": [],
+        "artifact_failures": 0,
+    }
+
+    def discard_then_install_initial_contender(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        initial_contender_source.write_bytes(initial_contender_bytes)
+        loader.os.replace(initial_contender_source, target)
+        contender_stat = target.stat()
+        observed.update(
+            initial_installed=True,
+            initial_identity=(contender_stat.st_dev, contender_stat.st_ino),
+        )
+
+    def occupy_target_or_fail_recovery_artifact(
+        source: Any,
+        destination: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        destination_name = Path(destination).name
+        if destination_name == "previous-database.duckdb":
+            assert len(observed["link_attempts"]) == retry_limit
+            assert kwargs.get("src_dir_fd") is not None
+            assert kwargs.get("dst_dir_fd") is not None
+            assert kwargs.get("follow_symlinks") is False
+            observed["artifact_failures"] += 1
+            raise OSError(artifact_failure_canary)
+        if destination_name != target.name:
+            real_hard_link(source, destination, *args, **kwargs)
+            return
+
+        attempt = len(observed["link_attempts"])
+        assert attempt < retry_limit
+        assert kwargs.get("src_dir_fd") is not None
+        assert kwargs.get("dst_dir_fd") is not None
+        assert kwargs.get("follow_symlinks") is False
+        assert not target.exists()
+        contender_bytes = f"RECOVERY_FAILURE_{attempt}_CANARY_RESTART_11".encode(
+            "ascii"
+        )
+        contender_source = tmp_path / f"recovery-failure-{attempt}.duckdb"
+        contender_source.write_bytes(contender_bytes)
+        loader.os.replace(contender_source, target)
+        contender_stat = target.stat()
+        observed["link_attempts"].append(
+            (
+                contender_bytes,
+                (contender_stat.st_dev, contender_stat.st_ino),
+            )
+        )
+        real_hard_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_install_initial_contender,
+    )
+    supported_no_follow_links = set(loader.os.supports_follow_symlinks)
+    supported_no_follow_links.add(occupy_target_or_fail_recovery_artifact)
+    monkeypatch.setattr(
+        loader.os,
+        "supports_follow_symlinks",
+        supported_no_follow_links,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_HARD_LINK",
+        occupy_target_or_fail_recovery_artifact,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(loader.LoadError) as captured:
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert observed["initial_installed"] is True
+    assert len(observed["link_attempts"]) == retry_limit
+    assert observed["artifact_failures"] == 1
+    contenders = [
+        (initial_contender_bytes, observed["initial_identity"]),
+        *observed["link_attempts"],
+    ]
+    for contender_bytes, contender_identity in contenders:
+        assert _paths_with_bytes_and_identity(
+            tmp_path,
+            contender_bytes,
+            contender_identity,
+        )
+    final_contender_bytes, final_contender_identity = contenders[-1]
+    final_target_stat = target.stat()
+    assert (final_target_stat.st_dev, final_target_stat.st_ino) == (
+        final_contender_identity
+    )
+    assert target.read_bytes() == final_contender_bytes
+    assert str(captured.value) == (
+        "previous database recovery artifact could not be preserved"
+    )
+    _assert_sanitized_load_error(
+        captured.value,
+        forbidden=(artifact_failure_canary, str(tmp_path)),
+    )
+    retained_backup_paths = [
+        path
+        for path in _paths_with_bytes_and_identity(tmp_path, target_before)
+        if loader.stat.S_IMODE(path.stat().st_mode) == 0o400
+        and sha256_file(path) == target_before_hash
+    ]
+    assert retained_backup_paths, (
+        "recovery-artifact failure left no named mode-0400 old-byte fallback"
+    )
+
+
+def test_restore_candidate_creation_failure_retains_verified_backup_fallback(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"old target bytes before candidate creation failure")
+    target_before = target.read_bytes()
+    target_before_hash = hashlib.sha256(target_before).hexdigest()
+    receipt_dir = tmp_path / "receipts"
+    unknown_a_bytes = b"UNKNOWN_A_CANDIDATE_FAILURE_CANARY_RESTART_11"
+    unknown_a_source = tmp_path / "candidate-failure-unknown-a.duckdb"
+    candidate_failure_canary = "PRIVATE_CANDIDATE_CREATION_FAILURE_CANARY_RESTART_11"
+    real_discard = loader._discard_target_backup_best_effort
+    observed: dict[str, Any] = {
+        "a_installed": False,
+        "candidate_failures": 0,
+    }
+
+    def discard_then_install_unknown_a(*args: Any, **kwargs: Any) -> None:
+        real_discard(*args, **kwargs)
+        unknown_a_source.write_bytes(unknown_a_bytes)
+        loader.os.replace(unknown_a_source, target)
+        unknown_a_stat = target.stat()
+        observed.update(
+            a_installed=True,
+            a_identity=(unknown_a_stat.st_dev, unknown_a_stat.st_ino),
+        )
+
+    def fail_restore_candidate_creation(
+        backup: Any,
+        workspace_descriptor: int,
+        known_entries: dict[str, tuple[int, int]],
+    ) -> tuple[int, str]:
+        del backup, workspace_descriptor, known_entries
+        assert observed["a_installed"] is True
+        assert not target.exists(), (
+            "unknown A was not quarantined before candidate creation"
+        )
+        observed["candidate_failures"] += 1
+        raise OSError(candidate_failure_canary)
+
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        discard_then_install_unknown_a,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_create_target_restore_candidate",
+        fail_restore_candidate_creation,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(loader.LoadError) as captured:
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert observed["a_installed"] is True
+    assert observed["candidate_failures"] == 1
+    assert _paths_with_bytes_and_identity(
+        tmp_path,
+        unknown_a_bytes,
+        observed["a_identity"],
+    ), "unknown A was not retained in its quarantine"
+    assert str(captured.value) == "DuckDB materialization failed"
+    _assert_sanitized_load_error(
+        captured.value,
+        forbidden=(candidate_failure_canary, str(tmp_path)),
+    )
+    retained_backup_paths = [
+        path
+        for path in _paths_with_bytes_and_identity(tmp_path, target_before)
+        if loader.stat.S_IMODE(path.stat().st_mode) == 0o400
+        and sha256_file(path) == target_before_hash
+    ]
+    assert retained_backup_paths, (
+        "restore-candidate failure left no named mode-0400 old-byte fallback"
+    )
 
 
 def test_duckdb_lock_probe_observes_connection_close_transition(
