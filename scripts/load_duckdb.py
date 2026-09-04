@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+import secrets
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -387,6 +388,26 @@ def _copy_preflight_snapshot(
             os.close(retained_descriptor)
 
 
+def _validate_csv_file_set(
+    root: Path,
+    expected_names: set[str],
+    expected_count: int,
+) -> None:
+    try:
+        actual_names = {
+            entry.name for entry in root.iterdir() if entry.suffix == ".csv"
+        }
+    except OSError as exc:
+        raise LoadError("CSV file set could not be enumerated") from exc
+
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        raise LoadError(f"CSV file set mismatch (missing={missing}, extra={extra})")
+    if len(actual_names) != expected_count:
+        raise LoadError("CSV file count does not match the expected active table count")
+
+
 def preflight_csvs(
     csv_dir: Path | str,
     bundle: SemanticBundle,
@@ -415,16 +436,8 @@ def preflight_csvs(
             f"(missing={missing}, extra={extra})"
         )
 
-    actual_csv_names = {
-        path.name for path in root.iterdir() if path.is_file() and path.suffix == ".csv"
-    }
     expected_csv_names = {table.file_name for table in manifest.tables}
-    if actual_csv_names != expected_csv_names:
-        missing = sorted(expected_csv_names - actual_csv_names)
-        extra = sorted(actual_csv_names - expected_csv_names)
-        raise LoadError(f"CSV file set mismatch (missing={missing}, extra={extra})")
-    if len(actual_csv_names) != len(bundle_tables):
-        raise LoadError("CSV file count does not match the expected active table count")
+    _validate_csv_file_set(root, expected_csv_names, len(bundle_tables))
 
     errors: list[str] = []
     inventory_tables: list[SourceTableInventory] = []
@@ -440,7 +453,8 @@ def preflight_csvs(
             error_message="private preflight parent could not be securely opened",
         )
         workspace, workspace_descriptor, workspace_identity = _create_private_workspace(
-            preflight_parent / "cerebro-preflight"
+            preflight_parent / "cerebro-preflight",
+            parent_descriptor=parent_descriptor,
         )
         _validate_directory_descriptor_entry(
             workspace_descriptor,
@@ -546,6 +560,7 @@ def preflight_csvs(
             required_mode=0o700,
             error_message="private preflight workspace changed during validation",
         )
+        _validate_csv_file_set(root, expected_csv_names, len(bundle_tables))
     finally:
         _remove_private_workspace(
             workspace,
@@ -652,6 +667,40 @@ def _validate_regular_descriptor_path(
 
 def _identity(value: os.stat_result) -> tuple[int, int]:
     return value.st_dev, value.st_ino
+
+
+def _close_best_effort(descriptor: int | None) -> None:
+    if descriptor is None or descriptor < 0:
+        return
+
+    try:
+        retained_stat = os.fstat(descriptor)
+    except OSError:
+        retained_stat = None
+
+    try:
+        os.close(descriptor)
+        return
+    except OSError:
+        pass
+
+    # A test seam or an interrupted close can fail before releasing the FD.
+    # Retry only while fstat proves that the numeric FD still identifies the
+    # same object; never risk closing a descriptor that has been reused.
+    if retained_stat is None:
+        return
+    try:
+        current_stat = os.fstat(descriptor)
+    except OSError:
+        return
+    if _identity(current_stat) != _identity(retained_stat) or stat.S_IFMT(
+        current_stat.st_mode
+    ) != stat.S_IFMT(retained_stat.st_mode):
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 def _validate_directory_descriptor_path(
@@ -799,11 +848,22 @@ def _sha256_descriptor(descriptor: int) -> str:
     return digest.hexdigest()
 
 
-def _link_no_follow(source: Path, destination: Path) -> None:
-    if os.link in getattr(os, "supports_follow_symlinks", ()):
-        os.link(source, destination, follow_symlinks=False)
-    else:
-        os.link(source, destination)
+def _link_no_follow(
+    source_name: str,
+    destination_name: str,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
+    if _HARD_LINK not in getattr(os, "supports_follow_symlinks", ()):
+        raise LoadError("secure receipt publication is not supported")
+    os.link(
+        source_name,
+        destination_name,
+        src_dir_fd=src_dir_fd,
+        dst_dir_fd=dst_dir_fd,
+        follow_symlinks=False,
+    )
 
 
 def _read_bounded_descriptor(descriptor: int, limit: int) -> bytes:
@@ -835,14 +895,16 @@ def _read_bounded_descriptor_from_start(descriptor: int, limit: int) -> bytes:
 
 def _validate_retained_receipt(
     descriptor: int,
-    path: Path,
+    directory_descriptor: int,
+    name: str,
     receipt_bytes: bytes,
     *,
     error_message: str,
 ) -> None:
-    _validate_regular_descriptor_path(
+    _validate_regular_descriptor_entry(
         descriptor,
-        path,
+        directory_descriptor,
+        name,
         error_message=error_message,
     )
     retained_bytes = _read_bounded_descriptor_from_start(
@@ -857,38 +919,39 @@ def _validate_retained_receipt(
         raise LoadError(error_message) from exc
     if canonical_json_bytes(retained) != receipt_bytes:
         raise LoadError(error_message)
-    _validate_regular_descriptor_path(
+    _validate_regular_descriptor_entry(
         descriptor,
-        path,
+        directory_descriptor,
+        name,
         error_message=error_message,
     )
 
 
-def _validate_existing_receipt(receipt_path: Path, receipt_bytes: bytes) -> None:
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
+def _validate_existing_receipt(
+    directory_descriptor: int,
+    name: str,
+    receipt_bytes: bytes,
+) -> None:
     flags = (
         os.O_RDONLY
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_CLOEXEC", 0)
-        | no_follow
+        | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(receipt_path, flags)
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
     except OSError as exc:
         raise LoadError("pre-existing receipt could not be securely opened") from exc
 
     try:
-        descriptor_stat = os.fstat(descriptor)
+        descriptor_stat = _validate_regular_descriptor_entry(
+            descriptor,
+            directory_descriptor,
+            name,
+            error_message="pre-existing receipt is not the opened regular file",
+        )
         if not stat.S_ISREG(descriptor_stat.st_mode):
             raise LoadError("pre-existing receipt is not a regular file")
-        if no_follow == 0:
-            _validate_regular_descriptor_path(
-                descriptor,
-                receipt_path,
-                error_message=(
-                    "pre-existing receipt path is not the opened regular file"
-                ),
-            )
         try:
             existing_bytes = _read_bounded_descriptor(
                 descriptor,
@@ -904,62 +967,85 @@ def _validate_existing_receipt(receipt_path: Path, receipt_bytes: bytes) -> None
             raise LoadError("pre-existing receipt is invalid") from exc
         if canonical_json_bytes(existing) != receipt_bytes:
             raise LoadError("pre-existing receipt is not canonical")
-        _validate_regular_descriptor_path(
+        _validate_regular_descriptor_entry(
             descriptor,
-            receipt_path,
-            error_message="pre-existing receipt path changed while validating",
+            directory_descriptor,
+            name,
+            error_message="pre-existing receipt changed while validating",
         )
     finally:
-        os.close(descriptor)
+        _close_best_effort(descriptor)
 
 
 def _create_private_workspace(
     target: Path,
+    *,
+    parent_descriptor: int,
 ) -> tuple[Path, int, tuple[int, int]]:
-    try:
-        workspace = Path(
-            tempfile.mkdtemp(
-                dir=target.parent,
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-            )
-        )
-    except OSError as exc:
-        raise LoadError("could not create private materialization workspace") from exc
+    workspace_name: str | None = None
+    for _ in range(128):
+        candidate = f".{target.name}.{secrets.token_hex(16)}.tmp"
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise LoadError(
+                "could not create private materialization workspace"
+            ) from exc
+        workspace_name = candidate
+        break
+    if workspace_name is None:
+        raise LoadError("could not allocate private materialization workspace")
 
+    workspace = target.parent / workspace_name
     descriptor: int | None = None
-    identity: tuple[int, int] | None = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        descriptor, _ = _open_directory_descriptor(
-            workspace,
-            error_message="private materialization workspace is not a directory",
+        descriptor = os.open(
+            workspace_name,
+            flags,
+            dir_fd=parent_descriptor,
         )
         os.fchmod(descriptor, 0o700)
-        descriptor_stat = _validate_directory_descriptor_path(
+        descriptor_stat = _validate_directory_descriptor_entry(
             descriptor,
-            workspace,
+            parent_descriptor,
+            workspace_name,
             required_mode=0o700,
             error_message="private materialization workspace is not mode 0700",
         )
-        identity = _identity(descriptor_stat)
-        return workspace, descriptor, identity
+        return workspace, descriptor, _identity(descriptor_stat)
     except Exception:
         if descriptor is not None:
             try:
                 descriptor_stat = os.fstat(descriptor)
-                path_stat = os.stat(workspace, follow_symlinks=False)
-                if stat.S_ISDIR(path_stat.st_mode) and _identity(
-                    path_stat
+                entry_stat = os.stat(
+                    workspace_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(entry_stat.st_mode) and _identity(
+                    entry_stat
                 ) == _identity(descriptor_stat):
-                    os.rmdir(workspace)
+                    os.rmdir(workspace_name, dir_fd=parent_descriptor)
             except OSError:
                 pass
-            os.close(descriptor)
+            _close_best_effort(descriptor)
         else:
             try:
-                workspace_stat = os.stat(workspace, follow_symlinks=False)
-                if stat.S_ISDIR(workspace_stat.st_mode):
-                    os.rmdir(workspace)
+                entry_stat = os.stat(
+                    workspace_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    os.rmdir(workspace_name, dir_fd=parent_descriptor)
             except OSError:
                 pass
         raise
@@ -1263,38 +1349,62 @@ def _write_receipt_temp(
     receipt_workspace: Path,
     receipt_bytes: bytes,
     known_entries: dict[str, tuple[int, int]] | None = None,
-) -> tuple[int, Path]:
-    workspace_mode = receipt_workspace.lstat().st_mode
+    *,
+    workspace_descriptor: int,
+) -> tuple[int, str]:
+    del receipt_workspace  # The retained descriptor is the authority.
+    try:
+        workspace_stat = os.fstat(workspace_descriptor)
+    except OSError as exc:
+        raise LoadError("receipt workspace descriptor is unavailable") from exc
     if (
-        not stat.S_ISDIR(workspace_mode)
-        or stat.S_ISLNK(workspace_mode)
-        or stat.S_IMODE(workspace_mode) != 0o700
+        not stat.S_ISDIR(workspace_stat.st_mode)
+        or stat.S_IMODE(workspace_stat.st_mode) != 0o700
     ):
         raise LoadError("receipt workspace is not a private mode-0700 directory")
 
     descriptor = -1
     read_descriptor = -1
+    receipt_temp_name: str | None = None
+    create_flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        descriptor, raw_path = tempfile.mkstemp(
-            dir=receipt_workspace,
-            prefix="receipt-",
-            suffix=".tmp",
-        )
-        receipt_temp = Path(raw_path)
-        if receipt_temp.parent != receipt_workspace:
-            raise LoadError("temporary receipt escaped its private workspace")
+        for _ in range(128):
+            candidate = f"receipt-{secrets.token_hex(16)}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    create_flags,
+                    0o600,
+                    dir_fd=workspace_descriptor,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise LoadError("could not create temporary receipt") from exc
+            receipt_temp_name = candidate
+            break
+        if receipt_temp_name is None:
+            raise LoadError("could not allocate temporary receipt")
+
         if known_entries is not None:
             descriptor_stat = _register_created_entry(
                 descriptor,
-                receipt_temp.name,
+                receipt_temp_name,
                 known_entries,
             )
         else:
             descriptor_stat = os.fstat(descriptor)
-        descriptor_stat = _validate_regular_descriptor_path(
+        descriptor_stat = _validate_regular_descriptor_entry(
             descriptor,
-            receipt_temp,
-            error_message="temporary receipt path is not the opened regular file",
+            workspace_descriptor,
+            receipt_temp_name,
+            error_message="temporary receipt entry is not the opened regular file",
         )
         if stat.S_IMODE(descriptor_stat.st_mode) != 0o600:
             os.fchmod(descriptor, 0o600)
@@ -1318,29 +1428,33 @@ def _write_receipt_temp(
         read_flags = (
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
-        read_descriptor = os.open(receipt_temp, read_flags)
-        read_stat = _validate_regular_descriptor_path(
+        read_descriptor = os.open(
+            receipt_temp_name,
+            read_flags,
+            dir_fd=workspace_descriptor,
+        )
+        read_stat = _validate_regular_descriptor_entry(
             read_descriptor,
-            receipt_temp,
+            workspace_descriptor,
+            receipt_temp_name,
             error_message="read-only receipt is not the validated regular file",
         )
         if _identity(read_stat) != _identity(os.fstat(descriptor)):
             raise LoadError("read-only receipt is not the written receipt inode")
         os.dup2(read_descriptor, descriptor, inheritable=False)
-        os.close(read_descriptor)
+        _close_best_effort(read_descriptor)
         read_descriptor = -1
         _validate_retained_receipt(
             descriptor,
-            receipt_temp,
+            workspace_descriptor,
+            receipt_temp_name,
             receipt_bytes,
             error_message="temporary receipt content changed before publication",
         )
-        return descriptor, receipt_temp
+        return descriptor, receipt_temp_name
     except Exception:
-        if read_descriptor >= 0:
-            os.close(read_descriptor)
-        if descriptor >= 0:
-            os.close(descriptor)
+        _close_best_effort(read_descriptor)
+        _close_best_effort(descriptor)
         raise
 
 
@@ -1514,7 +1628,14 @@ def load_csvs(
     receipt_dir: Path | str | None = None,
 ) -> tuple[MaterializationReceipt, Path]:
     """Build a verified DuckDB off to the side and atomically publish it."""
-    inventory = preflight_csvs(csv_dir, bundle, manifest)
+    source_root = Path(csv_dir)
+    inventory = preflight_csvs(source_root, bundle, manifest)
+    expected_csv_names = {table.source_file.name for table in inventory.tables}
+    _validate_csv_file_set(
+        source_root,
+        expected_csv_names,
+        len(inventory.tables),
+    )
     target = Path(db_path)
     target_dir = target.parent
     if not target_dir.is_dir():
@@ -1522,6 +1643,7 @@ def load_csvs(
     receipts = Path(receipt_dir) if receipt_dir is not None else target_dir
 
     target_parent_descriptor: int | None = None
+    receipt_parent_descriptor: int | None = None
     previous_target_descriptor: int | None = None
     previous_target_hash: str | None = None
     backup_name: str | None = None
@@ -1543,7 +1665,8 @@ def load_csvs(
             error_message="database target directory could not be securely opened",
         )
         workspace, workspace_descriptor, workspace_identity = _create_private_workspace(
-            target
+            target,
+            parent_descriptor=target_parent_descriptor,
         )
         _validate_directory_descriptor_entry(
             workspace_descriptor,
@@ -1567,7 +1690,7 @@ def load_csvs(
             source_snapshot_descriptors,
         )
         for descriptor in source_snapshot_descriptors:
-            os.close(descriptor)
+            _close_best_effort(descriptor)
         source_snapshot_descriptors = ()
         database_hash = _sha256_descriptor(database_descriptor)
 
@@ -1588,33 +1711,74 @@ def load_csvs(
         )
         receipt_bytes = canonical_json_bytes(receipt)
         receipt_hash = sha256(receipt_bytes).hexdigest()
+        receipt_name = f"{receipt_hash}.json"
         receipts.mkdir(parents=True, exist_ok=True)
-        receipt_path = receipts / f"{receipt_hash}.json"
+        receipt_path = receipts / receipt_name
+        if receipts == target_dir:
+            try:
+                receipt_parent_descriptor = os.dup(target_parent_descriptor)
+            except OSError as exc:
+                raise LoadError("receipt directory could not be retained") from exc
+            _validate_directory_descriptor_path(
+                receipt_parent_descriptor,
+                receipts,
+                error_message="receipt directory changed while opening",
+            )
+        else:
+            receipt_parent_descriptor, _ = _open_directory_descriptor(
+                receipts,
+                error_message="receipt directory could not be securely opened",
+            )
         (
             receipt_workspace,
             receipt_workspace_descriptor,
             receipt_workspace_identity,
-        ) = _create_private_workspace(receipts / "materialization-receipt")
-        receipt_descriptor, receipt_temp = _write_receipt_temp(
+        ) = _create_private_workspace(
+            receipts / "materialization-receipt",
+            parent_descriptor=receipt_parent_descriptor,
+        )
+        receipt_descriptor, receipt_temp_name = _write_receipt_temp(
             receipt_workspace,
             receipt_bytes,
             receipt_workspace_entries,
+            workspace_descriptor=receipt_workspace_descriptor,
         )
 
-        _validate_regular_descriptor_path(
+        _validate_regular_descriptor_entry(
             receipt_descriptor,
-            receipt_temp,
-            error_message="temporary receipt path changed before publication",
+            receipt_workspace_descriptor,
+            receipt_temp_name,
+            error_message="temporary receipt entry changed before publication",
+        )
+        _validate_directory_descriptor_path(
+            receipt_parent_descriptor,
+            receipts,
+            error_message="receipt directory changed before publication",
+        )
+        _validate_csv_file_set(
+            source_root,
+            expected_csv_names,
+            len(inventory.tables),
         )
         try:
-            _link_no_follow(receipt_temp, receipt_path)
+            _link_no_follow(
+                receipt_temp_name,
+                receipt_name,
+                src_dir_fd=receipt_workspace_descriptor,
+                dst_dir_fd=receipt_parent_descriptor,
+            )
         except FileExistsError:
-            _validate_existing_receipt(receipt_path, receipt_bytes)
+            _validate_existing_receipt(
+                receipt_parent_descriptor,
+                receipt_name,
+                receipt_bytes,
+            )
         else:
             receipt_uses_retained_inode = True
             _validate_retained_receipt(
                 receipt_descriptor,
-                receipt_path,
+                receipt_parent_descriptor,
+                receipt_name,
                 receipt_bytes,
                 error_message="published receipt content changed",
             )
@@ -1623,15 +1787,25 @@ def load_csvs(
         # replacement fails, leave the harmless orphan in place: its database
         # hash cannot validate against a mismatched target, and another
         # invocation may already have adopted it.
+        _validate_directory_descriptor_path(
+            receipt_parent_descriptor,
+            receipts,
+            error_message="receipt directory changed after publication",
+        )
         if receipt_uses_retained_inode:
             _validate_retained_receipt(
                 receipt_descriptor,
-                receipt_path,
+                receipt_parent_descriptor,
+                receipt_name,
                 receipt_bytes,
                 error_message="published receipt content changed",
             )
         else:
-            _validate_existing_receipt(receipt_path, receipt_bytes)
+            _validate_existing_receipt(
+                receipt_parent_descriptor,
+                receipt_name,
+                receipt_bytes,
+            )
         previous_target = _prepare_existing_target_backup(
             target_parent_descriptor,
             target.name,
@@ -1646,6 +1820,16 @@ def load_csvs(
             ) = previous_target
 
         try:
+            _validate_csv_file_set(
+                source_root,
+                expected_csv_names,
+                len(inventory.tables),
+            )
+            _validate_directory_descriptor_path(
+                receipt_parent_descriptor,
+                receipts,
+                error_message="receipt directory changed before database publication",
+            )
             _validate_regular_descriptor_entry(
                 database_descriptor,
                 workspace_descriptor,
@@ -1669,12 +1853,22 @@ def load_csvs(
             if receipt_uses_retained_inode:
                 _validate_retained_receipt(
                     receipt_descriptor,
-                    receipt_path,
+                    receipt_parent_descriptor,
+                    receipt_name,
                     receipt_bytes,
                     error_message="published receipt content changed during publication",
                 )
             else:
-                _validate_existing_receipt(receipt_path, receipt_bytes)
+                _validate_existing_receipt(
+                    receipt_parent_descriptor,
+                    receipt_name,
+                    receipt_bytes,
+                )
+            _validate_directory_descriptor_path(
+                receipt_parent_descriptor,
+                receipts,
+                error_message="receipt directory changed during database publication",
+            )
         except Exception:
             _restore_target_after_publication_failure(
                 target_parent_descriptor=target_parent_descriptor,
@@ -1699,18 +1893,18 @@ def load_csvs(
         raise LoadError(f"DuckDB materialization failed: {exc}") from exc
     finally:
         for descriptor in source_snapshot_descriptors:
-            os.close(descriptor)
-        if receipt_descriptor is not None:
-            os.close(receipt_descriptor)
+            _close_best_effort(descriptor)
+        _close_best_effort(receipt_descriptor)
         _remove_private_workspace(
             receipt_workspace,
             descriptor=receipt_workspace_descriptor,
             expected_identity=receipt_workspace_identity,
             known_entries=receipt_workspace_entries,
+            parent_descriptor=receipt_parent_descriptor,
             remove_mismatched_symlinks=True,
         )
-        if receipt_workspace_descriptor is not None:
-            os.close(receipt_workspace_descriptor)
+        _close_best_effort(receipt_workspace_descriptor)
+        _close_best_effort(receipt_parent_descriptor)
         _remove_private_workspace(
             workspace,
             descriptor=workspace_descriptor,
@@ -1718,11 +1912,7 @@ def load_csvs(
             known_entries=workspace_entries,
             parent_descriptor=target_parent_descriptor,
         )
-        if previous_target_descriptor is not None:
-            os.close(previous_target_descriptor)
-        if database_descriptor is not None:
-            os.close(database_descriptor)
-        if workspace_descriptor is not None:
-            os.close(workspace_descriptor)
-        if target_parent_descriptor is not None:
-            os.close(target_parent_descriptor)
+        _close_best_effort(previous_target_descriptor)
+        _close_best_effort(database_descriptor)
+        _close_best_effort(workspace_descriptor)
+        _close_best_effort(target_parent_descriptor)

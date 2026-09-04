@@ -155,6 +155,23 @@ def _assert_no_invocation_temps(target: Path, receipt_dir: Path | None = None) -
         assert not list(receipt_dir.glob(".*.tmp*"))
 
 
+def _read_directory_entry(loader: Any, directory_descriptor: int, name: Any) -> bytes:
+    descriptor = loader.os.open(
+        name,
+        loader.os.O_RDONLY | getattr(loader.os, "O_CLOEXEC", 0),
+        dir_fd=directory_descriptor,
+    )
+    try:
+        contents = bytearray()
+        offset = 0
+        while chunk := loader.os.pread(descriptor, 64 * 1024, offset):
+            contents.extend(chunk)
+            offset += len(chunk)
+        return bytes(contents)
+    finally:
+        loader.os.close(descriptor)
+
+
 def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
@@ -760,9 +777,13 @@ def test_receipt_is_finalized_immediately_before_database_replace(
     real_replace = loader.os.replace
     events: list[tuple[str, Path]] = []
 
-    def recording_link(source: Any, destination: Any) -> None:
-        events.append(("receipt", Path(destination)))
-        real_link(source, destination)
+    def recording_link(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        events.append(("receipt", receipt_dir / Path(destination)))
+        real_link(source, destination, **kwargs)
 
     def recording_replace(
         source: Any,
@@ -802,7 +823,11 @@ def test_receipt_finalize_failure_preserves_target_and_cleans_temps(
     before = target.read_bytes()
     receipt_dir = tmp_path / "receipts"
 
-    def fail_receipt_link(source: Any, destination: Any) -> None:
+    def fail_receipt_link(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
         raise OSError("injected receipt finalize failure")
 
     monkeypatch.setattr(loader.os, "link", fail_receipt_link)
@@ -830,34 +855,48 @@ def test_receipt_descriptor_stays_open_in_private_workspace_through_publication(
     csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
     target = tmp_path / "workshop.duckdb"
     receipt_dir = tmp_path / "receipts"
-    real_mkstemp = loader.tempfile.mkstemp
+    real_write_receipt = loader._write_receipt_temp
     real_link = loader.os.link
     reserved: dict[str, Any] = {}
     publication: dict[str, Any] = {}
 
-    def record_reserved_descriptor(*args: Any, **kwargs: Any) -> tuple[int, str]:
-        descriptor, raw_path = real_mkstemp(*args, **kwargs)
-        reserved.update(descriptor=descriptor, path=Path(raw_path))
-        return descriptor, raw_path
+    def record_reserved_descriptor(*args: Any, **kwargs: Any) -> Any:
+        descriptor, name = real_write_receipt(*args, **kwargs)
+        workspace = Path(args[0])
+        reserved.update(
+            descriptor=descriptor,
+            name=name,
+            path=workspace / name,
+            workspace_descriptor=kwargs["workspace_descriptor"],
+        )
+        return descriptor, name
 
-    def inspect_descriptor_at_publication(source: Any, destination: Any) -> None:
+    def inspect_descriptor_at_publication(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
         descriptor = reserved["descriptor"]
         descriptor_stat = loader.os.fstat(descriptor)
-        source_path = Path(source)
-        source_stat = source_path.lstat()
+        source_stat = loader.os.stat(
+            source,
+            dir_fd=kwargs["src_dir_fd"],
+            follow_symlinks=False,
+        )
+        workspace_stat = loader.os.fstat(kwargs["src_dir_fd"])
         publication.update(
             descriptor_is_regular=loader.stat.S_ISREG(descriptor_stat.st_mode),
             source_matches_descriptor=(
                 source_stat.st_dev == descriptor_stat.st_dev
                 and source_stat.st_ino == descriptor_stat.st_ino
             ),
-            source=source_path,
-            workspace_mode=source_path.parent.lstat().st_mode & 0o777,
-            workspace_is_symlink=source_path.parent.is_symlink(),
+            source=reserved["path"],
+            workspace_mode=workspace_stat.st_mode & 0o777,
+            workspace_is_symlink=loader.stat.S_ISLNK(workspace_stat.st_mode),
         )
-        real_link(source, destination)
+        real_link(source, destination, **kwargs)
 
-    monkeypatch.setattr(loader.tempfile, "mkstemp", record_reserved_descriptor)
+    monkeypatch.setattr(loader, "_write_receipt_temp", record_reserved_descriptor)
     monkeypatch.setattr(loader.os, "link", inspect_descriptor_at_publication)
 
     _receipt, receipt_path = loader.load_csvs(
@@ -896,22 +935,29 @@ def test_receipt_temp_path_substitution_cannot_truncate_existing_database(
     connection.close()
     target_before = target.read_bytes()
     receipt_dir = tmp_path / "receipts"
-    real_mkstemp = loader.tempfile.mkstemp
-    substituted_paths: list[Path] = []
+    real_open = loader.os.open
+    substituted_entries: list[str] = []
 
-    def substitute_reserved_path(*args: Any, **kwargs: Any) -> tuple[int, str]:
-        descriptor, raw_path = real_mkstemp(*args, **kwargs)
-        receipt_temp = Path(raw_path)
-        receipt_temp.unlink()
-        receipt_temp.symlink_to(target)
-        substituted_paths.append(receipt_temp)
-        return descriptor, raw_path
+    def substitute_reserved_entry(
+        path: Any,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if (
+            dir_fd is not None
+            and Path(path).name.startswith("receipt-")
+            and flags & loader.os.O_CREAT
+            and flags & loader.os.O_EXCL
+        ):
+            loader.os.unlink(path, dir_fd=dir_fd)
+            loader.os.symlink(target, path, dir_fd=dir_fd)
+            substituted_entries.append(Path(path).name)
+        return descriptor
 
-    def fail_receipt_link(source: Any, destination: Any) -> None:
-        raise OSError("injected failure after unsafe receipt write")
-
-    monkeypatch.setattr(loader.tempfile, "mkstemp", substitute_reserved_path)
-    monkeypatch.setattr(loader.os, "link", fail_receipt_link)
+    monkeypatch.setattr(loader.os, "open", substitute_reserved_entry)
 
     with pytest.raises(loader.LoadError):
         loader.load_csvs(
@@ -922,7 +968,7 @@ def test_receipt_temp_path_substitution_cannot_truncate_existing_database(
             receipt_dir=receipt_dir,
         )
 
-    assert len(substituted_paths) == 1
+    assert len(substituted_entries) == 1
     assert target.read_bytes() == target_before
     assert not target.is_symlink()
     assert not list(receipt_dir.glob("*.json"))
@@ -943,9 +989,13 @@ def test_concurrent_preexisting_receipt_is_never_overwritten_or_deleted(
     preexisting = b"concurrently published receipt bytes"
     real_link = loader.os.link
 
-    def competing_link(source: Any, destination: Any) -> None:
-        Path(destination).write_bytes(preexisting)
-        real_link(source, destination)
+    def competing_link(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        (receipt_dir / Path(destination)).write_bytes(preexisting)
+        real_link(source, destination, **kwargs)
 
     monkeypatch.setattr(loader.os, "link", competing_link)
 
@@ -980,13 +1030,21 @@ def test_existing_receipt_symlink_is_rejected_without_touching_its_target(
     real_link = loader.os.link
     competing: dict[str, Any] = {}
 
-    def publish_matching_symlink(source: Any, destination: Any) -> None:
-        receipt_bytes = Path(source).read_bytes()
+    def publish_matching_symlink(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        receipt_bytes = _read_directory_entry(
+            loader,
+            kwargs["src_dir_fd"],
+            source,
+        )
         symlink_target.write_bytes(receipt_bytes)
-        receipt_path = Path(destination)
+        receipt_path = receipt_dir / Path(destination)
         receipt_path.symlink_to(symlink_target)
         competing.update(path=receipt_path, bytes=receipt_bytes)
-        real_link(source, destination)
+        real_link(source, destination, **kwargs)
 
     monkeypatch.setattr(loader.os, "link", publish_matching_symlink)
 
@@ -1023,9 +1081,17 @@ def test_existing_receipt_fifo_is_rejected_without_blocking_or_removal(
     writer_threads: list[threading.Thread] = []
     competing: dict[str, Any] = {}
 
-    def publish_matching_fifo(source: Any, destination: Any) -> None:
-        receipt_bytes = Path(source).read_bytes()
-        receipt_path = Path(destination)
+    def publish_matching_fifo(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        receipt_bytes = _read_directory_entry(
+            loader,
+            kwargs["src_dir_fd"],
+            source,
+        )
+        receipt_path = receipt_dir / Path(destination)
         loader.os.mkfifo(receipt_path, 0o600)
         competing.update(path=receipt_path, bytes=receipt_bytes)
 
@@ -1051,7 +1117,7 @@ def test_existing_receipt_fifo_is_rejected_without_blocking_or_removal(
         writer = threading.Thread(target=write_when_reader_opens, daemon=True)
         writer_threads.append(writer)
         writer.start()
-        real_link(source, destination)
+        real_link(source, destination, **kwargs)
 
     monkeypatch.setattr(loader.os, "link", publish_matching_fifo)
     started = time.monotonic()
@@ -1346,14 +1412,25 @@ def test_link_no_follow_supported_branch_hard_links_symlink_itself(
     tmp_path: Path,
 ) -> None:
     loader = _loader()
-    assert loader.os.link in loader.os.supports_follow_symlinks
+    assert loader._HARD_LINK in loader.os.supports_follow_symlinks
     backing = tmp_path / "backing.txt"
     backing.write_bytes(b"backing bytes")
     source = tmp_path / "source-link"
     source.symlink_to(backing.name)
     destination = tmp_path / "destination-link"
-
-    loader._link_no_follow(source, destination)
+    directory_descriptor = loader.os.open(
+        tmp_path,
+        loader.os.O_RDONLY | getattr(loader.os, "O_DIRECTORY", 0),
+    )
+    try:
+        loader._link_no_follow(
+            source.name,
+            destination.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+    finally:
+        loader.os.close(directory_descriptor)
 
     source_stat = source.lstat()
     destination_stat = destination.lstat()
@@ -1382,9 +1459,17 @@ def test_oversized_regular_receipt_collision_uses_expected_plus_one_bounded_read
     real_read = loader.os.read
     observed: dict[str, Any] = {"read_sizes": []}
 
-    def publish_oversized_regular_collision(source: Any, destination: Any) -> None:
-        receipt_bytes = Path(source).read_bytes()
-        receipt_path = Path(destination)
+    def publish_oversized_regular_collision(
+        source: Any,
+        destination: Any,
+        **kwargs: Any,
+    ) -> None:
+        receipt_bytes = _read_directory_entry(
+            loader,
+            kwargs["src_dir_fd"],
+            source,
+        )
+        receipt_path = receipt_dir / Path(destination)
         with receipt_path.open("wb") as competing:
             competing.write(receipt_bytes)
             competing.truncate(oversized_size)
@@ -1392,7 +1477,7 @@ def test_oversized_regular_receipt_collision_uses_expected_plus_one_bounded_read
             path=receipt_path,
             receipt_length=len(receipt_bytes),
         )
-        real_link(source, destination)
+        real_link(source, destination, **kwargs)
 
     def record_bounded_read(descriptor: int, size: int) -> bytes:
         observed["read_sizes"].append(size)
@@ -1819,11 +1904,26 @@ def test_receipt_same_inode_rewrite_is_rejected_before_target_publication(
     real_link = loader._link_no_follow
     observed: dict[str, Any] = {}
 
-    def rewrite_same_inode_then_publish(source: Path, destination: Path) -> None:
-        source.chmod(0o600)
-        source.write_bytes(malicious_bytes)
-        real_link(source, destination)
-        observed["receipt_path"] = Path(destination)
+    def rewrite_same_inode_then_publish(
+        source: str,
+        destination: str,
+        **kwargs: Any,
+    ) -> None:
+        source_directory = kwargs["src_dir_fd"]
+        loader.os.chmod(source, 0o600, dir_fd=source_directory)
+        write_descriptor = loader.os.open(
+            source,
+            loader.os.O_WRONLY | loader.os.O_TRUNC,
+            dir_fd=source_directory,
+        )
+        try:
+            assert loader.os.write(write_descriptor, malicious_bytes) == len(
+                malicious_bytes
+            )
+        finally:
+            loader.os.close(write_descriptor)
+        real_link(source, destination, **kwargs)
+        observed["receipt_path"] = receipt_dir / destination
 
     monkeypatch.setattr(loader, "_link_no_follow", rewrite_same_inode_then_publish)
 
@@ -1971,15 +2071,26 @@ def test_receipt_destination_first_fstat_failure_cleans_workspace(
     target_before = target.read_bytes()
     receipt_dir = tmp_path / "receipts"
     real_write_receipt = loader._write_receipt_temp
-    real_mkstemp = loader.tempfile.mkstemp
+    real_open = loader.os.open
     real_fstat = loader.os.fstat
     observed: dict[str, Any] = {"failed": False}
 
     def fail_receipt_fstat(*args: Any, **kwargs: Any) -> Any:
-        def record_receipt_temp(*mkstemp_args: Any, **mkstemp_kwargs: Any) -> Any:
-            descriptor, raw_path = real_mkstemp(*mkstemp_args, **mkstemp_kwargs)
-            observed["receipt_descriptor"] = descriptor
-            return descriptor, raw_path
+        def record_receipt_temp(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if (
+                dir_fd is not None
+                and Path(path).name.startswith("receipt-")
+                and flags & loader.os.O_CREAT
+            ):
+                observed.setdefault("receipt_descriptor", descriptor)
+            return descriptor
 
         def fail_first_receipt_fstat(descriptor: int) -> Any:
             if (
@@ -1991,7 +2102,7 @@ def test_receipt_destination_first_fstat_failure_cleans_workspace(
             return real_fstat(descriptor)
 
         with monkeypatch.context() as scoped:
-            scoped.setattr(loader.tempfile, "mkstemp", record_receipt_temp)
+            scoped.setattr(loader.os, "open", record_receipt_temp)
             scoped.setattr(loader.os, "fstat", fail_first_receipt_fstat)
             return real_write_receipt(*args, **kwargs)
 
@@ -2009,3 +2120,205 @@ def test_receipt_destination_first_fstat_failure_cleans_workspace(
     assert observed["failed"] is True
     assert target.read_bytes() == target_before
     _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_post_publication_close_failure_does_not_report_failure_or_interrupt_cleanup(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    receipt_dir = tmp_path / "receipts"
+    real_write_receipt = loader._write_receipt_temp
+    real_discard_backup = loader._discard_target_backup_best_effort
+    real_close = loader.os.close
+    real_fstat = loader.os.fstat
+    observed: dict[str, Any] = {
+        "armed": False,
+        "failed": False,
+        "later_close_calls": 0,
+    }
+
+    def capture_receipt_descriptor(*args: Any, **kwargs: Any) -> Any:
+        descriptor, receipt_temp = real_write_receipt(*args, **kwargs)
+        observed["receipt_descriptor"] = descriptor
+        return descriptor, receipt_temp
+
+    def arm_close_fault(*args: Any, **kwargs: Any) -> None:
+        real_discard_backup(*args, **kwargs)
+        observed["armed"] = True
+
+    def fail_receipt_close_once(descriptor: int) -> None:
+        if (
+            observed["armed"]
+            and descriptor == observed.get("receipt_descriptor")
+            and not observed["failed"]
+        ):
+            observed["failed"] = True
+            raise OSError("injected post-publication close failure")
+        if observed["failed"]:
+            observed["later_close_calls"] += 1
+        real_close(descriptor)
+
+    monkeypatch.setattr(loader, "_write_receipt_temp", capture_receipt_descriptor)
+    monkeypatch.setattr(
+        loader,
+        "_discard_target_backup_best_effort",
+        arm_close_fault,
+    )
+    monkeypatch.setattr(loader.os, "close", fail_receipt_close_once)
+
+    try:
+        receipt, receipt_path = loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+    finally:
+        descriptor = observed.get("receipt_descriptor")
+        if isinstance(descriptor, int):
+            try:
+                real_fstat(descriptor)
+            except OSError:
+                pass
+            else:
+                real_close(descriptor)
+
+    assert observed["failed"] is True
+    assert observed["later_close_calls"] > 0
+    assert sha256_file(target) == receipt.database_sha256
+    receipt_bytes = receipt_path.read_bytes()
+    assert (
+        canonical_json_bytes(
+            loader.MaterializationReceipt.model_validate_json(receipt_bytes)
+        )
+        == receipt_bytes
+    )
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_csv_set_drift_after_initial_check_fails_before_publication(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    unexpected = csv_dir / "unexpected.csv"
+    real_copy = loader._copy_preflight_snapshot
+    real_connect = loader.duckdb.connect
+    opened_databases: list[Path] = []
+    observed = {"added": False}
+
+    def add_csv_after_initial_check(*args: Any, **kwargs: Any) -> Any:
+        result = real_copy(*args, **kwargs)
+        if not observed["added"]:
+            unexpected.write_text("value\n1\n", encoding="utf-8")
+            observed["added"] = True
+        return result
+
+    def track_file_database(
+        database: str = ":memory:",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(database) != ":memory:":
+            opened_databases.append(Path(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "_copy_preflight_snapshot", add_csv_after_initial_check)
+    monkeypatch.setattr(loader.duckdb, "connect", track_file_database)
+
+    with pytest.raises(loader.LoadError, match="CSV file set"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["added"] is True
+    assert unexpected.is_file()
+    assert opened_databases == []
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_receipt_workspace_substitution_creates_no_temp_in_replacement_tree(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    canary_bytes = b"unrelated replacement tree must survive"
+    real_write_receipt = loader._write_receipt_temp
+    observed: dict[str, Any] = {}
+
+    def substitute_receipt_workspace(
+        receipt_workspace: Path,
+        receipt_bytes: bytes,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        moved_workspace = receipt_workspace.with_name(
+            f"{receipt_workspace.name}-retained-by-test"
+        )
+        receipt_workspace.rename(moved_workspace)
+        receipt_workspace.mkdir(mode=0o700)
+        canary = receipt_workspace / "keep.txt"
+        canary.write_bytes(canary_bytes)
+        observed.update(
+            replacement_workspace=receipt_workspace,
+            moved_workspace=moved_workspace,
+            canary=canary,
+        )
+        return real_write_receipt(
+            receipt_workspace,
+            receipt_bytes,
+            *args,
+            **kwargs,
+        )
+
+    def fail_receipt_publication(*args: Any, **kwargs: Any) -> None:
+        raise OSError("injected receipt publication failure")
+
+    monkeypatch.setattr(loader, "_write_receipt_temp", substitute_receipt_workspace)
+    monkeypatch.setattr(loader, "_link_no_follow", fail_receipt_publication)
+
+    try:
+        with pytest.raises(loader.LoadError, match="receipt publication failure"):
+            loader.load_csvs(
+                csv_dir,
+                target,
+                bundle,
+                manifest,
+                receipt_dir=receipt_dir,
+            )
+
+        replacement_workspace = observed["replacement_workspace"]
+        moved_workspace = observed["moved_workspace"]
+        assert observed["canary"].read_bytes() == canary_bytes
+        assert not list(replacement_workspace.glob("receipt-*.tmp"))
+        assert not list(moved_workspace.glob("receipt-*.tmp"))
+        assert target.read_bytes() == target_before
+        assert not list(receipt_dir.glob("*.json"))
+    finally:
+        for key in ("replacement_workspace", "moved_workspace"):
+            workspace = observed.get(key)
+            if isinstance(workspace, Path):
+                shutil.rmtree(workspace, ignore_errors=True)
