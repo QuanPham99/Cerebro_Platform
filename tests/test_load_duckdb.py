@@ -737,11 +737,9 @@ def test_database_temp_uses_private_workspace_not_claimable_parent_path(
     assert not database["path_existed"]
     assert not database["parent_is_symlink"]
     assert database["parent_mode"] == 0o700
-    assert len(database["snapshots"]) == len(manifest.tables)
-    assert all(
-        is_file and not is_symlink for _, is_file, is_symlink in database["snapshots"]
-    )
-    assert loaded_sources[0].parent == database_path.parent
+    assert database["snapshots"] == ()
+    assert loaded_sources[0].parent in (Path("/dev/fd"), Path("/proc/self/fd"))
+    assert loaded_sources[0].name.isdigit()
     assert database_path != claimant
     assert claimant.is_symlink()
     assert claimant.resolve() == target.resolve()
@@ -1730,3 +1728,284 @@ def test_snapshot_destination_fstat_failure_cleans_workspace(
     assert observed["failed"] is True
     assert target.read_bytes() == target_before
     _assert_no_invocation_temps(target)
+
+
+def test_private_load_snapshot_aba_cannot_load_unverified_bytes(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    selected_table = next(
+        table
+        for table in _active_tables(bundle)
+        if any(column["data_type"] == "VARCHAR" for column in table.cerebro["columns"])
+    )
+    selected_name = _raw_name(selected_table)
+    selected_index = (
+        sorted(table.name for table in manifest.tables).index(selected_name) + 1
+    )
+    selected_column_index = next(
+        index
+        for index, column in enumerate(selected_table.cerebro["columns"])
+        if column["data_type"] == "VARCHAR"
+    )
+    selected_column = selected_table.cerebro["columns"][selected_column_index]["name"]
+    source_file = csv_dir / f"{selected_name}.csv"
+    original_rows = _read_rows(source_file)
+    unchecked_value = "UNCHECKED_PRIVATE_SNAPSHOT_VALUE"
+    changed_rows = [row.copy() for row in original_rows]
+    changed_rows[1][selected_column_index] = unchecked_value
+    changed_file = tmp_path / "changed-private-snapshot.csv"
+    _write_rows(changed_file, changed_rows)
+    changed_bytes = changed_file.read_bytes()
+    changed_file.unlink()
+    real_load_table = loader._load_table
+    observed = {"calls": 0, "attacked_private_path": False}
+
+    def swap_private_path_while_loading(
+        connection: duckdb.DuckDBPyConnection,
+        load_source: Path,
+        ddl: str,
+    ) -> int:
+        observed["calls"] += 1
+        if observed["calls"] != selected_index or load_source.parent.name == "fd":
+            return real_load_table(connection, load_source, ddl)
+        verified_bytes = load_source.read_bytes()
+        load_source.unlink()
+        load_source.write_bytes(changed_bytes)
+        observed["attacked_private_path"] = True
+        try:
+            return real_load_table(connection, load_source, ddl)
+        finally:
+            load_source.unlink()
+            load_source.write_bytes(verified_bytes)
+
+    monkeypatch.setattr(loader, "_load_table", swap_private_path_while_loading)
+
+    receipt, _receipt_path = loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        loaded_value = connection.execute(
+            f"SELECT {_quote(selected_column)} FROM {_quote(selected_name)}"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert observed["calls"] == len(manifest.tables)
+    assert observed["attacked_private_path"] is False
+    assert loaded_value == original_rows[1][selected_column_index]
+    assert loaded_value != unchecked_value
+    assert [table.source_file_sha256 for table in receipt.tables] == [
+        table.sha256 for table in manifest.tables
+    ]
+    _assert_no_invocation_temps(target)
+
+
+def test_receipt_same_inode_rewrite_is_rejected_before_target_publication(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    malicious_bytes = b'{"leaked":"' + SOURCE_VALUE.encode() + b'"}'
+    real_link = loader._link_no_follow
+    observed: dict[str, Any] = {}
+
+    def rewrite_same_inode_then_publish(source: Path, destination: Path) -> None:
+        source.chmod(0o600)
+        source.write_bytes(malicious_bytes)
+        real_link(source, destination)
+        observed["receipt_path"] = Path(destination)
+
+    monkeypatch.setattr(loader, "_link_no_follow", rewrite_same_inode_then_publish)
+
+    with pytest.raises(loader.LoadError, match="receipt.*content"):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert target.read_bytes() == target_before
+    assert observed["receipt_path"].read_bytes() == malicious_bytes
+    _assert_no_invocation_temps(target, receipt_dir)
+
+
+def test_bundle_mutation_during_preflight_cannot_split_ddl_and_receipt_identity(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    provenance = import_module("cerebro.provenance")
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    bundle_before = bundle.model_copy(deep=True)
+    expected_bundle_hash = provenance.semantic_bundle_sha256(bundle_before)
+    selected_table = next(
+        table
+        for table in _active_tables(bundle)
+        if any(column["data_type"] == "BIGINT" for column in table.cerebro["columns"])
+    )
+    selected_name = _raw_name(selected_table)
+    selected_column = next(
+        column["name"]
+        for column in selected_table.cerebro["columns"]
+        if column["data_type"] == "BIGINT"
+    )
+    real_copy = loader._copy_preflight_snapshot
+    observed = {"mutated": False}
+
+    def mutate_caller_bundle_after_snapshot(*args: Any, **kwargs: Any) -> Any:
+        result = real_copy(*args, **kwargs)
+        if not observed["mutated"]:
+            live_table = next(
+                table
+                for table in _active_tables(bundle)
+                if table.id == selected_table.id
+            )
+            live_column = next(
+                column
+                for column in live_table.cerebro["columns"]
+                if column["name"] == selected_column
+            )
+            live_column["data_type"] = "DOUBLE"
+            observed["mutated"] = True
+        return result
+
+    monkeypatch.setattr(
+        loader,
+        "_copy_preflight_snapshot",
+        mutate_caller_bundle_after_snapshot,
+    )
+
+    receipt, _receipt_path = loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        actual_type = connection.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
+            [selected_name, selected_column],
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert observed["mutated"] is True
+    assert actual_type == "BIGINT"
+    assert receipt.bundle_sha256 == expected_bundle_hash
+    assert receipt.bundle_sha256 != provenance.semantic_bundle_sha256(bundle)
+    _assert_no_invocation_temps(target)
+
+
+def test_database_destination_first_fstat_failure_cleans_workspace(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    real_build = loader._build_database
+    real_open = loader.os.open
+    real_fstat = loader.os.fstat
+    observed: dict[str, Any] = {"failed": False}
+
+    def fail_database_fstat(*args: Any, **kwargs: Any) -> Any:
+        def record_database_open(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path).name == "database.duckdb" and dir_fd is not None:
+                observed.setdefault("database_descriptor", descriptor)
+            return descriptor
+
+        def fail_first_database_fstat(descriptor: int) -> Any:
+            if (
+                descriptor == observed.get("database_descriptor")
+                and not observed["failed"]
+            ):
+                observed["failed"] = True
+                raise OSError("injected database fstat failure")
+            return real_fstat(descriptor)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(loader.os, "open", record_database_open)
+            scoped.setattr(loader.os, "fstat", fail_first_database_fstat)
+            return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_build_database", fail_database_fstat)
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(csv_dir, target, bundle, manifest)
+
+    assert observed["failed"] is True
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target)
+
+
+def test_receipt_destination_first_fstat_failure_cleans_workspace(
+    tmp_path: Path,
+    bundle: SemanticBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _loader()
+    csv_dir, manifest = write_bundle_csv_fixture(tmp_path, bundle)
+    target = tmp_path / "workshop.duckdb"
+    target.write_bytes(b"existing target bytes")
+    target_before = target.read_bytes()
+    receipt_dir = tmp_path / "receipts"
+    real_write_receipt = loader._write_receipt_temp
+    real_mkstemp = loader.tempfile.mkstemp
+    real_fstat = loader.os.fstat
+    observed: dict[str, Any] = {"failed": False}
+
+    def fail_receipt_fstat(*args: Any, **kwargs: Any) -> Any:
+        def record_receipt_temp(*mkstemp_args: Any, **mkstemp_kwargs: Any) -> Any:
+            descriptor, raw_path = real_mkstemp(*mkstemp_args, **mkstemp_kwargs)
+            observed["receipt_descriptor"] = descriptor
+            return descriptor, raw_path
+
+        def fail_first_receipt_fstat(descriptor: int) -> Any:
+            if (
+                descriptor == observed.get("receipt_descriptor")
+                and not observed["failed"]
+            ):
+                observed["failed"] = True
+                raise OSError("injected receipt fstat failure")
+            return real_fstat(descriptor)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(loader.tempfile, "mkstemp", record_receipt_temp)
+            scoped.setattr(loader.os, "fstat", fail_first_receipt_fstat)
+            return real_write_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_write_receipt_temp", fail_receipt_fstat)
+
+    with pytest.raises(loader.LoadError):
+        loader.load_csvs(
+            csv_dir,
+            target,
+            bundle,
+            manifest,
+            receipt_dir=receipt_dir,
+        )
+
+    assert observed["failed"] is True
+    assert target.read_bytes() == target_before
+    _assert_no_invocation_temps(target, receipt_dir)

@@ -23,7 +23,6 @@ from cerebro.provenance import (
     canonical_json_bytes,
     manifest_table_id,
     semantic_bundle_sha256,
-    sha256_file,
     source_manifest_sha256,
 )
 
@@ -396,11 +395,15 @@ def preflight_csvs(
     """Validate every source and return immutable, name-aligned load metadata."""
     if not isinstance(manifest, SourceManifest):
         raise LoadError("manifest must be a SourceManifest")
+    if not isinstance(bundle, SemanticBundle):
+        raise LoadError("bundle must be a SemanticBundle")
+    bundle_snapshot = SemanticBundle.model_validate(bundle.model_dump(mode="python"))
+    bundle_hash = semantic_bundle_sha256(bundle_snapshot)
     root = Path(csv_dir)
     if not root.is_dir():
         raise LoadError(f"CSV directory does not exist: {root}")
 
-    bundle_tables = _active_bundle_tables(bundle)
+    bundle_tables = _active_bundle_tables(bundle_snapshot)
     manifest_tables = {table.name: table for table in manifest.tables}
     bundle_names = set(bundle_tables)
     manifest_names = set(manifest_tables)
@@ -560,7 +563,7 @@ def preflight_csvs(
         raise LoadError("CSV preflight failed: " + "; ".join(errors))
     return SourceInventory(
         source_manifest_sha256=source_manifest_sha256(manifest),
-        bundle_sha256=semantic_bundle_sha256(bundle),
+        bundle_sha256=bundle_hash,
         tables=tuple(inventory_tables),
     )
 
@@ -765,6 +768,7 @@ def _open_regular_directory_entry(
     name: str,
     *,
     error_message: str,
+    known_entries: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[int, os.stat_result]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -772,6 +776,8 @@ def _open_regular_directory_entry(
     except OSError as exc:
         raise LoadError(error_message) from exc
     try:
+        if known_entries is not None:
+            _register_created_entry(descriptor, name, known_entries)
         descriptor_stat = _validate_regular_descriptor_entry(
             descriptor,
             directory_descriptor,
@@ -808,6 +814,54 @@ def _read_bounded_descriptor(descriptor: int, limit: int) -> bytes:
             break
         contents.extend(chunk)
     return bytes(contents)
+
+
+def _read_bounded_descriptor_from_start(descriptor: int, limit: int) -> bytes:
+    contents = bytearray()
+    while len(contents) < limit:
+        try:
+            chunk = os.pread(
+                descriptor,
+                min(64 * 1024, limit - len(contents)),
+                len(contents),
+            )
+        except OSError as exc:
+            raise LoadError("retained receipt content could not be read") from exc
+        if not chunk:
+            break
+        contents.extend(chunk)
+    return bytes(contents)
+
+
+def _validate_retained_receipt(
+    descriptor: int,
+    path: Path,
+    receipt_bytes: bytes,
+    *,
+    error_message: str,
+) -> None:
+    _validate_regular_descriptor_path(
+        descriptor,
+        path,
+        error_message=error_message,
+    )
+    retained_bytes = _read_bounded_descriptor_from_start(
+        descriptor,
+        len(receipt_bytes) + 1,
+    )
+    if retained_bytes != receipt_bytes:
+        raise LoadError(error_message)
+    try:
+        retained = MaterializationReceipt.model_validate_json(retained_bytes)
+    except Exception as exc:
+        raise LoadError(error_message) from exc
+    if canonical_json_bytes(retained) != receipt_bytes:
+        raise LoadError(error_message)
+    _validate_regular_descriptor_path(
+        descriptor,
+        path,
+        error_message=error_message,
+    )
 
 
 def _validate_existing_receipt(receipt_path: Path, receipt_bytes: bytes) -> None:
@@ -1014,7 +1068,7 @@ def _copy_verified_snapshot(
     workspace_descriptor: int,
     known_entries: dict[str, tuple[int, int]],
     index: int,
-) -> Path:
+) -> tuple[Path, int]:
     snapshot = workspace / f"source-{index:04d}.csv"
     _validate_directory_descriptor_path(
         workspace_descriptor,
@@ -1022,74 +1076,27 @@ def _copy_verified_snapshot(
         required_mode=0o700,
         error_message="source snapshot workspace is not the pinned mode-0700 directory",
     )
-    source_descriptor = _open_regular_source(table.source_file)
-    destination_descriptor: int | None = None
-    flags = (
-        os.O_RDWR
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    digest = sha256()
     try:
-        destination_descriptor = os.open(
-            snapshot.name,
-            flags,
-            0o600,
-            dir_fd=workspace_descriptor,
-        )
-        destination_stat = _register_created_entry(
-            destination_descriptor,
-            snapshot.name,
+        snapshot_descriptor, snapshot_hash = _copy_preflight_snapshot(
+            table.source_file,
+            snapshot,
+            workspace_descriptor,
             known_entries,
         )
-        if not stat.S_ISREG(destination_stat.st_mode):
-            raise LoadError("verified source snapshot is not a regular file")
-        _validate_regular_descriptor_entry(
-            destination_descriptor,
-            workspace_descriptor,
-            snapshot.name,
-            error_message="verified source snapshot entry changed after creation",
-        )
-
-        with os.fdopen(source_descriptor, "rb") as source:
-            source_descriptor = -1
-            with os.fdopen(
-                destination_descriptor,
-                "wb",
-                closefd=False,
-            ) as destination:
-                while chunk := source.read(1024 * 1024):
-                    digest.update(chunk)
-                    destination.write(chunk)
-                destination.flush()
-                os.fsync(destination_descriptor)
-
-        if digest.hexdigest() != table.source_file_sha256:
-            raise LoadError(f"source changed after preflight: {table.source_file.name}")
-
-        os.fchmod(destination_descriptor, 0o400)
-        snapshot_stat = _validate_regular_descriptor_entry(
-            destination_descriptor,
-            workspace_descriptor,
-            snapshot.name,
-            error_message="verified source snapshot entry changed after copying",
-        )
-        if stat.S_IMODE(snapshot_stat.st_mode) != 0o400:
-            raise LoadError("verified source snapshot is not mode 0400")
-        if _sha256_descriptor(destination_descriptor) != table.source_file_sha256:
-            raise LoadError("verified source snapshot hash changed after copying")
-        return snapshot
-    except OSError as exc:
+    except LoadError as exc:
+        if str(exc).startswith("could not securely open source"):
+            raise
         raise LoadError(
             f"could not create verified snapshot for {table.source_file.name}"
         ) from exc
-    finally:
-        if source_descriptor >= 0:
-            os.close(source_descriptor)
-        if destination_descriptor is not None:
-            os.close(destination_descriptor)
+    if snapshot_hash != table.source_file_sha256:
+        os.close(snapshot_descriptor)
+        raise LoadError(f"source changed after preflight: {table.source_file.name}")
+    try:
+        return _retained_descriptor_path(snapshot_descriptor), snapshot_descriptor
+    except Exception:
+        os.close(snapshot_descriptor)
+        raise
 
 
 def _snapshot_inventory(
@@ -1097,31 +1104,41 @@ def _snapshot_inventory(
     workspace: Path,
     workspace_descriptor: int,
     known_entries: dict[str, tuple[int, int]],
-) -> SourceInventory:
+) -> tuple[SourceInventory, tuple[int, ...]]:
     snapshot_tables: list[SourceTableInventory] = []
-    for index, table in enumerate(inventory.tables):
-        snapshot = _copy_verified_snapshot(
-            table,
-            workspace,
-            workspace_descriptor,
-            known_entries,
-            index,
-        )
-        snapshot_tables.append(
-            SourceTableInventory(
-                name=table.name,
-                table_id=table.table_id,
-                source_file=snapshot,
-                source_file_sha256=table.source_file_sha256,
-                row_count=table.row_count,
-                columns=table.columns,
-                ddl=table.ddl,
+    snapshot_descriptors: list[int] = []
+    try:
+        for index, table in enumerate(inventory.tables):
+            snapshot, snapshot_descriptor = _copy_verified_snapshot(
+                table,
+                workspace,
+                workspace_descriptor,
+                known_entries,
+                index,
             )
-        )
-    return SourceInventory(
-        source_manifest_sha256=inventory.source_manifest_sha256,
-        bundle_sha256=inventory.bundle_sha256,
-        tables=tuple(snapshot_tables),
+            snapshot_descriptors.append(snapshot_descriptor)
+            snapshot_tables.append(
+                SourceTableInventory(
+                    name=table.name,
+                    table_id=table.table_id,
+                    source_file=snapshot,
+                    source_file_sha256=table.source_file_sha256,
+                    row_count=table.row_count,
+                    columns=table.columns,
+                    ddl=table.ddl,
+                )
+            )
+    except Exception:
+        for descriptor in snapshot_descriptors:
+            os.close(descriptor)
+        raise
+    return (
+        SourceInventory(
+            source_manifest_sha256=inventory.source_manifest_sha256,
+            bundle_sha256=inventory.bundle_sha256,
+            tables=tuple(snapshot_tables),
+        ),
+        tuple(snapshot_descriptors),
     )
 
 
@@ -1130,6 +1147,7 @@ def _build_database(
     inventory: SourceInventory,
     workspace_descriptor: int,
     known_entries: dict[str, tuple[int, int]],
+    snapshot_descriptors: tuple[int, ...],
 ) -> int:
     _validate_directory_descriptor_path(
         workspace_descriptor,
@@ -1150,23 +1168,17 @@ def _build_database(
     else:
         raise LoadError("private database path already exists")
 
-    for table in inventory.tables:
-        expected_identity = known_entries.get(table.source_file.name)
-        try:
-            snapshot_stat = os.stat(
-                table.source_file.name,
-                dir_fd=workspace_descriptor,
-                follow_symlinks=False,
-            )
-        except OSError as exc:
-            raise LoadError("source snapshot escaped the private workspace") from exc
-        if (
-            table.source_file.parent != path.parent
-            or expected_identity is None
-            or not stat.S_ISREG(snapshot_stat.st_mode)
-            or _identity(snapshot_stat) != expected_identity
-        ):
-            raise LoadError("source snapshot escaped the private workspace")
+    if len(snapshot_descriptors) != len(inventory.tables):
+        raise LoadError("retained source snapshot count does not match inventory")
+    for table, descriptor in zip(
+        inventory.tables,
+        snapshot_descriptors,
+        strict=True,
+    ):
+        if _retained_descriptor_path(descriptor) != table.source_file:
+            raise LoadError("source snapshot is not the retained descriptor")
+        if _sha256_descriptor(descriptor) != table.source_file_sha256:
+            raise LoadError(f"verified source snapshot changed: {table.name}")
 
     connection: duckdb.DuckDBPyConnection | None = None
     database_descriptor: int | None = None
@@ -1174,17 +1186,27 @@ def _build_database(
     try:
         try:
             connection = duckdb.connect(str(path))
-            database_descriptor, database_stat = _open_regular_directory_entry(
+            database_descriptor, _ = _open_regular_directory_entry(
                 workspace_descriptor,
                 path.name,
                 error_message="database entry is not the opened regular file",
+                known_entries=known_entries,
             )
-            known_entries[path.name] = _identity(database_stat)
             connection.execute("BEGIN TRANSACTION")
             transaction_open = True
-            for table in inventory.tables:
-                if sha256_file(table.source_file) != table.source_file_sha256:
+            for table, descriptor in zip(
+                inventory.tables,
+                snapshot_descriptors,
+                strict=True,
+            ):
+                if _sha256_descriptor(descriptor) != table.source_file_sha256:
                     raise LoadError(f"verified source snapshot changed: {table.name}")
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                except OSError as exc:
+                    raise LoadError(
+                        f"could not rewind verified source snapshot: {table.name}"
+                    ) from exc
                 loaded_count = _load_table(
                     connection,
                     table.source_file,
@@ -1195,9 +1217,17 @@ def _build_database(
                         f"loaded row count mismatch for {table.name}: "
                         f"expected {table.row_count}, got {loaded_count}"
                     )
+                if _sha256_descriptor(descriptor) != table.source_file_sha256:
+                    raise LoadError(
+                        f"verified source snapshot changed while loading: {table.name}"
+                    )
             _verify_materialization(connection, inventory)
-            for table in inventory.tables:
-                if sha256_file(table.source_file) != table.source_file_sha256:
+            for table, descriptor in zip(
+                inventory.tables,
+                snapshot_descriptors,
+                strict=True,
+            ):
+                if _sha256_descriptor(descriptor) != table.source_file_sha256:
                     raise LoadError(
                         f"verified source snapshot changed while loading: {table.name}"
                     )
@@ -1243,6 +1273,7 @@ def _write_receipt_temp(
         raise LoadError("receipt workspace is not a private mode-0700 directory")
 
     descriptor = -1
+    read_descriptor = -1
     try:
         descriptor, raw_path = tempfile.mkstemp(
             dir=receipt_workspace,
@@ -1252,9 +1283,14 @@ def _write_receipt_temp(
         receipt_temp = Path(raw_path)
         if receipt_temp.parent != receipt_workspace:
             raise LoadError("temporary receipt escaped its private workspace")
-        descriptor_stat = os.fstat(descriptor)
         if known_entries is not None:
-            known_entries[receipt_temp.name] = _identity(descriptor_stat)
+            descriptor_stat = _register_created_entry(
+                descriptor,
+                receipt_temp.name,
+                known_entries,
+            )
+        else:
+            descriptor_stat = os.fstat(descriptor)
         descriptor_stat = _validate_regular_descriptor_path(
             descriptor,
             receipt_temp,
@@ -1277,13 +1313,32 @@ def _write_receipt_temp(
         validated = MaterializationReceipt.model_validate_json(validated_bytes)
         if canonical_json_bytes(validated) != receipt_bytes:
             raise LoadError("temporary receipt is not canonical")
-        _validate_regular_descriptor_path(
+
+        os.fchmod(descriptor, 0o400)
+        read_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        read_descriptor = os.open(receipt_temp, read_flags)
+        read_stat = _validate_regular_descriptor_path(
+            read_descriptor,
+            receipt_temp,
+            error_message="read-only receipt is not the validated regular file",
+        )
+        if _identity(read_stat) != _identity(os.fstat(descriptor)):
+            raise LoadError("read-only receipt is not the written receipt inode")
+        os.dup2(read_descriptor, descriptor, inheritable=False)
+        os.close(read_descriptor)
+        read_descriptor = -1
+        _validate_retained_receipt(
             descriptor,
             receipt_temp,
-            error_message="temporary receipt path changed before publication",
+            receipt_bytes,
+            error_message="temporary receipt content changed before publication",
         )
         return descriptor, receipt_temp
     except Exception:
+        if read_descriptor >= 0:
+            os.close(read_descriptor)
         if descriptor >= 0:
             os.close(descriptor)
         raise
@@ -1474,12 +1529,14 @@ def load_csvs(
     workspace_descriptor: int | None = None
     workspace_identity: tuple[int, int] | None = None
     workspace_entries: dict[str, tuple[int, int]] = {}
+    source_snapshot_descriptors: tuple[int, ...] = ()
     database_descriptor: int | None = None
     receipt_workspace: Path | None = None
     receipt_workspace_descriptor: int | None = None
     receipt_workspace_identity: tuple[int, int] | None = None
     receipt_workspace_entries: dict[str, tuple[int, int]] = {}
     receipt_descriptor: int | None = None
+    receipt_uses_retained_inode = False
     try:
         target_parent_descriptor, _ = _open_directory_descriptor(
             target_dir,
@@ -1495,7 +1552,7 @@ def load_csvs(
             required_mode=0o700,
             error_message="private workspace is not in the pinned target directory",
         )
-        snapshot_inventory = _snapshot_inventory(
+        snapshot_inventory, source_snapshot_descriptors = _snapshot_inventory(
             inventory,
             workspace,
             workspace_descriptor,
@@ -1507,7 +1564,11 @@ def load_csvs(
             snapshot_inventory,
             workspace_descriptor,
             workspace_entries,
+            source_snapshot_descriptors,
         )
+        for descriptor in source_snapshot_descriptors:
+            os.close(descriptor)
+        source_snapshot_descriptors = ()
         database_hash = _sha256_descriptor(database_descriptor)
 
         receipt = MaterializationReceipt(
@@ -1550,16 +1611,27 @@ def load_csvs(
         except FileExistsError:
             _validate_existing_receipt(receipt_path, receipt_bytes)
         else:
-            _validate_regular_descriptor_path(
+            receipt_uses_retained_inode = True
+            _validate_retained_receipt(
                 receipt_descriptor,
                 receipt_path,
-                error_message="published receipt is not the validated regular file",
+                receipt_bytes,
+                error_message="published receipt content changed",
             )
 
         # Publication makes this immutable path shared evidence. If database
         # replacement fails, leave the harmless orphan in place: its database
         # hash cannot validate against a mismatched target, and another
         # invocation may already have adopted it.
+        if receipt_uses_retained_inode:
+            _validate_retained_receipt(
+                receipt_descriptor,
+                receipt_path,
+                receipt_bytes,
+                error_message="published receipt content changed",
+            )
+        else:
+            _validate_existing_receipt(receipt_path, receipt_bytes)
         previous_target = _prepare_existing_target_backup(
             target_parent_descriptor,
             target.name,
@@ -1594,6 +1666,15 @@ def load_csvs(
             )
             if _sha256_descriptor(database_descriptor) != database_hash:
                 raise LoadError("published database hash changed during publication")
+            if receipt_uses_retained_inode:
+                _validate_retained_receipt(
+                    receipt_descriptor,
+                    receipt_path,
+                    receipt_bytes,
+                    error_message="published receipt content changed during publication",
+                )
+            else:
+                _validate_existing_receipt(receipt_path, receipt_bytes)
         except Exception:
             _restore_target_after_publication_failure(
                 target_parent_descriptor=target_parent_descriptor,
@@ -1617,6 +1698,8 @@ def load_csvs(
             raise
         raise LoadError(f"DuckDB materialization failed: {exc}") from exc
     finally:
+        for descriptor in source_snapshot_descriptors:
+            os.close(descriptor)
         if receipt_descriptor is not None:
             os.close(receipt_descriptor)
         _remove_private_workspace(
