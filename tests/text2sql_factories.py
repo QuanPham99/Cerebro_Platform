@@ -848,3 +848,24 @@ def complex_node_ir(snapshot=None, kind="window"):
             ),
         ),
     )
+
+
+GUARDED_VOLUME_QUESTION = "transaction volume by branch with at least five accounts"
+
+
+def guarded_branch_volume_ir(snapshot=None, question=GUARDED_VOLUME_QUESTION):
+    """Branch volume plus the minimum contributing-group guard FR-713 requires.
+
+    `SUM` over a confidential column is a reducing aggregate, so a legitimate
+    query must declare a minimum group size rather than relying on the caller.
+    """
+    snapshot = snapshot or valid_snapshot()
+    base = branch_volume_ir(snapshot)
+    guard = question_literal_ref(question, token="five", data_type="integer")
+    nodes = tuple(
+        node.model_copy(update={"minimum_group_size": guard})
+        if node.kind == "aggregate"
+        else node
+        for node in base.nodes
+    )
+    return base.model_copy(update={"nodes": nodes})
