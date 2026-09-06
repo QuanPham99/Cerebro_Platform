@@ -238,6 +238,26 @@ def check_preflight(
     )
 
 
+def probe_and_write_provider_capability(
+    *,
+    environ: Mapping[str, str],
+    receipt_dir: Path,
+) -> Path:
+    """Perform the one metadata-only organizer schema call and record a receipt.
+
+    This is an explicit opt-in action. `check_preflight` itself stays offline
+    and never contacts a provider, so ordinary readiness reporting cannot make
+    a network call as a side effect.
+    """
+    from cerebro.hosted_provider import OrganizerModelGateway, probe_provider_schema
+
+    gateway = OrganizerModelGateway.from_environment(environ)
+    _, path = probe_provider_schema(gateway=gateway, receipt_dir=receipt_dir)
+    if path is None:  # pragma: no cover - receipt_dir is always provided here
+        raise RuntimeError("capability probe did not write a receipt")
+    return path
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Report Text-to-SQL offline and external prerequisite readiness."
@@ -248,6 +268,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database")
     parser.add_argument("--materialization-receipt")
     parser.add_argument("--provider-capability-receipt")
+    parser.add_argument(
+        "--probe-provider-capability",
+        metavar="RECEIPT_DIR",
+        help=(
+            "perform one metadata-only organizer schema call and write a "
+            "content-addressed capability receipt into RECEIPT_DIR"
+        ),
+    )
     return parser
 
 
@@ -265,6 +293,12 @@ def main(
 ) -> int:
     runtime_environment = os.environ if environ is None else environ
     arguments = _argument_parser().parse_args(list(argv) if argv is not None else None)
+    if arguments.probe_provider_capability:
+        receipt_path = probe_and_write_provider_capability(
+            environ=runtime_environment,
+            receipt_dir=Path(arguments.probe_provider_capability),
+        )
+        print(f"provider_capability_receipt={receipt_path}")
     report = check_preflight(
         csv_dir=_configured_path(
             arguments.csv_dir, runtime_environment, "CEREBRO_CSV_DIR"
