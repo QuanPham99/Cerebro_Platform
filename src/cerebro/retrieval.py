@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -7,13 +8,32 @@ from collections import defaultdict
 from typing import Callable
 
 from .models import (
+    EXPRESSION_TYPE_REGISTRY_VERSION,
+    GROUNDING_SNAPSHOT_VERSION,
+    LITERAL_SPAN_REGISTRY_VERSION,
+    QUESTION_CANONICALIZATION_VERSION,
+    AuthorizationScope,
+    ColumnRef,
+    DialectCapabilities,
     GraphEdge,
     GraphNode,
     GraphResponse,
     GroundingResponse,
+    GroundingSnapshot,
     RankedResult,
     SemanticBundle,
     SemanticObject,
+    SnapshotColumn,
+    SnapshotGovernedLiteral,
+    SnapshotMetadataObject,
+    SnapshotRankingEvidence,
+    SnapshotRelationship,
+    SnapshotWarning,
+)
+from .provenance import (
+    authorization_scope_sha256,
+    canonicalize_question,
+    grounding_snapshot_sha256,
 )
 
 TOKEN = re.compile(r"[a-z0-9]+")
@@ -236,3 +256,364 @@ def embedder_from_environment() -> OpenAIEmbedder | None:
         return OpenAIEmbedder(os.getenv("CEREBRO_EMBEDDING_MODEL", "text-embedding-3-small"))
     except (ImportError, RuntimeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Authorization-first retrieval and immutable grounding snapshots (Task 3).
+#
+# The advisory methods above stay unchanged: `/api/grounding` and the MCP tools
+# keep returning metadata-only `GroundingResponse`. Everything below is a
+# separate, scope-first path that never ranks or traverses an unauthorized
+# object and freezes its result as a value-free `GroundingSnapshot`.
+# ---------------------------------------------------------------------------
+
+
+class AuthorizationScopeIntegrityError(Exception):
+    """Raised when a scope's declared hash does not match its payload."""
+
+
+class SnapshotMetadataError(Exception):
+    """Raised when governed metadata cannot be normalized without guessing."""
+
+
+class UnsupportedDialectError(Exception):
+    """Raised for any dialect other than the single supported `duckdb`."""
+
+
+# Declared DuckDB types normalize into the versioned scalar registry. Anything
+# absent here fails closed rather than being guessed into a scalar type.
+_DECLARED_TYPE_TO_SCALAR: dict[str, str] = {
+    "BIGINT": "integer",
+    "INTEGER": "integer",
+    "INT": "integer",
+    "SMALLINT": "integer",
+    "TINYINT": "integer",
+    "HUGEINT": "integer",
+    "UBIGINT": "integer",
+    "UINTEGER": "integer",
+    "USMALLINT": "integer",
+    "UTINYINT": "integer",
+    "DOUBLE": "decimal",
+    "FLOAT": "decimal",
+    "REAL": "decimal",
+    "DECIMAL": "decimal",
+    "NUMERIC": "decimal",
+    "VARCHAR": "string",
+    "TEXT": "string",
+    "STRING": "string",
+    "CHAR": "string",
+    "UUID": "string",
+    "BOOLEAN": "boolean",
+    "BOOL": "boolean",
+    "DATE": "date",
+    "TIMESTAMP": "timestamp",
+    "DATETIME": "timestamp",
+}
+_SCALAR_TYPES = frozenset(
+    {"string", "integer", "decimal", "boolean", "date", "timestamp"}
+)
+
+
+def _normalized_scalar_type(declared: object, subject: str) -> str:
+    if not isinstance(declared, str) or not declared.strip():
+        raise SnapshotMetadataError(f"{subject} has no declared type")
+    key = declared.strip().upper().split("(", 1)[0]
+    scalar = _DECLARED_TYPE_TO_SCALAR.get(key)
+    if scalar is None:
+        raise SnapshotMetadataError(f"{subject} declares an unsupported type")
+    return scalar
+
+
+def _declared_metric_result_type(metadata: dict[str, object], object_id: str) -> str:
+    declared = metadata.get("metric_result_type")
+    if not isinstance(declared, str) or declared not in _SCALAR_TYPES:
+        # Never infer a metric result type from a formula: an ungoverned guess
+        # would silently change what downstream type checking accepts.
+        raise SnapshotMetadataError(
+            f"{object_id} does not declare a governed metric result type"
+        )
+    return declared
+
+
+class GroundingResolver:
+    """Resolve a canonical question into an immutable, authorized snapshot."""
+
+    def __init__(
+        self,
+        retriever: SemanticRetriever,
+        *,
+        retrieval_config_hash: str,
+        top_k: int = 10,
+        depth: int = 1,
+    ) -> None:
+        self.retriever = retriever
+        self.retrieval_config_hash = retrieval_config_hash
+        self.top_k = top_k
+        self.depth = depth
+
+    # -- authorization boundary ------------------------------------------
+    def _is_authorized(self, obj: SemanticObject, scope: AuthorizationScope) -> bool:
+        if obj.id not in scope.allowed_object_ids:
+            return False
+        if obj.status != "active":
+            return False
+        classification = str(obj.cerebro.get("classification", "internal"))
+        return classification in scope.allowed_classifications
+
+    def authorized_candidates(
+        self, scope: AuthorizationScope
+    ) -> tuple[SemanticObject, ...]:
+        """Return the only objects retrieval may ever see, before ranking."""
+        return tuple(
+            obj
+            for obj in self.retriever.bundle.objects
+            if self._is_authorized(obj, scope)
+        )
+
+    def expand_authorized(
+        self,
+        seed_ids: tuple[str, ...] | list[str],
+        scope: AuthorizationScope,
+        depth: int = 1,
+    ) -> tuple[str, ...]:
+        """Expand the graph without ever entering an unauthorized node."""
+        allowed = {obj.id for obj in self.authorized_candidates(scope)}
+        visited = {object_id for object_id in seed_ids if object_id in allowed}
+        frontier = set(visited)
+        for _ in range(max(0, depth)):
+            neighbors = {
+                neighbor
+                for item in frontier
+                for neighbor in self.retriever.adjacency.get(item, set())
+                if neighbor in allowed
+            }
+            frontier = neighbors - visited
+            if not frontier:
+                break
+            visited.update(frontier)
+        return tuple(sorted(visited))
+
+    def _ranked_authorized(
+        self, canonical_question: str, scope: AuthorizationScope
+    ) -> list[tuple[str, float, list[str]]]:
+        allowed = {obj.id for obj in self.authorized_candidates(scope)}
+        terms = _tokens(canonical_question)
+        ranked: list[tuple[str, float, list[str]]] = []
+        for object_id in sorted(allowed):
+            haystack = _tokens(self.retriever.documents.get(object_id, ""))
+            counts = {term: haystack.count(term) for term in set(terms)}
+            matched = sorted({term for term in terms if counts.get(term, 0)})
+            if not matched:
+                continue
+            score = sum(1.0 + math.log1p(counts[term]) for term in matched)
+            ranked.append(
+                (object_id, round(score, 8), [f"lexical:{term}" for term in matched])
+            )
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        return ranked[: self.top_k]
+
+    # -- snapshot construction -------------------------------------------
+    def _snapshot_columns(
+        self, obj: SemanticObject, scope: AuthorizationScope
+    ) -> tuple[SnapshotColumn, ...]:
+        columns: list[SnapshotColumn] = []
+        for column in obj.cerebro.get("columns", []) or []:
+            if not isinstance(column, dict):
+                raise SnapshotMetadataError(f"{obj.id} declares a malformed column")
+            name = column.get("name")
+            if not isinstance(name, str) or not name:
+                raise SnapshotMetadataError(f"{obj.id} declares an unnamed column")
+            classification = str(column.get("classification", "internal"))
+            if classification not in scope.allowed_classifications:
+                continue
+            columns.append(
+                SnapshotColumn(
+                    ref=ColumnRef(table_id=obj.id, column=name),
+                    data_type=_normalized_scalar_type(
+                        column.get("data_type"), f"{obj.id}.{name}"
+                    ),
+                    description=str(column.get("description", "")),
+                    classification=classification,
+                )
+            )
+        return tuple(columns)
+
+    def _snapshot_relationships(
+        self, obj: SemanticObject, authorized_ids: frozenset[str]
+    ) -> tuple[SnapshotRelationship, ...]:
+        relationships: list[SnapshotRelationship] = []
+        for candidate_id in sorted(set(obj.links) | {obj.id}):
+            candidate = self.retriever.by_id.get(candidate_id)
+            if candidate is None or candidate.type != "relationship":
+                continue
+            if candidate.id not in authorized_ids:
+                continue
+            metadata = candidate.cerebro
+            source_table = str(metadata.get("source_table", ""))
+            target_table = str(metadata.get("target_table", ""))
+            source_column = str(metadata.get("source_column", ""))
+            target_column = str(metadata.get("target_column", ""))
+            # Both endpoints must survive authorization, otherwise the edge
+            # would leak the existence of an unauthorized table.
+            if source_table not in authorized_ids or target_table not in authorized_ids:
+                continue
+            if not source_column or not target_column:
+                raise SnapshotMetadataError(
+                    f"{candidate.id} does not declare both join columns"
+                )
+            relationships.append(
+                SnapshotRelationship(
+                    relationship_id=candidate.id,
+                    left=ColumnRef(table_id=source_table, column=source_column),
+                    right=ColumnRef(table_id=target_table, column=target_column),
+                )
+            )
+        return tuple(relationships)
+
+    @staticmethod
+    def _snapshot_warnings(obj: SemanticObject) -> tuple[SnapshotWarning, ...]:
+        warnings: list[SnapshotWarning] = []
+        for warning in obj.cerebro.get("warnings", []) or []:
+            text = str(warning)
+            if not text:
+                continue
+            # Prose carries no actionable authority: it becomes a stable hash
+            # with no control ID until a governed control registry exists.
+            warnings.append(
+                SnapshotWarning(
+                    object_id=obj.id,
+                    warning_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    kind="informational",
+                    control_id="",
+                )
+            )
+        return tuple(warnings)
+
+    @staticmethod
+    def _governed_literals(
+        obj: SemanticObject,
+    ) -> tuple[SnapshotGovernedLiteral, ...]:
+        declared = obj.cerebro.get("governed_literals", []) or []
+        if not isinstance(declared, list):
+            raise SnapshotMetadataError(
+                f"{obj.id} declares malformed governed literals"
+            )
+        literals: list[SnapshotGovernedLiteral] = []
+        for entry in declared:
+            # Only an exact authored declaration counts. No discovery, sample,
+            # or config-derived value may ever populate a governed literal.
+            if not isinstance(entry, dict):
+                raise SnapshotMetadataError(
+                    f"{obj.id} declares a malformed governed literal"
+                )
+            if set(entry) != {"literal_id", "data_type", "value"}:
+                raise SnapshotMetadataError(
+                    f"{obj.id} governed literals require exactly ID, type, and value"
+                )
+            literals.append(
+                SnapshotGovernedLiteral(
+                    literal_id=str(entry["literal_id"]),
+                    data_type=str(entry["data_type"]),
+                    value=entry["value"],
+                    source_object_id=obj.id,
+                )
+            )
+        return tuple(literals)
+
+    def _snapshot_object(
+        self,
+        obj: SemanticObject,
+        scope: AuthorizationScope,
+        authorized_ids: frozenset[str],
+    ) -> SnapshotMetadataObject:
+        formula: str | None = None
+        metric_result_type: str | None = None
+        if obj.type == "metric":
+            declared_formula = obj.cerebro.get("formula")
+            if not isinstance(declared_formula, str) or not declared_formula.strip():
+                raise SnapshotMetadataError(f"{obj.id} declares no governed formula")
+            formula = declared_formula
+            metric_result_type = _declared_metric_result_type(obj.cerebro, obj.id)
+        return SnapshotMetadataObject(
+            object_id=obj.id,
+            object_type=obj.type,
+            description=obj.description,
+            columns=self._snapshot_columns(obj, scope) if obj.type == "table" else (),
+            formula=formula,
+            metric_result_type=metric_result_type,
+            relationships=self._snapshot_relationships(obj, authorized_ids),
+            warnings=self._snapshot_warnings(obj),
+        )
+
+    def resolve(
+        self,
+        canonical_question: str,
+        scope: AuthorizationScope,
+        dialect: str,
+    ) -> GroundingSnapshot:
+        """Freeze an authorized, value-free snapshot for one canonical question."""
+        if not isinstance(scope, AuthorizationScope):
+            raise TypeError("scope must be a trusted AuthorizationScope")
+        if dialect != "duckdb":
+            raise UnsupportedDialectError("only the duckdb dialect is supported")
+        if canonicalize_question(canonical_question) != canonical_question:
+            raise ValueError("question must already be canonical")
+        # Integrity first: a scope whose hash does not match its payload never
+        # reaches retrieval. This proves integrity, not caller authentication.
+        if authorization_scope_sha256(scope) != scope.authorization_scope_hash:
+            raise AuthorizationScopeIntegrityError(
+                "authorization scope hash does not match its payload"
+            )
+
+        candidates = self.authorized_candidates(scope)
+        authorized_ids = frozenset(obj.id for obj in candidates)
+        ranked = self._ranked_authorized(canonical_question, scope)
+        selected_ids = set(
+            self.expand_authorized(
+                tuple(object_id for object_id, _, _ in ranked), scope, self.depth
+            )
+        )
+        selected = tuple(obj for obj in candidates if obj.id in selected_ids)
+
+        objects = tuple(
+            self._snapshot_object(obj, scope, authorized_ids) for obj in selected
+        )
+        governed_literals = tuple(
+            literal for obj in selected for literal in self._governed_literals(obj)
+        )
+        ranking_evidence = tuple(
+            SnapshotRankingEvidence(
+                object_id=object_id,
+                rank=index,
+                score=score,
+                signal_codes=("lexical",) if reasons else (),
+            )
+            for index, (object_id, score, reasons) in enumerate(ranked, 1)
+            if object_id in selected_ids
+        )
+
+        draft = GroundingSnapshot(
+            snapshot_version=GROUNDING_SNAPSHOT_VERSION,
+            semantic_version=self.retriever.bundle.version,
+            policy_version=scope.policy_version,
+            canonicalization_version=QUESTION_CANONICALIZATION_VERSION,
+            literal_registry_version=LITERAL_SPAN_REGISTRY_VERSION,
+            type_registry_version=EXPRESSION_TYPE_REGISTRY_VERSION,
+            authorization_scope_hash=scope.authorization_scope_hash,
+            retrieval_config_hash=self.retrieval_config_hash,
+            dialect="duckdb",
+            objects=objects,
+            governed_literals=governed_literals,
+            ranking_evidence=ranking_evidence,
+            authorized_object_ids=frozenset(item.object_id for item in objects),
+            policy_ids=frozenset(
+                item.object_id for item in objects if item.object_type == "policy"
+            ),
+            dialect_capabilities=DialectCapabilities(
+                supports_window=True, supports_set_operations=True
+            ),
+            snapshot_hash="0" * 64,
+        )
+        return draft.model_copy(
+            update={"snapshot_hash": grounding_snapshot_sha256(draft)}
+        )
