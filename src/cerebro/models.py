@@ -1593,13 +1593,20 @@ class ResponseBase(StrictModel):
             return self
         if self.snapshot_hash is None:
             raise ValueError("a generated response must cite its snapshot hash")
+        # A validated cache hit preserves its original route with zero semantic
+        # calls, so planned-route evidence is required only when a call happened.
+        served_from_cache = self.cache_status == "hit" and usage.semantic_calls == 0
         if self.generation_route == "planned_ir":
+            if served_from_cache:
+                return self
             if not usage.planned_ir_authorized:
                 raise ValueError("the planned route requires planned authorization")
             if usage.semantic_call_capacity != 2:
                 raise ValueError("the planned route requires planned capacity")
             if not planned_attempts:
                 raise ValueError("the planned route requires a planned attempt")
+            return self
+        if served_from_cache:
             return self
         if usage.planned_ir_authorized:
             raise ValueError("the default route authorizes no plan")
