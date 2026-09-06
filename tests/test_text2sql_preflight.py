@@ -815,3 +815,85 @@ def test_non_mapping_bundle_manifest_fails_closed_without_leakage(
     serialized = report.model_dump_json()
     assert canary not in serialized
     assert str(tmp_path) not in serialized
+
+
+def test_organizer_llm_environment_aliases_satisfy_the_organizer_gate(tmp_path):
+    """The organizer publishes `CEREBRO_LLM_*`; both spellings must be accepted."""
+    ProviderCapabilityReceipt = _contracts()[4]
+    check_preflight = _preflight().check_preflight
+    receipt = ProviderCapabilityReceipt(
+        provider="organizer.example",
+        model="organizer-model",
+        revision="organizer-model",
+        schema_mechanism="json_schema",
+    )
+    receipt_path = tmp_path / "capability.json"
+    receipt_path.write_text(receipt.model_dump_json(), encoding="utf-8")
+
+    canonical = check_preflight(
+        csv_dir=None,
+        manifest_path=None,
+        bundle_path=None,
+        environ={"CEREBRO_API_KEY": "key", "CEREBRO_MODEL": "organizer-model"},
+        database_path=None,
+        materialization_receipt_path=None,
+        provider_capability_receipt_path=receipt_path,
+    )
+    assert canonical.organizer_prerequisites_ready is True
+
+    aliased = check_preflight(
+        csv_dir=None,
+        manifest_path=None,
+        bundle_path=None,
+        environ={
+            "CEREBRO_LLM_API_KEY": "key",
+            "CEREBRO_LLM_MODEL": "organizer-model",
+        },
+        database_path=None,
+        materialization_receipt_path=None,
+        provider_capability_receipt_path=receipt_path,
+    )
+    assert aliased.organizer_prerequisites_ready is True
+
+    absent = check_preflight(
+        csv_dir=None,
+        manifest_path=None,
+        bundle_path=None,
+        environ={},
+        database_path=None,
+        materialization_receipt_path=None,
+        provider_capability_receipt_path=receipt_path,
+    )
+    assert absent.organizer_prerequisites_ready is False
+    assert {blocker.code for blocker in absent.blockers} >= {
+        "missing_api_key",
+        "missing_model",
+    }
+
+
+def test_canonical_model_name_wins_over_the_llm_alias(tmp_path):
+    ProviderCapabilityReceipt = _contracts()[4]
+    check_preflight = _preflight().check_preflight
+    receipt = ProviderCapabilityReceipt(
+        provider="organizer.example",
+        model="canonical-model",
+        revision="canonical-model",
+        schema_mechanism="json_schema",
+    )
+    receipt_path = tmp_path / "capability.json"
+    receipt_path.write_text(receipt.model_dump_json(), encoding="utf-8")
+
+    report = check_preflight(
+        csv_dir=None,
+        manifest_path=None,
+        bundle_path=None,
+        environ={
+            "CEREBRO_API_KEY": "key",
+            "CEREBRO_MODEL": "canonical-model",
+            "CEREBRO_LLM_MODEL": "alias-model",
+        },
+        database_path=None,
+        materialization_receipt_path=None,
+        provider_capability_receipt_path=receipt_path,
+    )
+    assert report.organizer_prerequisites_ready is True

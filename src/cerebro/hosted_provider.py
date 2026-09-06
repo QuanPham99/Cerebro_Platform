@@ -49,6 +49,9 @@ OutputT = TypeVar("OutputT")
 MAX_TRANSPORT_ATTEMPTS_PER_SEMANTIC_CALL = 2
 PROVIDER_TIMEOUT_MS_PER_ATTEMPT = 20_000
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# Most strict first: a provider that honors a real schema is preferred over one
+# that only guarantees JSON, which is preferred over prompt-only instruction.
+_AUTO_SCHEMA_MECHANISMS = ("json_schema", "json_object", "none")
 _BLOCKED_SOCKET_FAMILIES = (socket.AF_INET, socket.AF_INET6)
 
 
@@ -68,6 +71,43 @@ def install_offline_network_guard() -> Callable[[], None]:
         socket.socket = original_socket  # type: ignore[assignment]
 
     return restore
+
+
+def _json_payload_text(content: str) -> str:
+    """Return the JSON object text from a model reply, tolerating wrappers.
+
+    Some providers wrap the object in a markdown fence or prefix a sentence.
+    Extraction is bounded to the outermost balanced braces and never repairs or
+    invents content: prose with no JSON object stays invalid and fails decoding.
+    """
+    text = content.strip()
+    if text.startswith("```"):
+        fenced = text.split("```")
+        if len(fenced) >= 3:
+            body = fenced[1]
+            if body.lower().startswith("json"):
+                body = body[4:]
+            text = body.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _configured(environ: Mapping[str, str], *names: str) -> str:
+    """Return the first configured value among equivalent variable names.
+
+    The canonical `CEREBRO_*` names win; the `CEREBRO_LLM_*` spellings are
+    accepted because that is how the organizer environment is published.
+    """
+    for name in names:
+        value = environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _sanitized_provider_name(base_url: str) -> str:
@@ -90,14 +130,17 @@ class OrganizerModelGateway:
         client: httpx.Client,
         backoff_seconds: float = 0.5,
         max_attempts: int = MAX_TRANSPORT_ATTEMPTS_PER_SEMANTIC_CALL,
+        schema_mechanism: str = "json_schema",
+        timeout_ms: int = PROVIDER_TIMEOUT_MS_PER_ATTEMPT,
     ) -> None:
+        self.timeout_ms = timeout_ms
         self._base_url = base_url.rstrip("/")
         # The credential is held privately and only ever written to one header.
         self._api_key = api_key
         self.model = model
         self.model_revision = model_revision
         self.provider = _sanitized_provider_name(base_url)
-        self.schema_mechanism = "json_schema"
+        self.schema_mechanism = schema_mechanism
         self._client = client
         self._backoff_seconds = backoff_seconds
         self._max_attempts = max_attempts
@@ -111,10 +154,15 @@ class OrganizerModelGateway:
         backoff_seconds: float = 0.5,
         timeout_ms: int = PROVIDER_TIMEOUT_MS_PER_ATTEMPT,
     ) -> OrganizerModelGateway:
-        base_url = environ.get("CEREBRO_BASE_URL", "").strip()
-        api_key = environ.get("CEREBRO_API_KEY", "").strip()
-        model = environ.get("CEREBRO_MODEL", "").strip()
-        revision = environ.get("CEREBRO_MODEL_REVISION", "").strip()
+        base_url = _configured(environ, "CEREBRO_BASE_URL", "CEREBRO_LLM_BASE_URL")
+        api_key = _configured(environ, "CEREBRO_API_KEY", "CEREBRO_LLM_API_KEY")
+        model = _configured(environ, "CEREBRO_MODEL", "CEREBRO_LLM_MODEL")
+        revision = _configured(
+            environ, "CEREBRO_MODEL_REVISION", "CEREBRO_LLM_MODEL_REVISION"
+        )
+        # An organizer that publishes no separate revision pins the model ID as
+        # its own revision, so capability evidence always has a concrete value.
+        revision = revision or model
         # Configuration errors name the missing variable, never its value.
         missing = [
             name
@@ -129,6 +177,28 @@ class OrganizerModelGateway:
             raise ProviderConfigurationError(
                 "missing provider configuration: " + ", ".join(sorted(missing))
             )
+        mechanism = (
+            _configured(
+                environ, "CEREBRO_SCHEMA_MECHANISM", "CEREBRO_LLM_RESPONSE_MODE"
+            )
+            or "json_schema"
+        )
+        # FR-716 fixes the 20s default; a slower reasoning model is a deployment
+        # configuration choice, not a hard-coded provider assumption.
+        configured_timeout = _configured(
+            environ, "CEREBRO_PROVIDER_TIMEOUT_MS", "CEREBRO_LLM_TIMEOUT_MS"
+        )
+        if configured_timeout:
+            try:
+                timeout_ms = int(configured_timeout)
+            except ValueError as error:
+                raise ProviderConfigurationError(
+                    "provider timeout must be a positive whole number of milliseconds"
+                ) from error
+            if timeout_ms <= 0:
+                raise ProviderConfigurationError(
+                    "provider timeout must be a positive whole number of milliseconds"
+                )
         client = httpx.Client(
             transport=transport, timeout=httpx.Timeout(timeout_ms / 1000)
         )
@@ -139,6 +209,8 @@ class OrganizerModelGateway:
             model_revision=revision,
             client=client,
             backoff_seconds=backoff_seconds,
+            schema_mechanism=mechanism,
+            timeout_ms=timeout_ms,
         )
 
     def __repr__(self) -> str:  # pragma: no cover - defensive redaction
@@ -147,13 +219,55 @@ class OrganizerModelGateway:
             f"model={self.model!r}, revision={self.model_revision!r})"
         )
 
+    def _request_body(
+        self,
+        schema_name: str,
+        prompt: str,
+        output_adapter: TypeAdapter[OutputT],
+        mechanism: str,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"model": self.model, "temperature": 0}
+        schema = output_adapter.json_schema()
+        if mechanism == "json_schema":
+            # A name-only request lets a provider answer in prose, so the actual
+            # output schema always travels with the request.
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        elif mechanism == "json_object":
+            body["response_format"] = {"type": "json_object"}
+        # Every mechanism carries the same fixed instruction. A reasoning model
+        # otherwise answers in prose even when a response format is declared,
+        # and this string is local contract text, never caller-supplied.
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "Reply with exactly one JSON object and no prose, no "
+                    "markdown, and no code fence. It must validate against "
+                    f"this JSON Schema named {schema_name}: "
+                    + json.dumps(schema, sort_keys=True)
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        body["messages"] = messages
+        return body
+
     def generate(
         self,
         schema_name: str,
         prompt: str,
         output_adapter: TypeAdapter[OutputT],
+        mechanism: str | None = None,
     ) -> ProviderGeneration[OutputT]:
         attempts: list[TransportAttempt] = []
+        effective_mechanism = mechanism or self.schema_mechanism
         for ordinal in range(1, self._max_attempts + 1):
             started = time.monotonic()
             try:
@@ -163,15 +277,9 @@ class OrganizerModelGateway:
                         "authorization": f"Bearer {self._api_key}",
                         "content-type": "application/json",
                     },
-                    json={
-                        "model": self.model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": {"name": schema_name, "strict": True},
-                        },
-                        "temperature": 0,
-                    },
+                    json=self._request_body(
+                        schema_name, prompt, output_adapter, effective_mechanism
+                    ),
                 )
             except httpx.TimeoutException:
                 attempts.append(
@@ -252,8 +360,11 @@ class OrganizerModelGateway:
             self.schema_mechanism = declared
         # A schema failure is a semantic decoding fault, not a transport fault:
         # it propagates as ValidationError for orchestration to classify.
+        # Only `content` is ever decoded: a reasoning trace is never the output.
         output = output_adapter.validate_json(
-            content if isinstance(content, str) else json.dumps(content)
+            _json_payload_text(content)
+            if isinstance(content, str)
+            else json.dumps(content)
         )
         usage = payload.get("usage") or {}
         return ProviderGeneration[OutputT](
@@ -413,17 +524,37 @@ def probe_provider_schema(
         canonical_question="",
         snapshot=probe_view,
     )
-    generation = gateway.generate(
-        "provider_probe", _render_prompt(envelope), TypeAdapter(ProviderProbe)
+    prompt = _render_prompt(envelope)
+    adapter = TypeAdapter(ProviderProbe)
+
+    # `auto` means the organizer has not declared one mechanism, so the probe
+    # discovers it: one metadata-only call per candidate, most strict first, and
+    # the receipt records the mechanism that actually produced valid output.
+    candidates = (
+        _AUTO_SCHEMA_MECHANISMS
+        if gateway.schema_mechanism == "auto"
+        else (gateway.schema_mechanism,)
     )
-    if generation.output.ok is not True:
-        raise ProviderRejected("provider probe did not confirm schema support")
+    working_mechanism: str | None = None
+    for candidate in candidates:
+        try:
+            generation = gateway.generate(
+                "provider_probe", prompt, adapter, mechanism=candidate
+            )
+        except (ValidationError, ProviderRejected):
+            continue
+        if generation.output.ok is True:
+            working_mechanism = candidate
+            break
+    if working_mechanism is None:
+        raise ProviderRejected("no schema mechanism produced a valid probe response")
+    gateway.schema_mechanism = working_mechanism
 
     receipt = ProviderCapabilityReceipt(
         provider=gateway.provider,
         model=gateway.model,
         revision=gateway.model_revision or "unknown",
-        schema_mechanism=gateway.schema_mechanism,
+        schema_mechanism=working_mechanism,
     )
     if receipt_dir is None:
         return receipt, None

@@ -48,6 +48,19 @@ def _is_directory(path: Path | None) -> bool:
         return False
 
 
+def _configured_value(environ: Mapping[str, str], *names: str) -> str:
+    """Return the first configured value among equivalent variable names.
+
+    The canonical `CEREBRO_*` names win; the `CEREBRO_LLM_*` spellings are
+    accepted because that is how the organizer environment is published.
+    """
+    for name in names:
+        value = environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _read_model(path: Path, model_type: type[ModelT]) -> ModelT | None:
     try:
         return model_type.model_validate_json(path.read_bytes())
@@ -184,8 +197,8 @@ def check_preflight(
         if duckdb_version != materialization_receipt.engine_version:
             block("engine_version_mismatch", "data")
 
-    api_key = environ.get("CEREBRO_API_KEY", "")
-    current_model = environ.get("CEREBRO_MODEL", "")
+    api_key = _configured_value(environ, "CEREBRO_API_KEY", "CEREBRO_LLM_API_KEY")
+    current_model = _configured_value(environ, "CEREBRO_MODEL", "CEREBRO_LLM_MODEL")
     if not api_key.strip():
         block("missing_api_key", "organizer")
     if not current_model.strip():

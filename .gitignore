@@ -21,3 +21,5 @@ data/
 models/
 adapters/
 
+# Owner-supplied source CSVs, symlinked locally for materialization.
+database
