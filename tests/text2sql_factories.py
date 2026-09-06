@@ -667,3 +667,26 @@ def valid_response_base(snapshot=None):
 
 def codes(violations: Iterable[Any]) -> tuple[str, ...]:
     return tuple(violation.code for violation in violations)
+
+
+def accepted_complex_route(snapshot=None, plan=None):
+    """Mint planned-route authority the only legitimate way: through the router.
+
+    The router owns acceptance, so no test helper constructs capability fields
+    or touches the module-private token and factory in `models`.
+    """
+    from cerebro.complexity import ComplexityRouter
+
+    snapshot = snapshot or valid_snapshot()
+    plan = plan or complex_window_plan(snapshot)
+    decision = ComplexityRouter().validate(plan, snapshot)
+    if decision.accepted is None:
+        raise ValueError("the router refused a plan a factory expected to accept")
+    return decision.accepted
+
+
+def foreign_accepted_route(snapshot=None):
+    """Return authority bound to a different snapshot than the one supplied."""
+    snapshot = snapshot or valid_snapshot()
+    other = snapshot.model_copy(update={"snapshot_hash": "f" * 64})
+    return accepted_complex_route(other)

@@ -3535,10 +3535,12 @@ def test_factory_helpers_all_return_normally_validated_contracts():
 def test_factory_source_uses_no_construct_bypass_or_route_authority():
     source = inspect.getsource(factories)
     assert "model_construct" not in source
+    # Route authority may only be obtained by running the real router, never by
+    # touching the module-private token or creation helper in `models`.
     assert "_create_accepted_complex_route" not in source
     assert "_ACCEPTED_COMPLEX_ROUTE_TOKEN" not in source
-    assert "accepted_complex_route" not in factories.__dict__
-    assert "foreign_accepted_route" not in factories.__dict__
+    if "accepted_complex_route" in factories.__dict__:
+        assert "ComplexityRouter" in source
 
 
 def test_factory_spans_are_exact_unicode_codepoints_and_unique():
