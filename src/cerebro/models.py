@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
+import math
+import re
+from datetime import date as _Date
+from datetime import datetime as _DateTime
+from decimal import Decimal
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    StringConstraints,
+    TypeAdapter,
+    field_serializer,
+    model_validator,
+)
 
 
 class Provenance(BaseModel):
@@ -340,3 +359,1363 @@ class PreflightReport(_StrictFrozenEvidenceModel):
         ):
             raise ValueError("preflight blockers must be unique")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Text-to-SQL v3 contract layer.
+#
+# Everything below is additive: the legacy semantic/advisory models and the
+# Task 0 evidence models above keep their exact fields, validators, aliases,
+# `strict=True` configuration, and canonical serialization. The v3 layer uses
+# its own base configurations so it never widens or narrows those boundaries.
+# ---------------------------------------------------------------------------
+
+TEXT2SQL_CONTRACT_VERSION = "008.v3"
+GROUNDING_SNAPSHOT_VERSION = "008.grounding.v1"
+RELATIONAL_IR_VERSION = "008.ir.v1"
+QUESTION_CANONICALIZATION_VERSION = "008.question.v1"
+LITERAL_SPAN_REGISTRY_VERSION = "008.literal-span.v1"
+EXPRESSION_TYPE_REGISTRY_VERSION = "008.types.v1"
+AUTHORIZATION_SCOPE_VERSION = "008.scope.v1"
+COMPLEX_QUERY_PLAN_VERSION = "008.complex-plan.v1"
+
+MAX_EXPRESSION_DEPTH = 32
+MAX_IR_NODES = 256
+MAX_EXPRESSION_ITEMS = 100
+
+SUPPORTED_DEFAULT_NODE_KINDS = frozenset(
+    {"scan", "join", "filter", "aggregate", "project", "sort", "limit"}
+)
+SUPPORTED_COMPLEX_NODE_KINDS = frozenset({"window", "set_operation"})
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class StrictFrozenModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+# Identifiers and scalar types. `TableId` and `Sha256Digest` above are the
+# Task 0 spellings and stay untouched; `Sha256` is the v3 alias for the same
+# fail-closed lowercase-hex grammar.
+Sha256: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{64}$"),
+]
+NodeId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+]
+ColumnName: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]*$"),
+]
+MetricId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^metric\.[a-z][a-z0-9_-]*$"),
+]
+RelationshipId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^relationship\.[a-z][a-z0-9_]*$"),
+]
+PolicyId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^policy\.[a-z][a-z0-9_-]*$"),
+]
+SemanticObjectId: TypeAlias = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^(?:dataset|table|concept|relationship|metric|policy)"
+        r"\.[a-z][a-z0-9_-]*$"
+    ),
+]
+GovernedLiteralId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^literal\.[a-z][a-z0-9_-]*$"),
+]
+ControlId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^control\.[a-z][a-z0-9_-]*$"),
+]
+OptionalControlId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^(?:control\.[a-z][a-z0-9_-]*)?$"),
+]
+StableCode: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]*$"),
+]
+StableSubjectId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$"),
+]
+SemanticStateId: TypeAlias = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_-]*$"),
+]
+VersionTag: TypeAlias = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=128, pattern=r"^\S(?:.*\S)?$"),
+]
+
+Classification: TypeAlias = Literal["public", "internal", "confidential", "restricted"]
+ScalarType: TypeAlias = Literal[
+    "string", "integer", "decimal", "boolean", "date", "timestamp"
+]
+_FiniteFloat: TypeAlias = Annotated[float, Field(allow_inf_nan=False)]
+JsonScalar: TypeAlias = StrictBool | StrictInt | _FiniteFloat | StrictStr | None
+
+GenerationRoute: TypeAlias = Literal["default_ir", "planned_ir"]
+ResponseGenerationRoute: TypeAlias = Literal["default_ir", "planned_ir", "none"]
+CacheStatus: TypeAlias = Literal["disabled", "miss", "hit"]
+
+AllowedFunction: TypeAlias = Literal[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "stddev",
+    "variance",
+    "date_trunc",
+    "nullif",
+    "coalesce",
+]
+AllowedBinaryOperator: TypeAlias = Literal[
+    "eq",
+    "neq",
+    "lt",
+    "lte",
+    "gt",
+    "gte",
+    "and",
+    "or",
+    "add",
+    "subtract",
+    "multiply",
+    "divide",
+]
+ComplexOperatorId: TypeAlias = Literal[
+    "window.period_over_period.v1",
+    "set_operation.safe_binary.v1",
+]
+PipelineStage: TypeAlias = Literal[
+    "snapshot",
+    "cache",
+    "default_ir",
+    "clarification",
+    "complexity",
+    "planned_ir",
+    "literal_resolution",
+    "compile",
+    "ast_check",
+    "engine_validation",
+    "execution",
+    "provider_transport",
+]
+
+_DATE_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIMESTAMP_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?$")
+
+
+def _sorted_ids(value: frozenset[str]) -> list[str]:
+    """Serialize a set-like field deterministically without losing immutability."""
+    return sorted(value)
+
+
+def _check_scalar_value(data_type: str, value: Any) -> None:
+    """Validate an authored value exactly against its scalar type, never coercing."""
+    if data_type == "string":
+        if not isinstance(value, str):
+            raise ValueError("string values must be authored as text")
+        return
+    if data_type == "boolean":
+        if not isinstance(value, bool):
+            raise ValueError("boolean values must be authored as true or false")
+        return
+    if data_type == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("integer values must be authored as integers")
+        return
+    if data_type == "decimal":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("decimal values must be authored as numbers")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("decimal values must be finite")
+        return
+    if data_type == "date":
+        if not isinstance(value, str) or _DATE_TEXT.match(value) is None:
+            raise ValueError("date values must be authored as YYYY-MM-DD text")
+        try:
+            _Date.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError("date values must be a real calendar date") from error
+        return
+    if data_type == "timestamp":
+        if not isinstance(value, str) or _TIMESTAMP_TEXT.match(value) is None:
+            raise ValueError(
+                "timestamp values must be authored as naive date and time text"
+            )
+        try:
+            parsed = _DateTime.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError(
+                "timestamp values must be a real calendar date and time"
+            ) from error
+        if parsed.tzinfo is not None:
+            raise ValueError("timestamp values must not carry a timezone")
+        return
+    raise ValueError("unknown scalar type")
+
+
+class AuthorizationScope(StrictFrozenModel):
+    scope_version: Literal["008.scope.v1"]
+    tenant_scope_hash: Sha256
+    policy_version: VersionTag
+    allowed_object_ids: frozenset[SemanticObjectId]
+    allowed_classifications: frozenset[Classification]
+    authorization_scope_hash: Sha256
+
+    @field_serializer("allowed_object_ids", "allowed_classifications")
+    def _serialize_sorted(self, value: frozenset[str]) -> list[str]:
+        return _sorted_ids(value)
+
+
+class ColumnRef(StrictFrozenModel):
+    table_id: TableId
+    column: ColumnName
+
+
+class SnapshotColumn(StrictFrozenModel):
+    ref: ColumnRef
+    data_type: ScalarType
+    description: str = ""
+    classification: Classification = "internal"
+
+
+class SnapshotRelationship(StrictFrozenModel):
+    relationship_id: RelationshipId
+    left: ColumnRef
+    right: ColumnRef
+
+
+class SnapshotWarning(StrictFrozenModel):
+    object_id: SemanticObjectId
+    warning_hash: Sha256
+    kind: Literal["actionable", "informational"]
+    control_id: OptionalControlId = ""
+
+    @model_validator(mode="after")
+    def _actionability_matches_control_authority(self) -> SnapshotWarning:
+        if self.kind == "actionable" and not self.control_id:
+            raise ValueError("actionable warnings require a control ID")
+        if self.kind == "informational" and self.control_id:
+            raise ValueError("informational warnings carry no control authority")
+        return self
+
+
+class SnapshotGovernedLiteral(StrictFrozenModel):
+    literal_id: GovernedLiteralId
+    data_type: ScalarType
+    value: JsonScalar
+    source_object_id: SemanticObjectId
+
+    @model_validator(mode="after")
+    def _value_matches_declared_type(self) -> SnapshotGovernedLiteral:
+        _check_scalar_value(self.data_type, self.value)
+        return self
+
+
+class SnapshotRankingEvidence(StrictFrozenModel):
+    object_id: SemanticObjectId
+    rank: int = Field(ge=1)
+    score: Annotated[float, Field(allow_inf_nan=False)]
+    signal_codes: tuple[StableCode, ...] = ()
+
+
+class SnapshotMetadataObject(StrictFrozenModel):
+    object_id: SemanticObjectId
+    object_type: Literal[
+        "dataset", "table", "concept", "relationship", "metric", "policy"
+    ]
+    description: str = ""
+    columns: tuple[SnapshotColumn, ...] = ()
+    formula: str | None = None
+    metric_result_type: ScalarType | None = None
+    relationships: tuple[SnapshotRelationship, ...] = ()
+    warnings: tuple[SnapshotWarning, ...] = ()
+
+    @model_validator(mode="after")
+    def _metric_fields_belong_to_metrics(self) -> SnapshotMetadataObject:
+        if self.object_type == "metric":
+            if self.formula is None:
+                raise ValueError("metrics require a governed formula")
+            if self.metric_result_type is None:
+                raise ValueError("metrics require a declared result type")
+            return self
+        if self.formula is not None:
+            raise ValueError("only metrics may declare a formula")
+        if self.metric_result_type is not None:
+            raise ValueError("only metrics may declare a result type")
+        return self
+
+
+class DialectCapabilities(StrictFrozenModel):
+    parameter_style: Literal["qmark"] = "qmark"
+    supports_window: bool
+    supports_set_operations: bool
+
+
+class GroundingSnapshot(StrictFrozenModel):
+    snapshot_version: Literal["008.grounding.v1"]
+    semantic_version: VersionTag
+    policy_version: VersionTag
+    canonicalization_version: Literal["008.question.v1"]
+    literal_registry_version: Literal["008.literal-span.v1"]
+    type_registry_version: Literal["008.types.v1"]
+    authorization_scope_hash: Sha256
+    retrieval_config_hash: Sha256
+    dialect: Literal["duckdb"]
+    objects: tuple[SnapshotMetadataObject, ...] = ()
+    governed_literals: tuple[SnapshotGovernedLiteral, ...] = ()
+    ranking_evidence: tuple[SnapshotRankingEvidence, ...] = ()
+    authorized_object_ids: frozenset[SemanticObjectId] = frozenset()
+    policy_ids: frozenset[PolicyId] = frozenset()
+    dialect_capabilities: DialectCapabilities
+    snapshot_hash: Sha256
+
+    @field_serializer("authorized_object_ids", "policy_ids")
+    def _serialize_sorted(self, value: frozenset[str]) -> list[str]:
+        return _sorted_ids(value)
+
+
+# Value-free literal references. Neither variant carries a resolved or raw
+# value: a question literal is an exact code-point span, and a governed literal
+# is a snapshot registry identifier.
+class QuestionLiteralRef(StrictFrozenModel):
+    kind: Literal["question"]
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    data_type: ScalarType
+
+    @model_validator(mode="after")
+    def _span_is_ordered(self) -> QuestionLiteralRef:
+        if self.end <= self.start:
+            raise ValueError("question literal spans must end after they start")
+        return self
+
+
+class GovernedLiteralRef(StrictFrozenModel):
+    kind: Literal["governed"]
+    literal_id: GovernedLiteralId
+
+
+LiteralRef: TypeAlias = Annotated[
+    QuestionLiteralRef | GovernedLiteralRef,
+    Field(discriminator="kind"),
+]
+
+
+def _expression_depth(expression: Any) -> int:
+    """Return expression depth where a leaf is one and each edge adds one."""
+    kind = getattr(expression, "kind", None)
+    if kind == "function":
+        children: tuple[Any, ...] = tuple(expression.arguments)
+    elif kind == "binary":
+        children = (expression.left, expression.right)
+    elif kind == "in":
+        children = (expression.expression, *expression.values)
+    elif kind == "case":
+        children = (
+            *(
+                item
+                for branch in expression.branches
+                for item in (branch.when, branch.then)
+            ),
+            expression.else_expression,
+        )
+    else:
+        return 1
+    if not children:
+        return 1
+    return 1 + max(_expression_depth(child) for child in children)
+
+
+def _check_expression_depth(expression: Any) -> None:
+    if _expression_depth(expression) > MAX_EXPRESSION_DEPTH:
+        raise ValueError(f"expression depth must not exceed {MAX_EXPRESSION_DEPTH}")
+
+
+class ColumnExpression(StrictFrozenModel):
+    kind: Literal["column"]
+    ref: ColumnRef
+
+
+class MetricExpression(StrictFrozenModel):
+    kind: Literal["metric"]
+    metric_id: MetricId
+
+
+class LiteralExpression(StrictFrozenModel):
+    kind: Literal["literal"]
+    ref: LiteralRef
+
+
+class FunctionExpression(StrictFrozenModel):
+    kind: Literal["function"]
+    function: AllowedFunction
+    arguments: tuple[IRExpression, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+
+    @model_validator(mode="after")
+    def _depth_is_bounded(self) -> FunctionExpression:
+        _check_expression_depth(self)
+        return self
+
+
+class BinaryExpression(StrictFrozenModel):
+    kind: Literal["binary"]
+    operator: AllowedBinaryOperator
+    left: IRExpression
+    right: IRExpression
+
+    @model_validator(mode="after")
+    def _depth_is_bounded(self) -> BinaryExpression:
+        _check_expression_depth(self)
+        return self
+
+
+class InExpression(StrictFrozenModel):
+    kind: Literal["in"]
+    expression: IRExpression
+    values: tuple[IRExpression, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    negated: bool = False
+
+    @model_validator(mode="after")
+    def _depth_is_bounded(self) -> InExpression:
+        _check_expression_depth(self)
+        return self
+
+
+class WhenThen(StrictFrozenModel):
+    when: IRExpression
+    then: IRExpression
+
+
+class CaseExpression(StrictFrozenModel):
+    kind: Literal["case"]
+    branches: tuple[WhenThen, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    else_expression: IRExpression
+
+    @model_validator(mode="after")
+    def _depth_is_bounded(self) -> CaseExpression:
+        _check_expression_depth(self)
+        return self
+
+
+class RelativeTimeExpression(StrictFrozenModel):
+    kind: Literal["relative_time"]
+    date_column: ColumnRef
+    anchor: Literal["data_max"]
+    amount_ref: LiteralRef
+    unit: Literal["day", "week", "month", "quarter", "year"]
+    lower_inclusive: bool
+    upper_inclusive: bool
+
+
+IRExpression: TypeAlias = Annotated[
+    ColumnExpression
+    | MetricExpression
+    | LiteralExpression
+    | FunctionExpression
+    | BinaryExpression
+    | InExpression
+    | CaseExpression
+    | RelativeTimeExpression,
+    Field(discriminator="kind"),
+]
+
+
+class NamedExpression(StrictFrozenModel):
+    alias: ColumnName
+    expression: IRExpression
+
+
+class SortKey(StrictFrozenModel):
+    expression: IRExpression
+    direction: Literal["asc", "desc"]
+    nulls: Literal["first", "last"]
+
+
+class WindowExpression(StrictFrozenModel):
+    alias: ColumnName
+    function: Literal["lag", "lead", "row_number", "rank", "dense_rank"]
+    argument: IRExpression | None = None
+    partition_by: tuple[IRExpression, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    order_by: tuple[SortKey, ...] = Field(default=(), max_length=MAX_EXPRESSION_ITEMS)
+    offset: LiteralRef | None = None
+
+
+class ScanNode(StrictFrozenModel):
+    kind: Literal["scan"]
+    node_id: NodeId
+    table_id: TableId
+
+
+class JoinNode(StrictFrozenModel):
+    kind: Literal["join"]
+    node_id: NodeId
+    left_id: NodeId
+    right_id: NodeId
+    relationship_id: RelationshipId
+    join_type: Literal["inner", "left"]
+
+
+class FilterNode(StrictFrozenModel):
+    kind: Literal["filter"]
+    node_id: NodeId
+    input_id: NodeId
+    predicate: IRExpression
+
+
+class AggregateNode(StrictFrozenModel):
+    kind: Literal["aggregate"]
+    node_id: NodeId
+    input_id: NodeId
+    group_by: tuple[NamedExpression, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    measures: tuple[NamedExpression, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    minimum_group_size: LiteralRef | None = None
+
+
+class ProjectNode(StrictFrozenModel):
+    kind: Literal["project"]
+    node_id: NodeId
+    input_id: NodeId
+    outputs: tuple[NamedExpression, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+class SortNode(StrictFrozenModel):
+    kind: Literal["sort"]
+    node_id: NodeId
+    input_id: NodeId
+    keys: tuple[SortKey, ...] = Field(min_length=1, max_length=MAX_EXPRESSION_ITEMS)
+
+
+class LimitNode(StrictFrozenModel):
+    kind: Literal["limit"]
+    node_id: NodeId
+    input_id: NodeId
+    count: LiteralRef
+
+
+class WindowNode(StrictFrozenModel):
+    kind: Literal["window"]
+    node_id: NodeId
+    input_id: NodeId
+    outputs: tuple[WindowExpression, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+class SetOperationNode(StrictFrozenModel):
+    kind: Literal["set_operation"]
+    node_id: NodeId
+    left_id: NodeId
+    right_id: NodeId
+    operator: Literal["union", "intersect", "except"]
+    all: bool = False
+
+
+IRNode: TypeAlias = Annotated[
+    ScanNode
+    | JoinNode
+    | FilterNode
+    | AggregateNode
+    | ProjectNode
+    | SortNode
+    | LimitNode
+    | WindowNode
+    | SetOperationNode,
+    Field(discriminator="kind"),
+]
+
+
+class WarningRef(StrictFrozenModel):
+    object_id: SemanticObjectId
+    warning_hash: Sha256
+
+
+class WarningDecision(StrictFrozenModel):
+    warning: WarningRef
+    control_id: ControlId
+    decision: Literal["applied", "not_applicable"]
+
+
+def _dump_refs(refs: tuple[Any, ...]) -> list[Any]:
+    return [ref.model_dump(mode="json") for ref in refs]
+
+
+class DirectionMappingAssumption(StrictFrozenModel):
+    kind: Literal["direction_mapping"]
+    column: ColumnRef
+    inflow_refs: tuple[LiteralRef, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    outflow_refs: tuple[LiteralRef, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+    @model_validator(mode="after")
+    def _directions_are_distinct(self) -> DirectionMappingAssumption:
+        inflow = _dump_refs(self.inflow_refs)
+        outflow = _dump_refs(self.outflow_refs)
+        if any(ref in outflow for ref in inflow):
+            raise ValueError("inflow and outflow references must be distinct")
+        return self
+
+
+class StatusMappingAssumption(StrictFrozenModel):
+    kind: Literal["status_mapping"]
+    column: ColumnRef
+    semantic_state_id: SemanticStateId
+    literal_refs: tuple[LiteralRef, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+class GrainMappingAssumption(StrictFrozenModel):
+    kind: Literal["grain_mapping"]
+    source_table_ids: tuple[TableId, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    grouping_columns: tuple[ColumnRef, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    physical_operands: tuple[LiteralRef, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+class SnapshotAssumption(StrictFrozenModel):
+    kind: Literal["snapshot"]
+    column: ColumnRef
+    interpretation_code: StableCode
+    physical_operands: tuple[LiteralRef, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+Assumption: TypeAlias = Annotated[
+    DirectionMappingAssumption
+    | StatusMappingAssumption
+    | GrainMappingAssumption
+    | SnapshotAssumption,
+    Field(discriminator="kind"),
+]
+
+
+class RequestedDisclosure(StrictFrozenModel):
+    source_columns: tuple[ColumnRef, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    limit_ref: LiteralRef
+
+
+class RelationalQueryIR(StrictFrozenModel):
+    outcome: Literal["ir"]
+    ir_version: Literal["008.ir.v1"]
+    root_node_id: NodeId
+    nodes: tuple[IRNode, ...] = Field(min_length=1, max_length=MAX_IR_NODES)
+    warning_decisions: tuple[WarningDecision, ...] = ()
+    assumptions: tuple[Assumption, ...] = ()
+    requested_disclosures: tuple[RequestedDisclosure, ...] = ()
+
+
+class TableGroundingNeed(StrictFrozenModel):
+    kind: Literal["table"]
+    object_id: TableId
+
+
+class ColumnGroundingNeed(StrictFrozenModel):
+    kind: Literal["column"]
+    ref: ColumnRef
+
+
+class MetricGroundingNeed(StrictFrozenModel):
+    kind: Literal["metric"]
+    metric_id: MetricId
+
+
+class RelationshipGroundingNeed(StrictFrozenModel):
+    kind: Literal["relationship"]
+    relationship_id: RelationshipId
+
+
+GroundingNeed: TypeAlias = Annotated[
+    TableGroundingNeed
+    | ColumnGroundingNeed
+    | MetricGroundingNeed
+    | RelationshipGroundingNeed,
+    Field(discriminator="kind"),
+]
+
+
+class CheckViolation(StrictFrozenModel):
+    code: StableCode
+    stage: PipelineStage
+    subject_ids: tuple[StableSubjectId, ...] = ()
+
+
+class GroundingUsage(StrictFrozenModel):
+    object_ids: frozenset[SemanticObjectId] = frozenset()
+    relationship_ids: frozenset[RelationshipId] = frozenset()
+    governed_literal_ids: frozenset[GovernedLiteralId] = frozenset()
+
+    @field_serializer("object_ids", "relationship_ids", "governed_literal_ids")
+    def _serialize_sorted(self, value: frozenset[str]) -> list[str]:
+        return _sorted_ids(value)
+
+
+class AttemptRecord(StrictFrozenModel):
+    stage: PipelineStage
+    ordinal: int = Field(ge=1)
+    outcome: Literal["accepted", "rejected"]
+    latency_ms: int = Field(ge=0)
+    violation_codes: tuple[StableCode, ...] = ()
+    generation_route: ResponseGenerationRoute
+    cache_status: CacheStatus
+
+
+class QueryResult(StrictFrozenModel):
+    columns: tuple[ColumnName, ...]
+    column_types: tuple[ScalarType, ...]
+    rows: tuple[tuple[JsonScalar, ...], ...]
+    row_count: int = Field(ge=0)
+    truncated: bool
+    elapsed_ms: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _shape_is_consistent(self) -> QueryResult:
+        if len(self.columns) != len(self.column_types):
+            raise ValueError("column types must describe every column")
+        if self.row_count != len(self.rows):
+            raise ValueError("row count must match the returned rows")
+        # Consumers align cells to columns positionally, so a ragged row would
+        # misattribute values across columns and across classifications.
+        width = len(self.columns)
+        if any(len(row) != width for row in self.rows):
+            raise ValueError("every row must have one cell per column")
+        return self
+
+
+class OutputLineage(StrictFrozenModel):
+    output_name: ColumnName
+    source_columns: tuple[ColumnRef, ...] = ()
+    metric_ids: tuple[MetricId, ...] = ()
+    classification: Classification
+
+
+class DisclosureRecord(StrictFrozenModel):
+    output_name: ColumnName
+    source_columns: tuple[ColumnRef, ...] = Field(min_length=1)
+    classification: Classification
+    row_limit: int = Field(ge=0)
+
+
+def _has_complex_nodes(ir: RelationalQueryIR) -> bool:
+    return any(node.kind in SUPPORTED_COMPLEX_NODE_KINDS for node in ir.nodes)
+
+
+def _check_route_ir_and_plan_hash(
+    generation_route: str,
+    accepted_complex_plan_hash: str | None,
+    ir: RelationalQueryIR,
+) -> None:
+    if generation_route == "planned_ir":
+        if accepted_complex_plan_hash is None:
+            raise ValueError("the planned route requires an accepted plan hash")
+        return
+    if accepted_complex_plan_hash is not None:
+        raise ValueError("the default route must not carry an accepted plan hash")
+    if _has_complex_nodes(ir):
+        raise ValueError("the default route must not contain complex IR nodes")
+
+
+class ValidatedIR(StrictFrozenModel):
+    ir: RelationalQueryIR
+    ir_hash: Sha256
+    snapshot_hash: Sha256
+    canonical_question_hash: Sha256
+    generation_route: GenerationRoute
+    accepted_complex_plan_hash: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def _route_matches_plan_and_nodes(self) -> ValidatedIR:
+        _check_route_ir_and_plan_hash(
+            self.generation_route, self.accepted_complex_plan_hash, self.ir
+        )
+        return self
+
+
+class CachedGeneration(StrictFrozenModel):
+    ir: RelationalQueryIR
+    generation_route: GenerationRoute
+    accepted_complex_plan_hash: Sha256 | None = None
+    payload_sha256: Sha256
+
+    @model_validator(mode="after")
+    def _route_matches_plan_and_nodes(self) -> CachedGeneration:
+        _check_route_ir_and_plan_hash(
+            self.generation_route, self.accepted_complex_plan_hash, self.ir
+        )
+        return self
+
+
+class ComplexPlanStep(StrictFrozenModel):
+    step_id: StableCode
+    operator_id: ComplexOperatorId
+    depends_on: tuple[StableCode, ...] = ()
+    input_object_ids: tuple[SemanticObjectId, ...] = Field(min_length=1)
+    output_names: tuple[ColumnName, ...] = Field(min_length=1)
+
+
+class ComplexQueryPlan(StrictFrozenModel):
+    outcome: Literal["complex_plan"]
+    plan_version: Literal["008.complex-plan.v1"]
+    operator_ids: tuple[ComplexOperatorId, ...] = Field(min_length=1)
+    steps: tuple[ComplexPlanStep, ...] = Field(min_length=1)
+    expected_outputs: tuple[ColumnName, ...] = Field(min_length=1)
+
+
+_SHA256_ADAPTER = TypeAdapter(Sha256)
+
+
+def _canonical_model_bytes(model: BaseModel) -> bytes:
+    """Serialize a validated model with the repository's canonical convention.
+
+    This mirrors `cerebro.provenance.canonical_json_bytes` byte-for-byte. It is
+    duplicated rather than imported because `cerebro.provenance` imports this
+    module, so importing it back would create a cycle.
+    """
+    return json.dumps(
+        model.model_dump(mode="json"),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def complex_plan_sha256(plan: ComplexQueryPlan) -> Sha256:
+    """Return the single authoritative digest of an accepted complex plan."""
+    if not isinstance(plan, ComplexQueryPlan):
+        raise TypeError("a plan digest requires a validated complex plan")
+    return hashlib.sha256(_canonical_model_bytes(plan)).hexdigest()
+
+
+def _refuse_state_protocol(name: str) -> Any:
+    """Return state-protocol methods that fail closed for local capabilities.
+
+    `dataclasses` generates `__getstate__`/`__setstate__` for frozen slotted
+    classes, and `__setstate__` assigns through `object.__setattr__`. Left open,
+    that mints a forged capability, rewrites a frozen one in place, skips
+    `__post_init__`, and gives `dataclasses.asdict` a dict path. Copy, pickle,
+    and dict conversion therefore all fail closed here.
+    """
+
+    def _raise(*_args: Any, **_kwargs: Any) -> Any:
+        raise TypeError(f"{name} does not support copy, pickle, or state transfer")
+
+    return _raise
+
+
+# Module-private minting authority for the planned route. Callers cannot forge
+# the capability: the token never leaves this module and the dataclass refuses
+# direct construction, including `dataclasses.replace`, copy, and pickle.
+_ACCEPTED_COMPLEX_ROUTE_TOKEN = object()
+
+
+@dataclasses.dataclass(frozen=True, slots=True, init=False)
+class AcceptedComplexRoute:
+    generation_route: Literal["planned_ir"]
+    snapshot_hash: str
+    plan_hash: str
+    plan: ComplexQueryPlan
+    _router_token: object
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("AcceptedComplexRoute is minted by the router, not constructed")
+
+    __getstate__ = _refuse_state_protocol("AcceptedComplexRoute")
+    __setstate__ = _refuse_state_protocol("AcceptedComplexRoute")
+    __reduce__ = _refuse_state_protocol("AcceptedComplexRoute")
+    __reduce_ex__ = _refuse_state_protocol("AcceptedComplexRoute")
+    __copy__ = _refuse_state_protocol("AcceptedComplexRoute")
+    __deepcopy__ = _refuse_state_protocol("AcceptedComplexRoute")
+
+
+def _create_accepted_complex_route(
+    *,
+    snapshot_hash: str,
+    plan_hash: str,
+    plan: ComplexQueryPlan,
+) -> AcceptedComplexRoute:
+    if not isinstance(plan, ComplexQueryPlan):
+        raise TypeError("an accepted route requires a validated complex plan")
+    _SHA256_ADAPTER.validate_python(snapshot_hash)
+    _SHA256_ADAPTER.validate_python(plan_hash)
+    if plan_hash != complex_plan_sha256(plan):
+        raise ValueError("plan hash must be derived from the accepted plan")
+    route = object.__new__(AcceptedComplexRoute)
+    object.__setattr__(route, "generation_route", "planned_ir")
+    object.__setattr__(route, "snapshot_hash", snapshot_hash)
+    object.__setattr__(route, "plan_hash", plan_hash)
+    object.__setattr__(route, "plan", plan)
+    object.__setattr__(route, "_router_token", _ACCEPTED_COMPLEX_ROUTE_TOKEN)
+    return route
+
+
+def _is_authentic_accepted_route(candidate: Any) -> bool:
+    if not isinstance(candidate, AcceptedComplexRoute):
+        return False
+    token = getattr(candidate, "_router_token", None)
+    return token is _ACCEPTED_COMPLEX_ROUTE_TOKEN
+
+
+def _snapshot_is_empty(snapshot: GroundingSnapshot) -> bool:
+    return not (
+        snapshot.objects
+        or snapshot.governed_literals
+        or snapshot.ranking_evidence
+        or snapshot.authorized_object_ids
+        or snapshot.policy_ids
+    )
+
+
+GuardedGenerationMode: TypeAlias = Literal["default_ir", "planned_ir", "provider_probe"]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GuardedGenerationRequest:
+    mode: GuardedGenerationMode
+    canonical_question: str
+    snapshot: GroundingSnapshot
+    accepted_complex_route: AcceptedComplexRoute | None = None
+    prior_violations: tuple[CheckViolation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("default_ir", "planned_ir", "provider_probe"):
+            raise ValueError("unknown guarded generation mode")
+        if not isinstance(self.canonical_question, str):
+            raise TypeError("a guarded request carries canonical question text")
+        if not isinstance(self.snapshot, GroundingSnapshot):
+            raise TypeError("a guarded request carries an immutable snapshot")
+        if not isinstance(self.prior_violations, tuple) or not all(
+            isinstance(item, CheckViolation) for item in self.prior_violations
+        ):
+            raise TypeError("prior violations must be typed check violations")
+        if self.mode == "planned_ir":
+            if not _is_authentic_accepted_route(self.accepted_complex_route):
+                raise TypeError("the planned mode requires an authentic accepted route")
+            route = self.accepted_complex_route
+            if route.snapshot_hash != self.snapshot.snapshot_hash:
+                raise ValueError("the accepted route must bind to this snapshot")
+            if route.plan_hash != complex_plan_sha256(route.plan):
+                raise ValueError("the accepted route must bind to its plan hash")
+            return
+        if self.accepted_complex_route is not None:
+            raise ValueError("only the planned mode may carry an accepted route")
+        if self.mode == "provider_probe":
+            if not _snapshot_is_empty(self.snapshot):
+                raise ValueError("a provider probe requires an empty snapshot")
+            if self.prior_violations:
+                raise ValueError("a provider probe carries no prior violations")
+
+    # Without these, `__setstate__` would skip `__post_init__` entirely and
+    # `dataclasses.asdict` would expose the canonical question through a dict.
+    __getstate__ = _refuse_state_protocol("GuardedGenerationRequest")
+    __setstate__ = _refuse_state_protocol("GuardedGenerationRequest")
+    __reduce__ = _refuse_state_protocol("GuardedGenerationRequest")
+    __reduce_ex__ = _refuse_state_protocol("GuardedGenerationRequest")
+    __copy__ = _refuse_state_protocol("GuardedGenerationRequest")
+    __deepcopy__ = _refuse_state_protocol("GuardedGenerationRequest")
+
+
+class ObjectAmbiguityCandidate(StrictFrozenModel):
+    kind: Literal["object"]
+    object_id: SemanticObjectId
+
+
+class RelationshipAmbiguityCandidate(StrictFrozenModel):
+    kind: Literal["relationship"]
+    relationship_id: RelationshipId
+
+
+class GovernedLiteralAmbiguityCandidate(StrictFrozenModel):
+    kind: Literal["governed_literal"]
+    literal_id: GovernedLiteralId
+
+
+class GrainAmbiguityCandidate(StrictFrozenModel):
+    kind: Literal["grain"]
+    grain: Literal["row", "day", "week", "month", "quarter", "year"]
+    grouping_columns: tuple[ColumnRef, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+class OperatorAmbiguityCandidate(StrictFrozenModel):
+    kind: Literal["operator"]
+    operator_id: ComplexOperatorId
+
+
+AmbiguityCandidate: TypeAlias = Annotated[
+    ObjectAmbiguityCandidate
+    | RelationshipAmbiguityCandidate
+    | GovernedLiteralAmbiguityCandidate
+    | GrainAmbiguityCandidate
+    | OperatorAmbiguityCandidate,
+    Field(discriminator="kind"),
+]
+
+
+class Ambiguity(StrictFrozenModel):
+    ambiguity_id: StableCode
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    candidates: tuple[AmbiguityCandidate, ...] = Field(
+        min_length=2, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+    @model_validator(mode="after")
+    def _span_and_candidates_are_well_formed(self) -> Ambiguity:
+        if self.end <= self.start:
+            raise ValueError("ambiguity spans must end after they start")
+        kinds = {candidate.kind for candidate in self.candidates}
+        if len(kinds) != 1:
+            raise ValueError("ambiguity candidates must share one kind")
+        dumped = [candidate.model_dump(mode="json") for candidate in self.candidates]
+        for index, candidate in enumerate(dumped):
+            if candidate in dumped[index + 1 :]:
+                raise ValueError("ambiguity candidates must be distinct")
+        return self
+
+
+class ClarificationRequest(StrictFrozenModel):
+    outcome: Literal["clarification_request"]
+    ambiguities: tuple[Ambiguity, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+class LiteralClarificationNeed(StrictFrozenModel):
+    kind: Literal["literal_need"]
+    issue: Literal[
+        "missing_literal",
+        "invalid_question_span",
+        "unparseable_question_literal",
+        "ungrounded_governed_literal",
+        "literal_type_mismatch",
+        "invented_literal_reference",
+    ]
+    expected_type: ScalarType
+    target_column: ColumnRef | None = None
+    literal_ref: LiteralRef | None = None
+
+
+class GroundingRefusal(StrictFrozenModel):
+    outcome: Literal["grounding_refusal"]
+    unmet_needs: tuple[GroundingNeed, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+
+
+IRGenerationOutcome: TypeAlias = Annotated[
+    RelationalQueryIR | ComplexQueryPlan | GroundingRefusal | ClarificationRequest,
+    Field(discriminator="outcome"),
+]
+
+
+class BoundParameter(StrictFrozenModel):
+    position: int = Field(ge=1)
+    data_type: ScalarType
+    value: JsonScalar = Field(exclude=True)
+
+
+class CompiledQuery(StrictFrozenModel):
+    sql: str = Field(min_length=1)
+    parameters: tuple[BoundParameter, ...] = ()
+    ir_hash: Sha256
+    compiler_version: VersionTag
+    dialect: Literal["duckdb"]
+
+
+class SQLArtifact(StrictFrozenModel):
+    sql: str = Field(min_length=1)
+    sql_sha256: Sha256
+    parameter_count: int = Field(ge=0)
+    parameter_types: tuple[ScalarType, ...] = ()
+    ir_hash: Sha256
+    compiler_version: VersionTag
+    dialect: Literal["duckdb"]
+
+    @model_validator(mode="after")
+    def _count_matches_types(self) -> SQLArtifact:
+        if self.parameter_count != len(self.parameter_types):
+            raise ValueError("parameter count must match the declared types")
+        return self
+
+
+class BudgetLimits(StrictFrozenModel):
+    # Frozen per the spec: a cap any holder can raise is not a cap.
+    initial_semantic_call_capacity: Literal[1]
+    planned_semantic_call_capacity: Literal[2]
+    max_transport_attempts_per_semantic_call: int = Field(ge=1, le=2)
+    provider_timeout_ms_per_attempt: int = Field(gt=0)
+    max_input_tokens: int = Field(gt=0)
+    max_output_tokens: int = Field(gt=0)
+    max_cost_usd: Decimal = Field(gt=0, allow_inf_nan=False)
+    end_to_end_deadline_ms: int = Field(gt=0)
+
+    @classmethod
+    def defaults(cls) -> BudgetLimits:
+        return cls(
+            initial_semantic_call_capacity=1,
+            planned_semantic_call_capacity=2,
+            max_transport_attempts_per_semantic_call=2,
+            provider_timeout_ms_per_attempt=20_000,
+            max_input_tokens=32_000,
+            max_output_tokens=8_000,
+            max_cost_usd=Decimal("0.50"),
+            end_to_end_deadline_ms=120_000,
+        )
+
+
+class BudgetUsage(StrictModel):
+    # Accounting mutates usage, so bounds must be revalidated on assignment.
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    semantic_call_capacity: Literal[1, 2]
+    planned_ir_authorized: bool
+    semantic_calls: int = Field(ge=0)
+    transport_attempts: int = Field(ge=0)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    cost_usd: Decimal = Field(ge=0, allow_inf_nan=False)
+    elapsed_ms: int = Field(ge=0)
+
+
+class SQLGenerationRequest(StrictModel):
+    question: Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
+    authorization_scope: AuthorizationScope
+    dialect: Literal["duckdb"] = "duckdb"
+    max_rows: int = Field(default=1000, ge=1, le=10_000)
+
+
+class ResponseBase(StrictModel):
+    # `validate_assignment` keeps route/evidence coherence from being edited
+    # away after validation; `protected_namespaces` allows `model_revision`.
+    model_config = ConfigDict(
+        extra="forbid", protected_namespaces=(), validate_assignment=True
+    )
+
+    contract_version: Literal["008.v3"]
+    semantic_version: VersionTag
+    policy_version: VersionTag
+    canonicalization_version: Literal["008.question.v1"]
+    literal_registry_version: Literal["008.literal-span.v1"]
+    ir_contract_version: Literal["008.ir.v1"]
+    type_registry_version: Literal["008.types.v1"]
+    prompt_version: VersionTag
+    router_version: VersionTag
+    compiler_version: VersionTag
+    checker_version: VersionTag
+    dialect: Literal["duckdb"]
+    provider: VersionTag
+    model: VersionTag
+    model_revision: VersionTag
+    canonical_question_hash: Sha256
+    authorization_scope_hash: Sha256
+    snapshot_hash: Sha256 | None = None
+    generation_route: ResponseGenerationRoute
+    cache_status: CacheStatus
+    grounding_usage: GroundingUsage
+    assumptions: tuple[Assumption, ...] = ()
+    attempt_records: tuple[AttemptRecord, ...] = ()
+    budget_usage: BudgetUsage
+    violations: tuple[CheckViolation, ...] = ()
+
+    @model_validator(mode="after")
+    def _route_evidence_is_coherent(self) -> ResponseBase:
+        usage = self.budget_usage
+        planned_attempts = tuple(
+            record
+            for record in self.attempt_records
+            if record.stage == "planned_ir" or record.generation_route == "planned_ir"
+        )
+        if self.generation_route == "none":
+            if self.snapshot_hash is not None:
+                raise ValueError("a pre-generation response has no snapshot hash")
+            if self.attempt_records:
+                raise ValueError("a pre-generation response records no attempts")
+            if usage.semantic_calls or usage.transport_attempts:
+                raise ValueError("a pre-generation response spends no semantic calls")
+            if usage.planned_ir_authorized:
+                raise ValueError("a pre-generation response authorizes no plan")
+            if (
+                self.grounding_usage.object_ids
+                or self.grounding_usage.relationship_ids
+                or self.grounding_usage.governed_literal_ids
+            ):
+                raise ValueError("a pre-generation response uses no grounding")
+            return self
+        if self.snapshot_hash is None:
+            raise ValueError("a generated response must cite its snapshot hash")
+        if self.generation_route == "planned_ir":
+            if not usage.planned_ir_authorized:
+                raise ValueError("the planned route requires planned authorization")
+            if usage.semantic_call_capacity != 2:
+                raise ValueError("the planned route requires planned capacity")
+            if not planned_attempts:
+                raise ValueError("the planned route requires a planned attempt")
+            return self
+        if usage.planned_ir_authorized:
+            raise ValueError("the default route authorizes no plan")
+        if usage.semantic_call_capacity != 1:
+            raise ValueError("the default route keeps the initial capacity")
+        if planned_attempts:
+            raise ValueError("the default route records no planned attempt")
+        return self
+
+
+class OkResponse(ResponseBase):
+    status: Literal["ok"]
+    generation_route: GenerationRoute
+    snapshot_hash: Sha256
+    ir: RelationalQueryIR
+    sql_artifact: SQLArtifact
+    result: QueryResult
+    output_lineage: tuple[OutputLineage, ...]
+    disclosures: tuple[DisclosureRecord, ...]
+
+    @model_validator(mode="after")
+    def _ir_matches_generation_route(self) -> OkResponse:
+        if self.generation_route == "default_ir" and _has_complex_nodes(self.ir):
+            raise ValueError("the default route must not contain complex IR nodes")
+        return self
+
+
+class CheckFailedResponse(ResponseBase):
+    status: Literal["check_failed"]
+    executable: Literal[False] = False
+    ir: RelationalQueryIR | None = None
+    sql_artifact: SQLArtifact | None = None
+    violations: tuple[CheckViolation, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _route_matches_generation_evidence(self) -> CheckFailedResponse:
+        if self.generation_route == "none" and (
+            self.ir is not None or self.sql_artifact is not None
+        ):
+            raise ValueError("a pre-generation failure carries no generated evidence")
+        if (
+            self.generation_route == "default_ir"
+            and self.ir is not None
+            and _has_complex_nodes(self.ir)
+        ):
+            raise ValueError("the default route must not contain complex IR nodes")
+        return self
+
+
+_REFUSAL_POPULATION_NAMES = (
+    "unmet_needs",
+    "policy_ids",
+    "unsupported_operator_ids",
+    "ambiguities",
+    "literal_needs",
+)
+_REFUSAL_POPULATION_MATRIX: dict[str, frozenset[frozenset[str]]] = {
+    "missing_grounding": frozenset({frozenset({"unmet_needs"})}),
+    "policy_disallowed": frozenset({frozenset({"policy_ids"})}),
+    "unsupported_complexity": frozenset({frozenset({"unsupported_operator_ids"})}),
+    "clarification_required": frozenset(
+        {frozenset({"ambiguities"}), frozenset({"literal_needs"})}
+    ),
+}
+
+
+class RefusedResponse(ResponseBase):
+    status: Literal["refused"]
+    reason: Literal[
+        "missing_grounding",
+        "policy_disallowed",
+        "clarification_required",
+        "unsupported_complexity",
+    ]
+    unmet_needs: tuple[GroundingNeed, ...] = ()
+    ambiguities: tuple[Ambiguity, ...] = ()
+    literal_needs: tuple[LiteralClarificationNeed, ...] = ()
+    policy_ids: tuple[PolicyId, ...] = ()
+    unsupported_operator_ids: tuple[ComplexOperatorId, ...] = ()
+
+    @model_validator(mode="after")
+    def _reason_matches_typed_populations(self) -> RefusedResponse:
+        if self.generation_route == "none":
+            raise ValueError("a refusal reports the route it reached")
+        populated = frozenset(
+            name for name in _REFUSAL_POPULATION_NAMES if getattr(self, name)
+        )
+        if populated not in _REFUSAL_POPULATION_MATRIX[self.reason]:
+            raise ValueError("refusal populations must match the refusal reason")
+        if self.ambiguities and self.generation_route != "default_ir":
+            raise ValueError("model ambiguity is recorded on the default route")
+        return self
+
+
+SQLGenerationResponse: TypeAlias = Annotated[
+    OkResponse | CheckFailedResponse | RefusedResponse,
+    Field(discriminator="status"),
+]
+
+
+# Rebuild the recursive IR contracts only after every variant is declared, so
+# the discriminated unions resolve against complete definitions.
+for _model in (
+    FunctionExpression,
+    BinaryExpression,
+    InExpression,
+    WhenThen,
+    CaseExpression,
+    NamedExpression,
+    SortKey,
+    WindowExpression,
+    FilterNode,
+    AggregateNode,
+    ProjectNode,
+    SortNode,
+    LimitNode,
+    WindowNode,
+    RelationalQueryIR,
+    ValidatedIR,
+    CachedGeneration,
+    OkResponse,
+    CheckFailedResponse,
+    RefusedResponse,
+):
+    _model.model_rebuild()
+del _model
