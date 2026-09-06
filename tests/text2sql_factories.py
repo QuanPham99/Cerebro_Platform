@@ -690,3 +690,161 @@ def foreign_accepted_route(snapshot=None):
     snapshot = snapshot or valid_snapshot()
     other = snapshot.model_copy(update={"snapshot_hash": "f" * 64})
     return accepted_complex_route(other)
+
+
+def validated_ir(
+    ir=None, snapshot=None, question=None, *, generation_route="default_ir"
+):
+    """Wrap an IR as `ValidatedIR` with genuinely derived binding hashes."""
+    from cerebro.models import relational_ir_sha256
+    from cerebro.provenance import canonical_question_sha256, canonicalize_question
+
+    snapshot = snapshot or valid_snapshot()
+    ir = ir if ir is not None else minimal_ir(snapshot)
+    question = canonicalize_question(
+        question if question is not None else canonical_question()
+    )
+    plan_hash = None
+    if generation_route == "planned_ir":
+        plan_hash = models.complex_plan_sha256(complex_window_plan(snapshot))
+    return models.ValidatedIR(
+        ir=ir,
+        ir_hash=relational_ir_sha256(ir),
+        snapshot_hash=snapshot.snapshot_hash,
+        canonical_question_hash=canonical_question_sha256(question),
+        generation_route=generation_route,
+        accepted_complex_plan_hash=plan_hash,
+    )
+
+
+def filtered_account_ir(snapshot=None, *, city_ref=None, column="city"):
+    """Scan, filter one column against a literal ref, then project the key."""
+    snapshot = snapshot or valid_snapshot()
+    if city_ref is None:
+        city_ref = question_literal_ref(canonical_question(), token="London")
+    return models.RelationalQueryIR(
+        outcome="ir",
+        ir_version="008.ir.v1",
+        root_node_id="project_accounts",
+        nodes=(
+            models.ScanNode(
+                kind="scan", node_id="scan_accounts", table_id="table.accounts"
+            ),
+            models.FilterNode(
+                kind="filter",
+                node_id="filter_accounts",
+                input_id="scan_accounts",
+                predicate=models.BinaryExpression(
+                    kind="binary",
+                    operator="eq",
+                    left=models.ColumnExpression(
+                        kind="column",
+                        ref=models.ColumnRef(table_id="table.accounts", column=column),
+                    ),
+                    right=models.LiteralExpression(kind="literal", ref=city_ref),
+                ),
+            ),
+            models.ProjectNode(
+                kind="project",
+                node_id="project_accounts",
+                input_id="filter_accounts",
+                outputs=(
+                    models.NamedExpression(
+                        alias="account_id",
+                        expression=models.ColumnExpression(
+                            kind="column",
+                            ref=models.ColumnRef(
+                                table_id="table.accounts", column="account_id"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def complex_node_ir(snapshot=None, kind="window"):
+    """Return the smallest valid IR that requires the planned route."""
+    snapshot = snapshot or valid_snapshot()
+    account_id = models.ColumnExpression(
+        kind="column",
+        ref=models.ColumnRef(table_id="table.accounts", column="account_id"),
+    )
+    if kind == "window":
+        return models.RelationalQueryIR(
+            outcome="ir",
+            ir_version="008.ir.v1",
+            root_node_id="window_accounts",
+            nodes=(
+                models.ScanNode(
+                    kind="scan", node_id="scan_accounts", table_id="table.accounts"
+                ),
+                models.ProjectNode(
+                    kind="project",
+                    node_id="project_accounts",
+                    input_id="scan_accounts",
+                    outputs=(
+                        models.NamedExpression(
+                            alias="account_id", expression=account_id
+                        ),
+                    ),
+                ),
+                models.WindowNode(
+                    kind="window",
+                    node_id="window_accounts",
+                    input_id="project_accounts",
+                    outputs=(
+                        models.WindowExpression(
+                            alias="row_position",
+                            function="row_number",
+                            partition_by=(),
+                            order_by=(
+                                models.SortKey(
+                                    expression=account_id,
+                                    direction="asc",
+                                    nulls="last",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    return models.RelationalQueryIR(
+        outcome="ir",
+        ir_version="008.ir.v1",
+        root_node_id="union_accounts",
+        nodes=(
+            models.ScanNode(
+                kind="scan", node_id="scan_left", table_id="table.accounts"
+            ),
+            models.ScanNode(
+                kind="scan", node_id="scan_right", table_id="table.accounts"
+            ),
+            models.ProjectNode(
+                kind="project",
+                node_id="project_left",
+                input_id="scan_left",
+                outputs=(
+                    models.NamedExpression(alias="account_id", expression=account_id),
+                ),
+            ),
+            models.ProjectNode(
+                kind="project",
+                node_id="project_right",
+                input_id="scan_right",
+                outputs=(
+                    models.NamedExpression(alias="account_id", expression=account_id),
+                ),
+            ),
+            models.SetOperationNode(
+                kind="set_operation",
+                node_id="union_accounts",
+                left_id="project_left",
+                right_id="project_right",
+                operator="union",
+                all=False,
+            ),
+        ),
+    )

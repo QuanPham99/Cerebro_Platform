@@ -1228,6 +1228,13 @@ def complex_plan_sha256(plan: ComplexQueryPlan) -> Sha256:
     return hashlib.sha256(_canonical_model_bytes(plan)).hexdigest()
 
 
+def relational_ir_sha256(ir: RelationalQueryIR) -> Sha256:
+    """Return the single authoritative digest of a value-free relational IR."""
+    if not isinstance(ir, RelationalQueryIR):
+        raise TypeError("an IR digest requires a validated RelationalQueryIR")
+    return hashlib.sha256(_canonical_model_bytes(ir)).hexdigest()
+
+
 def _refuse_state_protocol(name: str) -> Any:
     """Return state-protocol methods that fail closed for local capabilities.
 
