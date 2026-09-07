@@ -696,3 +696,40 @@ def test_baseline_without_provider_configuration_returns_typed_json(
     error = json.loads(capsys.readouterr().err)
     assert error["command"] == "baseline"
     assert not output.exists()
+
+
+def test_exhausted_budget_returns_terminal_evidence_not_an_exception(
+    database, reference_bundle, reference_scope
+):
+    """A run that runs out of budget still reports where it stopped."""
+    from cerebro.models import BudgetLimits
+
+    limits = BudgetLimits.defaults().model_copy(update={"end_to_end_deadline_ms": 1})
+    runtime = build_agent(
+        database,
+        "scripted",
+        reference_scope,
+        golden.GoldenProvider(),
+        bundle_path=reference_bundle,
+        budget_limits=limits,
+    )
+    try:
+        response = runtime.agent.run(
+            SQLGenerationRequest(
+                question="What is transaction volume by branch?",
+                authorization_scope=reference_scope,
+                dialect="duckdb",
+                max_rows=100,
+            )
+        )
+    finally:
+        runtime.close()
+    assert response.status == "check_failed"
+    codes = {violation.code for violation in response.violations}
+    assert codes & {
+        "deadline_exceeded",
+        "token_budget_exceeded",
+        "cost_budget_exceeded",
+        "semantic_call_budget_exceeded",
+    }
+    assert response.attempt_records

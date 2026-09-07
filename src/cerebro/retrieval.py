@@ -439,14 +439,21 @@ class GroundingResolver:
         return tuple(columns)
 
     def _snapshot_relationships(
-        self, obj: SemanticObject, authorized_ids: frozenset[str]
+        self, obj: SemanticObject, member_ids: frozenset[str]
     ) -> tuple[SnapshotRelationship, ...]:
+        """Return only edges this snapshot can stand behind on its own.
+
+        `member_ids` are the objects this snapshot actually contains, not merely
+        the ones the scope authorizes. An edge to a table the snapshot omits
+        would advertise a join whose endpoint the consumer cannot see, and it
+        would leak that the omitted table exists.
+        """
         relationships: list[SnapshotRelationship] = []
         for candidate_id in sorted(set(obj.links) | {obj.id}):
             candidate = self.retriever.by_id.get(candidate_id)
             if candidate is None or candidate.type != "relationship":
                 continue
-            if candidate.id not in authorized_ids:
+            if candidate.id not in member_ids:
                 continue
             metadata = candidate.cerebro
             source_table = str(metadata.get("source_table", ""))
@@ -455,7 +462,7 @@ class GroundingResolver:
             target_column = str(metadata.get("target_column", ""))
             # Both endpoints must survive authorization, otherwise the edge
             # would leak the existence of an unauthorized table.
-            if source_table not in authorized_ids or target_table not in authorized_ids:
+            if source_table not in member_ids or target_table not in member_ids:
                 continue
             if not source_column or not target_column:
                 raise SnapshotMetadataError(
@@ -524,7 +531,7 @@ class GroundingResolver:
         self,
         obj: SemanticObject,
         scope: AuthorizationScope,
-        authorized_ids: frozenset[str],
+        member_ids: frozenset[str],
     ) -> SnapshotMetadataObject:
         formula: str | None = None
         metric_result_type: str | None = None
@@ -541,7 +548,7 @@ class GroundingResolver:
             columns=self._snapshot_columns(obj, scope) if obj.type == "table" else (),
             formula=formula,
             metric_result_type=metric_result_type,
-            relationships=self._snapshot_relationships(obj, authorized_ids),
+            relationships=self._snapshot_relationships(obj, member_ids),
             warnings=self._snapshot_warnings(obj),
         )
 
@@ -566,7 +573,6 @@ class GroundingResolver:
             )
 
         candidates = self.authorized_candidates(scope)
-        authorized_ids = frozenset(obj.id for obj in candidates)
         ranked = self._ranked_authorized(canonical_question, scope)
         selected_ids = set(
             self.expand_authorized(
@@ -575,8 +581,9 @@ class GroundingResolver:
         )
         selected = tuple(obj for obj in candidates if obj.id in selected_ids)
 
+        member_ids = frozenset(obj.id for obj in selected)
         objects = tuple(
-            self._snapshot_object(obj, scope, authorized_ids) for obj in selected
+            self._snapshot_object(obj, scope, member_ids) for obj in selected
         )
         governed_literals = tuple(
             literal for obj in selected for literal in self._governed_literals(obj)

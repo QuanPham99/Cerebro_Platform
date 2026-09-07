@@ -37,6 +37,11 @@ _LOCAL_ACTIONS = frozenset(
 )
 
 
+# Every budget action is also a pipeline stage, so an exhausted budget can name
+# exactly where it stopped.
+_PIPELINE_STAGES = _SEMANTIC_ACTIONS | _LOCAL_ACTIONS
+
+
 class Clock(Protocol):
     def monotonic_ms(self) -> int: ...
 
@@ -49,9 +54,10 @@ class _SystemClock:
 class BudgetExceeded(Exception):
     """Raised before any contact when an action would exceed a limit."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, action: str = "") -> None:
         super().__init__(code)
         self.code = code
+        self.action = action
 
 
 class BudgetTransitionDenied(Exception):
@@ -119,22 +125,22 @@ class RequestBudget:
             raise ValueError(f"unknown budget action: {action}")
 
         if self._elapsed_ms() > self._limits.end_to_end_deadline_ms:
-            raise BudgetExceeded("deadline_exceeded")
+            raise BudgetExceeded("deadline_exceeded", action)
 
         if action in _SEMANTIC_ACTIONS:
             if action == "planned_ir" and not self._planned_authorized:
-                raise BudgetExceeded("planned_route_not_authorized")
+                raise BudgetExceeded("planned_route_not_authorized", action)
             if self._semantic_calls >= self._capacity:
-                raise BudgetExceeded("semantic_call_budget_exceeded")
+                raise BudgetExceeded("semantic_call_budget_exceeded", action)
 
         if estimated_tokens < 0:
             raise ValueError("estimated tokens cannot be negative")
         if self._input_tokens + estimated_tokens > self._limits.max_input_tokens:
-            raise BudgetExceeded("token_budget_exceeded")
+            raise BudgetExceeded("token_budget_exceeded", action)
         if self._output_tokens > self._limits.max_output_tokens:
-            raise BudgetExceeded("token_budget_exceeded")
+            raise BudgetExceeded("token_budget_exceeded", action)
         if self._cost_usd + estimated_cost_usd > self._limits.max_cost_usd:
-            raise BudgetExceeded("cost_budget_exceeded")
+            raise BudgetExceeded("cost_budget_exceeded", action)
 
         if action in _SEMANTIC_ACTIONS:
             # A new semantic call gets its own transport allowance; the total
@@ -326,6 +332,23 @@ class Text2SQLAgent:
             return state.execute()
         except _Terminal as terminal:
             return terminal.response
+        except BudgetExceeded as exhausted:
+            # An exhausted budget is a terminal outcome with evidence, not an
+            # escaping error: a caller that gets no response learns nothing
+            # about which limit stopped the request or how far it got.
+            stage = (
+                exhausted.action if exhausted.action in _PIPELINE_STAGES else "cache"
+            )
+            if state.snapshot is not None and state.route == "none":
+                # The snapshot is already pinned, so this is not a pre-generation
+                # failure: the request reached the default route and stopped
+                # there without ever earning a plan.
+                state.route = "default_ir"
+            try:
+                state.check_failed((exhausted.code, stage))
+            except _Terminal as terminal:
+                return terminal.response
+            raise  # pragma: no cover - check_failed always terminates
 
 
 class _RunState:

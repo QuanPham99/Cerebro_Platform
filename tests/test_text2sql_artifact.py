@@ -197,12 +197,17 @@ def evidence(tmp_path, reference_bundle, database) -> ValidatedLiveEvidence:
         ),
         encoding="utf-8",
     )
+    from cerebro.bundle import load_validated_bundle
+    from cerebro.provenance import semantic_bundle_sha256, sha256_file
+
     receipt = tmp_path / "materialization.json"
     receipt.write_text(
         json.dumps(
             {
                 "source_manifest_sha256": "2" * 64,
-                "bundle_sha256": "3" * 64,
+                "bundle_sha256": semantic_bundle_sha256(
+                    load_validated_bundle(reference_bundle)
+                ),
                 "tables": [
                     {
                         "table_id": "table.branches",
@@ -210,7 +215,7 @@ def evidence(tmp_path, reference_bundle, database) -> ValidatedLiveEvidence:
                         "row_count": 2,
                     }
                 ],
-                "database_sha256": "4" * 64,
+                "database_sha256": sha256_file(Path(database)),
                 "engine": "duckdb",
                 "engine_version": "1.0.0",
             }
@@ -632,3 +637,13 @@ def test_prepare_live_evidence_requires_every_retained_path(tmp_path, database):
 def test_golden_set_declares_exactly_ten_unique_ids(golden_ids):
     assert len(golden_ids) == 10
     assert len(set(golden_ids)) == 10
+
+
+def test_materialization_receipt_must_attest_the_bundle_and_database(
+    candidate, evidence
+):
+    """A baseline may not cite data evidence for something it did not query."""
+    for field in ("bundle_sha256", "database_sha256"):
+        forged = evidence.materialization_receipt.model_copy(update={field: "0" * 64})
+        drifted = dataclasses.replace(evidence, materialization_receipt=forged)
+        assert "evidence_drift" in _blockers(validate_live_baseline(candidate, drifted))

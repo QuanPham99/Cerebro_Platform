@@ -696,6 +696,7 @@ class ValidatedLiveEvidence:
     capability_receipt_sha256: str
     golden_set_sha256: str
     capability_receipt: Any
+    materialization_receipt: Any
     expected_question_ids: tuple[str, ...]
     code_revision: str
     code_dirty: bool
@@ -725,7 +726,7 @@ def prepare_live_evidence(
     golden_set: Path | str = EXPECTED_GOLDEN_QUESTIONS,
 ) -> ValidatedLiveEvidence:
     """Resolve, read, and hash every retained evidence path exactly once."""
-    from .models import ProviderCapabilityReceipt
+    from .models import MaterializationReceipt, ProviderCapabilityReceipt
 
     paths = RetainedEvidencePaths(
         source_manifest=Path(source_manifest).resolve(),
@@ -757,11 +758,21 @@ def prepare_live_evidence(
     except ValidationError as error:
         raise LiveBaselineError("capability receipt is not valid evidence") from error
 
+    try:
+        materialization = MaterializationReceipt.model_validate_json(
+            paths.materialization_receipt.read_bytes()
+        )
+    except ValidationError as error:
+        raise LiveBaselineError(
+            "materialization receipt is not valid evidence"
+        ) from error
+
     expected = tuple(item.id for item in load_reference_questions(paths.golden_set))
     revision, dirty = code_revision()
     return ValidatedLiveEvidence(
         paths=paths,
         capability_receipt=receipt,
+        materialization_receipt=materialization,
         expected_question_ids=expected,
         code_revision=revision,
         code_dirty=dirty,
@@ -1061,6 +1072,15 @@ def validate_live_baseline(
         "golden_set_sha256": evidence.golden_set_sha256,
     }
     if fresh != recorded:
+        blockers.add("evidence_drift")
+
+    # The bundle and database this run actually read must be the ones the
+    # materialization receipt attests to. Without this, a baseline could cite
+    # authoritative data evidence while having queried something else.
+    materialization = evidence.materialization_receipt
+    if materialization.bundle_sha256 != evidence.bundle_sha256:
+        blockers.add("evidence_drift")
+    if materialization.database_sha256 != evidence.database_sha256:
         blockers.add("evidence_drift")
 
     # 2. The receipt must be the one this run's own probe produced.
