@@ -150,3 +150,69 @@ def test_advisory_grounding_payload_is_not_an_authorization_scope():
             question="fraud rate by card type",
             authorization_scope=json.loads(grounding.model_dump_json()),
         )
+
+
+def test_health_reports_whether_the_web_ui_is_built():
+    """One process serves UI, API, and MCP, so its state must be observable."""
+
+    async def exercise() -> dict:
+        transport = httpx.ASGITransport(app=create_app(DEFAULT_BUNDLE))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            return (await client.get("/api/health")).json()
+
+    payload = asyncio.run(exercise())
+    assert payload["status"] == "ok"
+    assert payload["web_ui"] in {"built", "not_built"}
+
+
+def test_unbuilt_web_ui_explains_itself_instead_of_a_bare_404(monkeypatch, tmp_path):
+    """A missing UI bundle reads like a broken server unless it says otherwise."""
+    from cerebro import api
+
+    monkeypatch.setattr(api, "ROOT", tmp_path)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=api.create_app(DEFAULT_BUNDLE))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            return (
+                await client.get("/"),
+                (await client.get("/api/health")).json(),
+            )
+
+    response, health = asyncio.run(exercise())
+    assert health["web_ui"] == "not_built"
+    assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "web_ui_not_built"
+    assert "npm run build" in body["build_command"]
+
+
+def test_built_web_ui_is_served_from_the_same_process(monkeypatch, tmp_path):
+    from cerebro import api
+
+    dist = tmp_path / "apps" / "web" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<title>Cerebro</title>", encoding="utf-8")
+    monkeypatch.setattr(api, "ROOT", tmp_path)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=api.create_app(DEFAULT_BUNDLE))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            return (
+                await client.get("/"),
+                (await client.get("/api/health")).json(),
+                await client.get("/api/bundles/active"),
+            )
+
+    page, health, active = asyncio.run(exercise())
+    assert page.status_code == 200
+    assert "Cerebro" in page.text
+    assert health["web_ui"] == "built"
+    # Mounting the UI at the root must not shadow the API or MCP routes.
+    assert active.status_code == 200

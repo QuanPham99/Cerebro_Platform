@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
 
@@ -29,7 +29,9 @@ def create_mcp_server(retriever: SemanticRetriever) -> FastMCP:
         """Retrieve concepts, tables, safe joins, metrics, warnings, and provenance for a question."""
         if not question.strip():
             raise ValueError("question must not be empty")
-        return retriever.grounding(question, min(max(limit, 1), 50)).model_dump(mode="json")
+        return retriever.grounding(question, min(max(limit, 1), 50)).model_dump(
+            mode="json"
+        )
 
     @server.tool()
     def get_concept(concept_id: str) -> dict:
@@ -48,7 +50,11 @@ def create_mcp_server(retriever: SemanticRetriever) -> FastMCP:
         if unknown:
             raise ValueError(f"Unknown concept IDs: {', '.join(unknown)}")
         ids = retriever.expand(concept_ids, depth)
-        return {"semantic_version": retriever.bundle.version, "depth": depth, "concept_ids": ids}
+        return {
+            "semantic_version": retriever.bundle.version,
+            "depth": depth,
+            "concept_ids": ids,
+        }
 
     return server
 
@@ -79,16 +85,30 @@ def create_app(bundle_path: Path | str = DEFAULT_BUNDLE) -> FastAPI:
         allow_headers=["*"],
     )
 
+    web_dist = ROOT / "apps" / "web" / "dist"
+
     @app.get("/api/health")
     async def health() -> dict:
-        return {"status": "ok", "bundle": bundle.name, "version": bundle.version, "objects": len(bundle.objects)}
+        return {
+            "status": "ok",
+            "bundle": bundle.name,
+            "version": bundle.version,
+            "objects": len(bundle.objects),
+            "web_ui": "built" if web_dist.exists() else "not_built",
+        }
 
     @app.get("/api/bundles/active")
     async def active_bundle() -> dict:
         counts: dict[str, int] = {}
         for obj in bundle.objects:
             counts[obj.type] = counts.get(obj.type, 0) + 1
-        return {"name": bundle.name, "version": bundle.version, "root": bundle.root, "counts": counts, "generation_mode": "fallback"}
+        return {
+            "name": bundle.name,
+            "version": bundle.version,
+            "root": bundle.root,
+            "counts": counts,
+            "generation_mode": "fallback",
+        }
 
     @app.get("/api/graph")
     async def graph() -> dict:
@@ -98,7 +118,9 @@ def create_app(bundle_path: Path | str = DEFAULT_BUNDLE) -> FastAPI:
     async def get_concept(concept_id: str) -> SemanticObject:
         obj = retriever.by_id.get(concept_id)
         if obj is None:
-            raise HTTPException(status_code=404, detail={"code": "unknown_concept", "id": concept_id})
+            raise HTTPException(
+                status_code=404, detail={"code": "unknown_concept", "id": concept_id}
+            )
         return obj
 
     @app.get("/api/search")
@@ -107,16 +129,33 @@ def create_app(bundle_path: Path | str = DEFAULT_BUNDLE) -> FastAPI:
         types: str | None = None,
         limit: int = Query(default=10, ge=1, le=50),
     ) -> dict:
-        requested = {item.strip() for item in types.split(",") if item.strip()} if types else None
+        requested = (
+            {item.strip() for item in types.split(",") if item.strip()}
+            if types
+            else None
+        )
         if requested:
-            allowed = {"dataset", "table", "concept", "relationship", "metric", "policy"}
+            allowed = {
+                "dataset",
+                "table",
+                "concept",
+                "relationship",
+                "metric",
+                "policy",
+            }
             unknown = requested - allowed
             if unknown:
-                raise HTTPException(status_code=422, detail={"code": "unknown_types", "types": sorted(unknown)})
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "unknown_types", "types": sorted(unknown)},
+                )
         return {
             "query": q,
             "retrieval_mode": "lexical_graph",
-            "results": [item.model_dump(mode="json") for item in retriever.search(q, limit, requested)],
+            "results": [
+                item.model_dump(mode="json")
+                for item in retriever.search(q, limit, requested)
+            ],
         }
 
     @app.post("/api/grounding", response_model=GroundingResponse)
@@ -130,14 +169,33 @@ def create_app(bundle_path: Path | str = DEFAULT_BUNDLE) -> FastAPI:
     async def knowledge_document(document_path: str) -> FileResponse:
         bundle_root = Path(bundle.root).resolve()
         requested = (bundle_root / document_path).resolve()
-        if bundle_root not in requested.parents or not requested.is_file() or requested.suffix != ".md":
+        if (
+            bundle_root not in requested.parents
+            or not requested.is_file()
+            or requested.suffix != ".md"
+        ):
             raise HTTPException(status_code=404, detail={"code": "unknown_document"})
         return FileResponse(requested, media_type="text/markdown; charset=utf-8")
 
     app.mount("/mcp", mcp_app)
-    web_dist = ROOT / "apps" / "web" / "dist"
     if web_dist.exists():
         app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
+    else:
+        # An unbuilt UI used to answer a bare 404, which reads like a broken
+        # server. Say what is missing and exactly how to supply it.
+        @app.get("/")
+        async def web_ui_not_built() -> JSONResponse:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "web_ui_not_built",
+                    "message": "The API and MCP server are running; the web UI bundle is absent.",
+                    "build_command": "cd apps/web && npm install && npm run build",
+                    "api_docs": "/docs",
+                    "health": "/api/health",
+                },
+            )
+
     return app
 
 

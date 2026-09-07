@@ -307,6 +307,20 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "serve":
             import uvicorn
 
+            from .paths import ROOT
+
+            # One process serves the UI, the HTTP API, and MCP. Say which of
+            # those are actually available before binding the port, so a missing
+            # UI build is visible immediately instead of as a 503 later.
+            built = (ROOT / "apps" / "web" / "dist").exists()
+            base = f"http://{args.host}:{args.port}"
+            print(
+                f"web UI   {base}/"
+                if built
+                else "web UI   not built (cd apps/web && npm install && npm run build)"
+            )
+            print(f"HTTP API {base}/api/health")
+            print(f"MCP      {base}/mcp")
             uvicorn.run("cerebro.api:app", host=args.host, port=args.port)
         return 0
     except (
