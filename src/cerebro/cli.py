@@ -10,13 +10,19 @@ from .bundle import BundleLoader, BundleValidator
 from .enrichment import SemanticEnricher, provider_from_environment
 from .evaluation import (
     DEFAULT_SUPPORTED_QUESTIONS,
+    EXPECTED_GOLDEN_QUESTIONS,
+    LiveBaselineError,
     ReferenceQuestionError,
     RuntimeCompositionError,
     build_agent,
     load_authorization_scope,
     load_reference_questions,
+    prepare_live_evidence,
     run_evaluation,
+    run_live_baseline,
     run_offline_reference,
+    validate_live_baseline,
+    write_evaluation_artifact,
     write_offline_reference,
 )
 from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG
@@ -96,8 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         "baseline", help="Run the live Option B baseline with the organizer model"
     )
     _add_runtime_arguments(baseline)
-    baseline.add_argument("--questions", type=Path, default=DEFAULT_SUPPORTED_QUESTIONS)
+    baseline.add_argument("--questions", type=Path, default=EXPECTED_GOLDEN_QUESTIONS)
     baseline.add_argument("--capability-receipt-dir", type=Path, required=True)
+    baseline.add_argument("--manifest", type=Path, required=True)
+    baseline.add_argument("--materialization-receipt", type=Path, required=True)
+    baseline.add_argument("--output", type=Path, required=True)
 
     serve = commands.add_parser("serve", help="Serve HTTP, MCP, and built web UI")
     serve.add_argument("--host", default="127.0.0.1")
@@ -202,9 +211,6 @@ def _run_reference(args) -> int:
 
 def _run_baseline(args) -> int:
     """Live organizer only. It never accepts a scripted or golden provider."""
-    from .hosted_provider import probe_provider_schema
-    from .models import SQLGenerationRequest
-
     scope = load_authorization_scope(args.authorization_scope)
     runtime = build_agent(
         args.database,
@@ -213,46 +219,44 @@ def _run_baseline(args) -> int:
         bundle_path=args.bundle,
     )
     try:
-        receipt, receipt_path = probe_provider_schema(
-            gateway=runtime.provider._inner,
-            receipt_dir=args.capability_receipt_dir,
+        candidate, receipt_path = run_live_baseline(
+            runtime,
+            capability_receipt_dir=args.capability_receipt_dir,
+            questions_path=args.questions,
+            max_rows=args.max_rows,
         )
-        outcomes = []
-        for case in load_reference_questions(args.questions):
-            response = runtime.agent.run(
-                SQLGenerationRequest(
-                    question=case.question,
-                    authorization_scope=scope,
-                    dialect="duckdb",
-                    max_rows=args.max_rows,
-                )
-            )
-            outcomes.append(
-                {
-                    "id": case.id,
-                    "status": response.status,
-                    "generation_route": response.generation_route,
-                    "cache_status": response.cache_status,
-                    "semantic_calls": response.budget_usage.semantic_calls,
-                }
-            )
     finally:
         runtime.close()
+
+    evidence = prepare_live_evidence(
+        source_manifest=args.manifest,
+        materialization_receipt=args.materialization_receipt,
+        bundle=args.bundle,
+        database=args.database,
+        capability_receipt=receipt_path,
+        golden_set=args.questions,
+    )
+    outcome = validate_live_baseline(candidate, evidence)
+    if outcome.run_kind == "blocked":
+        # A blocked baseline writes nothing at all: no artifact, no placeholder.
+        print(outcome.model_dump_json(indent=2), file=sys.stderr)
+        return 2
+    written = write_evaluation_artifact(outcome, args.output)
     print(
         json.dumps(
             {
-                "run_kind": "live_baseline",
-                "provider": receipt.provider,
-                "model": receipt.model,
-                "revision": receipt.revision,
-                "schema_mechanism": receipt.schema_mechanism,
-                "capability_receipt": str(receipt_path) if receipt_path else None,
-                "questions": outcomes,
-            },
-            indent=2,
+                "run_kind": outcome.run_kind,
+                "run_id": outcome.provenance.run_id,
+                "total_questions": outcome.total_questions,
+                "ok_count": outcome.ok_count,
+                "refused_count": outcome.refused_count,
+                "check_failed_count": outcome.check_failed_count,
+                "capability_receipt": str(receipt_path),
+                "output": str(written),
+            }
         )
     )
-    return 0 if all(item["status"] == "ok" for item in outcomes) else 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -309,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         CommandConfigurationError,
         RuntimeCompositionError,
         ReferenceQuestionError,
+        LiveBaselineError,
         ProviderConfigurationError,
     ) as exc:
         # Configuration failures are typed and machine readable: a caller must

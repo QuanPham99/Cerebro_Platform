@@ -608,3 +608,91 @@ def test_cli_modes_are_explicit_and_disjoint():
     }
     assert "--cassette" not in options
     assert "--provider-factory" not in options
+
+
+# --- live baseline boundary -------------------------------------------------
+
+
+def test_live_baseline_refuses_an_offline_runtime(runtime_factory, tmp_path):
+    """A scripted or golden provider can never produce a live baseline."""
+    from cerebro.evaluation import LiveBaselineError, run_live_baseline
+
+    runtime = runtime_factory()
+    with pytest.raises(LiveBaselineError):
+        run_live_baseline(runtime, capability_receipt_dir=tmp_path / "capability")
+
+
+def test_baseline_command_declares_the_full_evidence_surface():
+    from cerebro import cli
+
+    choices = {
+        action.dest: action for action in cli.build_parser()._subparsers._group_actions
+    }["command"].choices
+    options = {
+        option
+        for action in choices["baseline"]._actions
+        for option in action.option_strings
+    }
+    assert {
+        "--manifest",
+        "--materialization-receipt",
+        "--capability-receipt-dir",
+        "--authorization-scope",
+        "--database",
+        "--bundle",
+        "--output",
+        "--questions",
+    } <= options
+
+
+def test_baseline_defaults_to_the_ten_golden_questions():
+    from cerebro.evaluation import (
+        EXPECTED_GOLDEN_QUESTION_COUNT,
+        EXPECTED_GOLDEN_QUESTIONS,
+    )
+
+    cases = load_reference_questions(EXPECTED_GOLDEN_QUESTIONS)
+    assert len(cases) == EXPECTED_GOLDEN_QUESTION_COUNT
+    assert len({case.id for case in cases}) == EXPECTED_GOLDEN_QUESTION_COUNT
+
+
+def test_baseline_without_provider_configuration_returns_typed_json(
+    tmp_path, database, reference_bundle, reference_scope, capsys, monkeypatch
+):
+    from cerebro import cli
+
+    for name in (
+        "CEREBRO_BASE_URL",
+        "CEREBRO_API_KEY",
+        "CEREBRO_MODEL",
+        "CEREBRO_LLM_BASE_URL",
+        "CEREBRO_LLM_API_KEY",
+        "CEREBRO_LLM_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    scope_path = tmp_path / "scope.json"
+    scope_path.write_text(reference_scope.model_dump_json(), encoding="utf-8")
+    output = tmp_path / "baseline.json"
+    code = cli.main(
+        [
+            "baseline",
+            "--bundle",
+            str(reference_bundle),
+            "--database",
+            database,
+            "--authorization-scope",
+            str(scope_path),
+            "--capability-receipt-dir",
+            str(tmp_path / "capability"),
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--materialization-receipt",
+            str(tmp_path / "receipt.json"),
+            "--output",
+            str(output),
+        ]
+    )
+    assert code == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["command"] == "baseline"
+    assert not output.exists()

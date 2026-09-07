@@ -1733,3 +1733,218 @@ for _model in (
 ):
     _model.model_rebuild()
 del _model
+
+
+# ---------------------------------------------------------------------------
+# Live Option B baseline evidence.
+#
+# A baseline is only worth publishing if a reader can reconstruct exactly which
+# code, data, policy, and model produced it. Every field below is mandatory for
+# that reason: an artifact that omits one cannot be audited later, and an
+# optional provenance field is provenance nobody can rely on.
+# ---------------------------------------------------------------------------
+
+EVALUATION_ARTIFACT_VERSION = "008.artifact.v3"
+
+BaselineBlockerCode: TypeAlias = Literal[
+    "evidence_drift",
+    "stale_capability_probe",
+    "provider_identity_mismatch",
+    "model_identity_mismatch",
+    "model_revision_mismatch",
+    "schema_mechanism_mismatch",
+    "dirty_code_revision",
+    "unknown_code_revision",
+    "question_cardinality_mismatch",
+    "duplicate_question_id",
+    "unexpected_question_id",
+    "falsified_totals",
+    "all_questions_failed",
+    "generation_route_mismatch",
+    "cache_status_mismatch",
+    "semantic_call_count_mismatch",
+    "cached_route_not_revalidated",
+    "unauthorized_budget_transition",
+    "repeated_budget_transition",
+    "budget_overflow",
+    "canonicalization_version_drift",
+    "literal_registry_version_drift",
+    "type_registry_version_drift",
+    "serialized_canonical_question",
+    "serialized_resolved_value",
+    "missing_v3_provenance",
+    "missing_live_provider",
+]
+
+
+class ArtifactProvenance(_StrictFrozenEvidenceModel):
+    """Everything needed to reproduce one live baseline run."""
+
+    contract_version: Literal["008.artifact.v3"]
+    run_id: EvidenceIdentifier
+    dialect: Literal["duckdb"]
+
+    # Retrieval, authorization, and policy.
+    retrieval_config_sha256: Sha256Digest
+    policy_version: EvidenceIdentifier
+    semantic_version: EvidenceIdentifier
+    authorization_scope_hash: Sha256Digest
+
+    # Question and literal identity.
+    canonicalization_version: EvidenceIdentifier
+    canonical_question_hash_algorithm: Literal["sha256"]
+    literal_registry_version: EvidenceIdentifier
+
+    # Generation and checking.
+    prompt_version: EvidenceIdentifier
+    ir_contract_version: EvidenceIdentifier
+    type_registry_version: EvidenceIdentifier
+    router_version: EvidenceIdentifier
+    compiler_version: EvidenceIdentifier
+    checker_sha256: Sha256Digest
+    cache_identity_version: EvidenceIdentifier
+
+    # Exact effective limits, plus the hash that pins them.
+    budget_limits: BudgetLimits
+    budget_limits_sha256: Sha256Digest
+
+    # The organizer runtime that actually answered.
+    provider: EvidenceIdentifier
+    model: EvidenceIdentifier
+    model_revision: EvidenceIdentifier
+    schema_mechanism: EvidenceIdentifier
+    capability_receipt_sha256: Sha256Digest
+
+    # The authoritative data this run read.
+    source_manifest_sha256: Sha256Digest
+    materialization_receipt_sha256: Sha256Digest
+    bundle_sha256: Sha256Digest
+    database_sha256: Sha256Digest
+    golden_set_sha256: Sha256Digest
+
+    # The exact code revision.
+    code_revision: EvidenceIdentifier
+    code_dirty: bool
+
+
+class EvaluationQuestion(_StrictFrozenEvidenceModel):
+    """One baseline question's terminal evidence. It carries no values."""
+
+    question_id: EvidenceIdentifier
+    canonical_question_hash: Sha256Digest
+    authorization_scope_hash: Sha256Digest
+    snapshot_hash: Sha256Digest
+    status: Literal["ok", "refused", "check_failed"]
+    generation_route: Literal["default_ir", "planned_ir"]
+    cache_status: Literal["miss", "hit"]
+    ir_hash: Sha256Digest | None = None
+    sql_artifact: SQLArtifact | None = None
+    attempt_records: tuple[AttemptRecord, ...] = Field(min_length=1)
+    budget_usage: BudgetUsage
+    result_columns: tuple[ColumnName, ...] = ()
+    result_column_types: tuple[ScalarType, ...] = ()
+    row_count: int | None = None
+    output_lineage: tuple[OutputLineage, ...] = ()
+    disclosures: tuple[DisclosureRecord, ...] = ()
+    violation_codes: tuple[StableCode, ...] = ()
+    refusal_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _evidence_is_internally_consistent(self) -> EvaluationQuestion:
+        # Semantic call totals are derived from the attempts, never reported
+        # independently: a self-declared total could not be cross-checked.
+        # A generation stage labels both the provider call and the local IR
+        # validation that follows it, and it is also recorded when a cached IR is
+        # revalidated. Each route is entered at most once per request, so the
+        # number of distinct generation stages reached while the cache missed is
+        # exactly the number of semantic calls.
+        derived = len(
+            {
+                record.stage
+                for record in self.attempt_records
+                if record.stage in {"default_ir", "planned_ir"}
+                and record.outcome == "accepted"
+                and record.cache_status == "miss"
+            }
+        )
+        if derived != self.budget_usage.semantic_calls:
+            raise ValueError("semantic calls must be derived from the attempts")
+        if len(self.result_columns) != len(self.result_column_types):
+            raise ValueError("result column types must describe every column")
+        if self.status == "ok":
+            if self.sql_artifact is None or self.ir_hash is None:
+                raise ValueError("an ok question reports its IR hash and artifact")
+            if self.row_count is None:
+                raise ValueError("an ok question reports its row count")
+            if not self.output_lineage:
+                raise ValueError("an ok question reports output lineage")
+            if self.violation_codes:
+                raise ValueError("an ok question reports no violations")
+        if self.status == "refused" and not self.refusal_reason:
+            raise ValueError("a refusal reports its typed reason")
+        if self.status == "check_failed" and not self.violation_codes:
+            raise ValueError("a check failure reports at least one violation code")
+        if self.cache_status == "hit" and self.budget_usage.semantic_calls != 0:
+            raise ValueError("a cache hit consumes no semantic call")
+        planned_miss = (
+            self.generation_route == "planned_ir" and self.cache_status == "miss"
+        )
+        if planned_miss and not self.budget_usage.planned_ir_authorized:
+            raise ValueError("a planned miss requires an authorized transition")
+        default_miss = (
+            self.generation_route == "default_ir" and self.cache_status == "miss"
+        )
+        if default_miss and self.budget_usage.planned_ir_authorized:
+            raise ValueError("a default miss authorizes no transition")
+        return self
+
+
+class EvaluationArtifact(_StrictFrozenEvidenceModel):
+    """The only artifact a live baseline may publish."""
+
+    run_kind: Literal["live_unadapted_baseline"]
+    artifact_version: Literal["008.artifact.v3"]
+    provenance: ArtifactProvenance
+    questions: tuple[EvaluationQuestion, ...] = Field(min_length=1)
+    total_questions: int = Field(ge=1)
+    ok_count: int = Field(ge=0)
+    refused_count: int = Field(ge=0)
+    check_failed_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _totals_are_derived_and_non_vacuous(self) -> EvaluationArtifact:
+        if self.total_questions != len(self.questions):
+            raise ValueError("the reported total must equal the question count")
+        identifiers = [item.question_id for item in self.questions]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("every question id must be unique")
+        counted = {
+            "ok": self.ok_count,
+            "refused": self.refused_count,
+            "check_failed": self.check_failed_count,
+        }
+        for status, reported in counted.items():
+            derived = sum(1 for item in self.questions if item.status == status)
+            if reported != derived:
+                raise ValueError(f"the {status} count must be derived from entries")
+        if sum(counted.values()) != self.total_questions:
+            raise ValueError("status counts must partition every question")
+        # A run where nothing succeeded is not a baseline: it measures nothing.
+        if self.ok_count < 1:
+            raise ValueError("a baseline requires at least one ok question")
+        return self
+
+
+class BlockedEvaluation(_StrictFrozenEvidenceModel):
+    """The recorded outcome when evidence is absent or has drifted."""
+
+    run_kind: Literal["blocked"]
+    artifact_version: Literal["008.artifact.v3"]
+    run_id: EvidenceIdentifier
+    blockers: tuple[BaselineBlockerCode, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _blockers_are_unique(self) -> BlockedEvaluation:
+        if len(set(self.blockers)) != len(self.blockers):
+            raise ValueError("blockers must be unique")
+        return self
