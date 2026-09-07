@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import date as _Date
+from datetime import datetime as _DateTime
+from datetime import time as _Time
+from datetime import timedelta as _TimeDelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from uuid import UUID
 
 import duckdb
 
@@ -99,6 +105,30 @@ def _run_with_deadline(
 def _scalar_type(duckdb_type: str) -> str:
     key = str(duckdb_type).upper().split("(", 1)[0]
     return _DUCKDB_TYPE_TO_SCALAR.get(key, "string")
+
+
+def _cell(value: Any) -> Any:
+    """Render one engine cell as a JSON scalar without changing its meaning.
+
+    Temporal and exact-decimal cells arrive as Python objects the response
+    contract cannot carry. They are rendered losslessly and canonically rather
+    than dropped, because a silently absent cell would misreport the result.
+    Non-finite floats are deliberately not rewritten: the contract rejects them,
+    and inventing a substitute would hide an engine-level anomaly.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (_DateTime, _Date, _Time)):
+        return value.isoformat()
+    if isinstance(value, _TimeDelta):
+        return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    if isinstance(value, UUID):
+        return str(value)
+    return str(value)
 
 
 class DuckDBExecutor:
@@ -235,7 +265,7 @@ class DuckDBExecutor:
         return QueryResult(
             columns=tuple(item[0] for item in description),
             column_types=tuple(_scalar_type(item[1]) for item in description),
-            rows=tuple(tuple(row) for row in returned),
+            rows=tuple(tuple(_cell(cell) for cell in row) for row in returned),
             row_count=len(returned),
             truncated=truncated,
             elapsed_ms=elapsed_ms,

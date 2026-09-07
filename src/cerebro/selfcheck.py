@@ -1497,7 +1497,10 @@ def _authorize_predicates(
     for node in ir.nodes:
         if node.kind == "filter":
             for term in _ir_predicate_terms(node.predicate):
-                ledger.declare(term)
+                # One data-relative window is a closed interval: it renders as
+                # exactly two bound comparisons against the same scalar anchor,
+                # so it authorizes two compiled terms rather than one.
+                ledger.declare(term, 2 if term == "relative_time" else 1)
         if node.kind == "aggregate" and node.minimum_group_size is not None:
             ledger.declare("minimum_group_guard")
 
@@ -1827,18 +1830,62 @@ def _expression_source_columns(expression: Any) -> set[Any]:
     return sources
 
 
-def _metric_source_columns(index: GroundingIndex, metric_id: str) -> set[Any]:
+def _all_sensitive_columns(index: GroundingIndex) -> set[Any]:
     from .models import ColumnRef
 
-    if metric_id not in index.metric_result_types:
-        return set()
-    # A governed metric is authorized as a whole; its lineage is the sensitive
-    # columns its formula may legitimately touch.
     return {
         ColumnRef(table_id=table_id, column=column)
         for (table_id, column) in index.columns
         if index.column_classifications.get((table_id, column))
         in _SENSITIVE_CLASSIFICATIONS
+    }
+
+
+def _metric_source_columns(index: GroundingIndex, metric_id: str) -> set[Any]:
+    """Return the snapshot columns one governed metric formula actually reads.
+
+    Lineage must name the columns the formula touches, not every sensitive
+    column in the snapshot: an unrelated restricted column in a neighbouring
+    table would otherwise over-classify every metric and demand guards the
+    query does not need. When the formula is absent, unparsable, or references a
+    column this snapshot cannot resolve, the conservative whole-snapshot
+    sensitive set is used instead, because an unresolved reference is exactly
+    the case where under-reporting would be unsafe.
+    """
+    from .models import ColumnRef
+
+    if metric_id not in index.metric_result_types:
+        return set()
+    formula = index.metric_formulas.get(metric_id)
+    if not formula:
+        return _all_sensitive_columns(index)
+
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        parsed = sqlglot.parse_one(formula, dialect="duckdb")
+    except Exception:  # noqa: BLE001 - sqlglot raises several error types
+        return _all_sensitive_columns(index)
+
+    resolved: set[tuple[str, str]] = set()
+    for column in parsed.find_all(exp.Column):
+        name = column.name
+        matched: tuple[str, str] | None = None
+        for part in (column.table, column.db, column.catalog):
+            if not part:
+                continue
+            for table_id in (f"table.{part}", part):
+                if (table_id, name) in index.columns:
+                    matched = (table_id, name)
+                    break
+            if matched is not None:
+                break
+        if matched is None:
+            return _all_sensitive_columns(index)
+        resolved.add(matched)
+    return {
+        ColumnRef(table_id=table_id, column=column) for table_id, column in resolved
     }
 
 

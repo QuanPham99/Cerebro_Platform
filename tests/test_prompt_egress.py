@@ -387,3 +387,51 @@ def test_provider_output_that_is_not_schema_valid_fails_as_a_semantic_error():
     inner = _scripted([{"outcome": "ir", "ir_version": "008.ir.v1"}])
     with pytest.raises(ValidationError):
         GuardedProvider(inner).generate(_request(), _outcome_adapter())
+
+
+# --- the offline reference provider honours the same boundary ---------------
+
+
+def test_golden_provider_speaks_only_the_guarded_protocol():
+    """The offline reference goes through the same boundary as the organizer."""
+    import golden_answers
+
+    provider = golden_answers.GoldenProvider()
+    assert isinstance(provider, Text2SQLGenerationProvider)
+    for attribute in ("provider", "model", "model_revision", "schema_mechanism"):
+        assert isinstance(getattr(provider, attribute), str)
+
+
+def test_golden_provider_rejects_an_unguarded_payload():
+    import golden_answers
+
+    from cerebro.text2sql_provider import ProviderRejected
+
+    provider = golden_answers.GoldenProvider()
+    with pytest.raises(ProviderRejected):
+        provider.generate({"mode": "default_ir"}, _outcome_adapter())
+
+
+def test_golden_answers_module_never_imports_enrichment():
+    """Query generation and bundle enrichment stay separate workstreams."""
+    import ast
+
+    import golden_answers
+
+    tree = ast.parse(inspect.getsource(golden_answers))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+            imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+    assert not {name for name in imported if "enrichment" in name}
+
+
+def test_golden_answers_stores_no_sql_or_resolved_value():
+    import golden_answers
+
+    source = inspect.getsource(golden_answers)
+    for forbidden in ("SELECT ", "BoundParameter", "ResolvedLiteral"):
+        assert forbidden not in source
