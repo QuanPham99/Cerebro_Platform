@@ -61,10 +61,9 @@ OPTION_B_PROVENANCE_FIELDS = (
 
 
 @pytest.fixture(scope="module")
-def reference_bundle(tmp_path_factory) -> Path:
-    return golden.materialize_reference_bundle(
-        DEFAULT_BUNDLE, tmp_path_factory.mktemp("artifact-bundle") / "bank-workshop"
-    )
+def reference_bundle() -> Path:
+    """The governed bundle, read directly. Nothing copies or amends it."""
+    return DEFAULT_BUNDLE
 
 
 @pytest.fixture(scope="module")

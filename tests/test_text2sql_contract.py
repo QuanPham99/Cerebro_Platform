@@ -3836,3 +3836,106 @@ def test_all_task0_evidence_records_keep_exact_fields_and_dumps():
             "strict": True,
         }
     assert hasattr(models, "Sha256Digest")
+
+
+# --- deferred findings closed -----------------------------------------------
+
+
+def test_resolved_parameter_value_never_surfaces_through_repr_or_str():
+    """`exclude` stops serialization; a value also must not escape via a repr."""
+    parameter = models.BoundParameter(
+        position=1, data_type="string", value="CANARY_RESOLVED_LONDON"
+    )
+    for rendered in (repr(parameter), str(parameter), f"{parameter}"):
+        assert "CANARY_RESOLVED_LONDON" not in rendered
+    assert "CANARY_RESOLVED_LONDON" not in repr((parameter,))
+    assert "CANARY_RESOLVED_LONDON" not in repr(
+        models.CompiledQuery(
+            sql="SELECT 1",
+            parameters=(parameter,),
+            ir_hash=factories.SHA256_A,
+            compiler_version="008.compiler.v1",
+            dialect="duckdb",
+        )
+    )
+    # The value is still readable by the compiler that owns it.
+    assert parameter.value == "CANARY_RESOLVED_LONDON"
+
+
+@pytest.mark.parametrize(
+    ("model_name", "field", "item"),
+    [
+        ("ComplexQueryPlan", "operator_ids", "window.period_over_period.v1"),
+        ("ComplexQueryPlan", "expected_outputs", "output_name"),
+    ],
+)
+def test_provider_authored_collections_are_bounded(model_name, field, item):
+    plan = factories.complex_window_plan()
+    payload = plan.model_dump(mode="python")
+    payload[field] = tuple([item] * 500)
+    with pytest.raises(ValidationError):
+        getattr(models, model_name).model_validate(payload)
+
+
+def test_plan_step_dependencies_and_inputs_are_bounded():
+    plan = factories.complex_window_plan()
+    step = plan.steps[0].model_dump(mode="python")
+    for field, item in (
+        ("depends_on", "other_step"),
+        ("input_object_ids", "table.transactions"),
+        ("output_names", "column_name"),
+    ):
+        payload = {**step, field: tuple([item] * 500)}
+        with pytest.raises(ValidationError):
+            models.ComplexPlanStep.model_validate(payload)
+
+
+def test_response_attempt_and_violation_collections_are_bounded():
+    base = factories.valid_response_base()
+    payload = base.model_dump(mode="python")
+    payload["attempt_records"] = tuple(payload["attempt_records"]) * 200
+    with pytest.raises(ValidationError):
+        models.ResponseBase.model_validate(payload)
+
+
+def test_ir_decision_collections_are_bounded():
+    ir = factories.minimal_ir()
+    payload = ir.model_dump(mode="python")
+    payload["assumptions"] = tuple([{"kind": "direction_mapping"}] * 500)
+    with pytest.raises(ValidationError):
+        models.RelationalQueryIR.model_validate(payload)
+
+
+def test_sensitive_output_lineage_must_name_its_provenance():
+    with pytest.raises(ValidationError):
+        models.OutputLineage(output_name="secret", classification="restricted")
+    named = models.OutputLineage(
+        output_name="secret",
+        source_columns=(
+            models.ColumnRef(table_id="table.accounts", column="customer_name"),
+        ),
+        classification="restricted",
+    )
+    assert named.source_columns
+    # A public output legitimately has no sensitive provenance to name.
+    assert models.OutputLineage(output_name="count", classification="public")
+
+
+def test_default_route_denies_every_node_kind_it_does_not_declare():
+    """Deny by default: an unlisted node kind is not a simple node."""
+    declared = models.SUPPORTED_DEFAULT_NODE_KINDS | models.SUPPORTED_COMPLEX_NODE_KINDS
+    actual = {
+        variant.model_fields["kind"].annotation.__args__[0]
+        for variant in (
+            models.ScanNode,
+            models.JoinNode,
+            models.FilterNode,
+            models.AggregateNode,
+            models.ProjectNode,
+            models.SortNode,
+            models.LimitNode,
+            models.WindowNode,
+            models.SetOperationNode,
+        )
+    }
+    assert actual == declared

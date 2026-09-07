@@ -286,10 +286,52 @@ def test_unknown_declared_column_type_fails_closed():
         resolver.resolve(canonicalize_question("orders"), scope, "duckdb")
 
 
-def test_metric_without_declared_result_type_fails_closed(resolver):
-    scope = _scope({"table.card_transactions", "metric.card-fraud-rate"})
+def test_metric_without_declared_result_type_fails_closed():
+    """A result type is governed input; it is never inferred from a formula.
+
+    The metric is synthetic on purpose. Asserting this against the workshop
+    bundle would only prove that the bundle happened to omit the declaration,
+    so the guarantee would disappear the moment the bundle declared it.
+    """
+    metric = SemanticObject(
+        id="metric.order-volume",
+        type="metric",
+        name="Order volume",
+        description="Governed order volume.",
+        cerebro={
+            "classification": "internal",
+            "formula": "SUM(orders.amount)",
+        },
+    )
+    resolver = GroundingResolver(
+        SemanticRetriever(_synthetic_bundle([_synthetic_table(), metric])),
+        retrieval_config_hash=RETRIEVAL_CONFIG_HASH,
+    )
+    scope = _scope({"table.orders", "metric.order-volume"})
     with pytest.raises(SnapshotMetadataError):
-        resolver.resolve(canonicalize_question("card fraud rate"), scope, "duckdb")
+        resolver.resolve(canonicalize_question("order volume"), scope, "duckdb")
+
+
+def test_workshop_bundle_declares_every_metric_result_type():
+    """Every governed metric card carries the declaration the resolver needs."""
+    from cerebro.bundle import load_validated_bundle
+    from cerebro.paths import DEFAULT_BUNDLE
+
+    metrics = [
+        obj
+        for obj in load_validated_bundle(DEFAULT_BUNDLE).objects
+        if obj.type == "metric"
+    ]
+    assert metrics
+    for metric in metrics:
+        assert metric.cerebro.get("metric_result_type") in {
+            "string",
+            "integer",
+            "decimal",
+            "boolean",
+            "date",
+            "timestamp",
+        }, metric.id
 
 
 def test_metric_with_declared_result_type_is_accepted():

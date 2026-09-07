@@ -7,15 +7,17 @@ asserting its own output instead of the production compiler's.
 
 This module never imports `cerebro.enrichment`. The enrichment flow builds the
 semantic bundle and has no authority over query generation.
+
+The reference run reads `knowledge/bank-workshop` directly. The bundle now
+declares `metric_result_type` on every metric card, so nothing here has to
+copy or amend governed metadata.
 """
 
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from cerebro.evaluation import ReferenceQuestion, load_reference_questions
@@ -71,63 +73,6 @@ REFERENCE_OBJECT_IDS: tuple[str, ...] = (
 
 REFERENCE_POLICY_VERSION = "policy.reference.v1"
 REFERENCE_TENANT_SCOPE_HASH = "1" * 64
-
-#: Governed metric result types the read-only workshop bundle does not declare.
-#:
-#: `knowledge/bank-workshop/` is read-only input owned by another workstream and
-#: none of its metric cards author `metric_result_type`, which `GroundingResolver`
-#: requires and refuses to infer from a formula. The reference run therefore
-#: materializes a local copy of the bundle and authors the declaration there.
-#: Nothing in the governed bundle is modified.
-MISSING_METRIC_RESULT_TYPES: Mapping[str, str] = {
-    "metric.card-fraud-rate": "decimal",
-    "metric.late-payment-rate": "decimal",
-    "metric.non-performing-loan-rate": "decimal",
-    "metric.transaction-volume": "decimal",
-}
-_DEFAULT_METRIC_RESULT_TYPE = "decimal"
-
-_FORMULA_LINE = re.compile(r"^(?P<indent>\s*)formula:\s", re.MULTILINE)
-
-
-def materialize_reference_bundle(source: Path | str, destination: Path | str) -> Path:
-    """Copy an OKF bundle and author the metric result types it omits.
-
-    This is fixture materialization, not a bundle edit: the source tree is only
-    read. It exists so the offline reference can exercise metric fidelity while
-    the governed bundle's missing declaration is resolved upstream.
-    """
-    source_root = Path(source)
-    target = Path(destination)
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source_root, target)
-    for card in sorted((target / "metrics").glob("*.md")):
-        text = card.read_text(encoding="utf-8")
-        if "metric_result_type:" in text:
-            continue
-        match = _FORMULA_LINE.search(text)
-        if match is None:
-            continue
-        indent = match.group("indent")
-        identifier = _declared_id(text)
-        declared = MISSING_METRIC_RESULT_TYPES.get(
-            identifier, _DEFAULT_METRIC_RESULT_TYPE
-        )
-        insertion = f"{indent}metric_result_type: {declared}\n"
-        card.write_text(
-            text[: match.start()] + insertion + text[match.start() :],
-            encoding="utf-8",
-        )
-    return target
-
-
-def _declared_id(text: str) -> str:
-    for line in text.splitlines():
-        if line.startswith("id:"):
-            return line.split(":", 1)[1].strip()
-    return ""
-
 
 # --- span helpers -----------------------------------------------------------
 

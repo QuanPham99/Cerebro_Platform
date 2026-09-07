@@ -382,6 +382,10 @@ COMPLEX_QUERY_PLAN_VERSION = "008.complex-plan.v1"
 MAX_EXPRESSION_DEPTH = 32
 MAX_IR_NODES = 256
 MAX_EXPRESSION_ITEMS = 100
+# One request performs at most two semantic calls and a fixed number of local
+# gates, so an unbounded plan or attempt list is never legitimate input.
+MAX_PLAN_STEPS = 16
+MAX_ATTEMPT_RECORDS = 64
 
 SUPPORTED_DEFAULT_NODE_KINDS = frozenset(
     {"scan", "join", "filter", "aggregate", "project", "sort", "limit"}
@@ -1041,9 +1045,15 @@ class RelationalQueryIR(StrictFrozenModel):
     ir_version: Literal["008.ir.v1"]
     root_node_id: NodeId
     nodes: tuple[IRNode, ...] = Field(min_length=1, max_length=MAX_IR_NODES)
-    warning_decisions: tuple[WarningDecision, ...] = ()
-    assumptions: tuple[Assumption, ...] = ()
-    requested_disclosures: tuple[RequestedDisclosure, ...] = ()
+    warning_decisions: tuple[WarningDecision, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    assumptions: tuple[Assumption, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    requested_disclosures: tuple[RequestedDisclosure, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
 
 
 class TableGroundingNeed(StrictFrozenModel):
@@ -1125,9 +1135,24 @@ class QueryResult(StrictFrozenModel):
 
 class OutputLineage(StrictFrozenModel):
     output_name: ColumnName
-    source_columns: tuple[ColumnRef, ...] = ()
-    metric_ids: tuple[MetricId, ...] = ()
+    source_columns: tuple[ColumnRef, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    metric_ids: tuple[MetricId, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
     classification: Classification
+
+    @model_validator(mode="after")
+    def _sensitive_classification_needs_provenance(self) -> OutputLineage:
+        # A confidential or restricted label with no source column and no metric
+        # names nothing: a reader could not tell what was disclosed, so the
+        # downstream narrator could not decide what it may repeat.
+        if self.classification in {"confidential", "restricted"} and not (
+            self.source_columns or self.metric_ids
+        ):
+            raise ValueError("a sensitive output must name its provenance")
+        return self
 
 
 class DisclosureRecord(StrictFrozenModel):
@@ -1189,17 +1214,25 @@ class CachedGeneration(StrictFrozenModel):
 class ComplexPlanStep(StrictFrozenModel):
     step_id: StableCode
     operator_id: ComplexOperatorId
-    depends_on: tuple[StableCode, ...] = ()
-    input_object_ids: tuple[SemanticObjectId, ...] = Field(min_length=1)
-    output_names: tuple[ColumnName, ...] = Field(min_length=1)
+    depends_on: tuple[StableCode, ...] = Field(default=(), max_length=MAX_PLAN_STEPS)
+    input_object_ids: tuple[SemanticObjectId, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
+    output_names: tuple[ColumnName, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
 
 
 class ComplexQueryPlan(StrictFrozenModel):
     outcome: Literal["complex_plan"]
     plan_version: Literal["008.complex-plan.v1"]
-    operator_ids: tuple[ComplexOperatorId, ...] = Field(min_length=1)
-    steps: tuple[ComplexPlanStep, ...] = Field(min_length=1)
-    expected_outputs: tuple[ColumnName, ...] = Field(min_length=1)
+    operator_ids: tuple[ComplexOperatorId, ...] = Field(
+        min_length=1, max_length=MAX_PLAN_STEPS
+    )
+    steps: tuple[ComplexPlanStep, ...] = Field(min_length=1, max_length=MAX_PLAN_STEPS)
+    expected_outputs: tuple[ColumnName, ...] = Field(
+        min_length=1, max_length=MAX_EXPRESSION_ITEMS
+    )
 
 
 _SHA256_ADAPTER = TypeAdapter(Sha256)
@@ -1461,7 +1494,13 @@ IRGenerationOutcome: TypeAlias = Annotated[
 class BoundParameter(StrictFrozenModel):
     position: int = Field(ge=1)
     data_type: ScalarType
-    value: JsonScalar = Field(exclude=True)
+    value: JsonScalar = Field(exclude=True, repr=False)
+
+    def __str__(self) -> str:
+        # `exclude` only stops serialization. A resolved literal must also stay
+        # out of reprs, logs, tracebacks, and assertion output, because those
+        # are exactly where a value escapes without anyone choosing to dump it.
+        return self.__repr__()
 
 
 class CompiledQuery(StrictFrozenModel):
@@ -1562,10 +1601,16 @@ class ResponseBase(StrictModel):
     generation_route: ResponseGenerationRoute
     cache_status: CacheStatus
     grounding_usage: GroundingUsage
-    assumptions: tuple[Assumption, ...] = ()
-    attempt_records: tuple[AttemptRecord, ...] = ()
+    assumptions: tuple[Assumption, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
+    attempt_records: tuple[AttemptRecord, ...] = Field(
+        default=(), max_length=MAX_ATTEMPT_RECORDS
+    )
     budget_usage: BudgetUsage
-    violations: tuple[CheckViolation, ...] = ()
+    violations: tuple[CheckViolation, ...] = Field(
+        default=(), max_length=MAX_EXPRESSION_ITEMS
+    )
 
     @model_validator(mode="after")
     def _route_evidence_is_coherent(self) -> ResponseBase:

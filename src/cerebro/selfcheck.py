@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from .models import (
     MAX_EXPRESSION_DEPTH,
-    SUPPORTED_COMPLEX_NODE_KINDS,
+    SUPPORTED_DEFAULT_NODE_KINDS,
     Ambiguity,
     CheckViolation,
     ClarificationRequest,
@@ -477,7 +477,9 @@ def _phase_route(
     if generation_route == "planned_ir":
         return
     complex_nodes = sorted(
-        node.node_id for node in ir.nodes if node.kind in SUPPORTED_COMPLEX_NODE_KINDS
+        node.node_id
+        for node in ir.nodes
+        if node.kind not in SUPPORTED_DEFAULT_NODE_KINDS
     )
     if complex_nodes:
         findings.add("complex_node_requires_planned_route", tuple(complex_nodes))
@@ -1739,6 +1741,9 @@ def _derive_lineage_and_disclosures(
     resolved_cap = _resolved_disclosure_cap(ir, graph, caps)
 
     for alias, expression in outputs:
+        if expression is None:
+            lineage.append(lineage_model(output_name=alias, classification="public"))
+            continue
         sources = _expression_source_columns(expression)
         metrics = tuple(
             sorted(
@@ -1799,16 +1804,25 @@ def _derive_lineage_and_disclosures(
 def _root_output_items(ir: Any) -> list[tuple[str, Any]]:
     by_id = {node.node_id: node for node in ir.nodes}
     order = _topological_order(ir, by_id)
+    windows: list[tuple[str, Any]] = []
     for node_id in reversed(order):
         node = by_id[node_id]
+        if node.kind == "window":
+            # A window output's lineage is the lineage of the value it carries.
+            # An ordering-only function such as `row_number` carries no source
+            # value, so it is reported with no provenance rather than omitted.
+            windows = [
+                (output.alias, output.argument) for output in node.outputs
+            ] + windows
+            continue
         if node.kind == "project":
-            return [(item.alias, item.expression) for item in node.outputs]
+            return [(item.alias, item.expression) for item in node.outputs] + windows
         if node.kind == "aggregate":
             return [
                 (item.alias, item.expression)
                 for item in (*node.group_by, *node.measures)
-            ]
-    return []
+            ] + windows
+    return windows
 
 
 def _expression_source_columns(expression: Any) -> set[Any]:
