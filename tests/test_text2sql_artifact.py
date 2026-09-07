@@ -646,3 +646,63 @@ def test_materialization_receipt_must_attest_the_bundle_and_database(
         forged = evidence.materialization_receipt.model_copy(update={field: "0" * 64})
         drifted = dataclasses.replace(evidence, materialization_receipt=forged)
         assert "evidence_drift" in _blockers(validate_live_baseline(candidate, drifted))
+
+
+def test_early_stopped_question_is_not_a_call_count_or_overflow_blocker(
+    offline_responses, ten_questions, evidence
+):
+    """A gate that stopped a request is doing its job, not overflowing.
+
+    A question that never completed made fewer semantic calls and records
+    elapsed time past the deadline that stopped it. Holding it to the shape of
+    a completed request would block every honest partial run.
+    """
+    scope, _ = offline_responses
+    first = ten_questions[0]
+    stopped = first.model_copy(
+        update={
+            "status": "check_failed",
+            "violation_codes": ("deadline_exceeded",),
+            "sql_artifact": None,
+            "ir_hash": None,
+            "row_count": None,
+            "result_columns": (),
+            "result_column_types": (),
+            "output_lineage": (),
+            "disclosures": (),
+            "attempt_records": tuple(
+                record
+                for record in first.attempt_records
+                if record.stage not in {"default_ir", "planned_ir"}
+            )
+            or first.attempt_records[:1],
+            "budget_usage": first.budget_usage.model_copy(
+                update={"semantic_calls": 0, "elapsed_ms": 10**6}
+            ),
+        }
+    )
+    outcome = validate_live_baseline(
+        _candidate(scope, (stopped, *ten_questions[1:]), evidence), evidence
+    )
+    assert outcome.run_kind == "live_unadapted_baseline", getattr(
+        outcome, "blockers", outcome
+    )
+    assert outcome.check_failed_count == 1
+    assert outcome.ok_count == len(ten_questions) - 1
+
+
+def test_completed_question_past_the_deadline_still_overflows(
+    offline_responses, ten_questions, evidence
+):
+    """A run that finished past the deadline escaped the gate rather than hitting it."""
+    scope, _ = offline_responses
+    first = ten_questions[0]
+    escaped = first.model_copy(
+        update={
+            "budget_usage": first.budget_usage.model_copy(update={"elapsed_ms": 10**6})
+        }
+    )
+    outcome = validate_live_baseline(
+        _candidate(scope, (escaped, *ten_questions[1:]), evidence), evidence
+    )
+    assert "budget_overflow" in _blockers(outcome)

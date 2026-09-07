@@ -963,21 +963,23 @@ def _route_and_budget_blockers(candidate: LiveBaselineCandidate) -> set[str]:
             if record.stage == "complexity" and record.cache_status == "miss"
         )
 
+        completed = question.status == "ok"
         if cache == "miss":
-            expected_calls = 2 if route == "planned_ir" else 1
-            expected_capacity = 2 if route == "planned_ir" else 1
-            if calls != expected_calls:
-                blockers.add("semantic_call_count_mismatch")
-            if usage.semantic_call_capacity != expected_capacity:
-                blockers.add("generation_route_mismatch")
+            # The exact call counts describe a request that ran to completion.
+            # A question that stopped early legitimately made fewer calls, so
+            # holding it to the completed shape would report a mismatch for a
+            # gate doing its job.
+            if completed:
+                expected_calls = 2 if route == "planned_ir" else 1
+                expected_capacity = 2 if route == "planned_ir" else 1
+                if calls != expected_calls:
+                    blockers.add("semantic_call_count_mismatch")
+                if usage.semantic_call_capacity != expected_capacity:
+                    blockers.add("generation_route_mismatch")
             if route == "planned_ir":
-                if transitions != 1:
-                    blockers.add(
-                        "repeated_budget_transition"
-                        if transitions > 1
-                        else "unauthorized_budget_transition"
-                    )
-                if not usage.planned_ir_authorized:
+                if transitions > 1:
+                    blockers.add("repeated_budget_transition")
+                if completed and (transitions != 1 or not usage.planned_ir_authorized):
                     blockers.add("unauthorized_budget_transition")
             elif usage.planned_ir_authorized or transitions:
                 blockers.add("unauthorized_budget_transition")
@@ -992,14 +994,18 @@ def _route_and_budget_blockers(candidate: LiveBaselineCandidate) -> set[str]:
             )
             if not revalidated:
                 blockers.add("cached_route_not_revalidated")
-            if question.status == "ok" and stages.count("engine_validation") != 1:
+            if completed and stages.count("engine_validation") != 1:
                 blockers.add("cached_route_not_revalidated")
             for required in ("compile", "ast_check"):
-                if question.status == "ok" and required not in stages:
+                if completed and required not in stages:
                     blockers.add("cached_route_not_revalidated")
 
-        if question.status == "ok" and stages.count("engine_validation") != 1:
+        if completed and stages.count("engine_validation") != 1:
             blockers.add("generation_route_mismatch")
+
+        # Overflow means a limit was crossed rather than enforced. Calls,
+        # transport attempts, tokens, and cost are all checked before contact,
+        # so exceeding one of them is always a defect.
         if calls > usage.semantic_call_capacity:
             blockers.add("budget_overflow")
         if usage.semantic_calls > limits.planned_semantic_call_capacity:
@@ -1015,7 +1021,10 @@ def _route_and_budget_blockers(candidate: LiveBaselineCandidate) -> set[str]:
             blockers.add("budget_overflow")
         if usage.cost_usd > limits.max_cost_usd:
             blockers.add("budget_overflow")
-        if usage.elapsed_ms > limits.end_to_end_deadline_ms:
+        # The deadline is tested before each action, so a request that stopped
+        # on it necessarily records elapsed time past it. Only a run that
+        # finished successfully past the deadline escaped the gate.
+        if completed and usage.elapsed_ms > limits.end_to_end_deadline_ms:
             blockers.add("budget_overflow")
     return blockers
 
