@@ -8,6 +8,9 @@ node_modules/
 apps/web/node_modules/
 apps/web/dist/
 .env
+# The organizer credential file, under either spelling. It is read from disk and
+# must never become a tracked object.
+env
 artifacts/
 knowledge/generated/
 
