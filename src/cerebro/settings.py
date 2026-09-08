@@ -35,6 +35,9 @@ class Settings:
     llm_provider_name: str = "OpenAI-compatible"
     llm_timeout_seconds: int = 120
     llm_max_output_tokens: int = 8192
+    llm_max_retries: int = 2
+    llm_retry_backoff_seconds: float = 2.0
+    llm_timeout_backoff_multiplier: float = 1.5
 
     @property
     def llm_configured(self) -> bool:
@@ -61,6 +64,11 @@ class Settings:
             llm_provider_name=_clean(os.getenv("CEREBRO_LLM_PROVIDER_NAME")) or "OpenAI-compatible",
             llm_timeout_seconds=max(10, min(int(os.getenv("CEREBRO_LLM_TIMEOUT_SECONDS", "120")), 600)),
             llm_max_output_tokens=max(256, min(int(os.getenv("CEREBRO_LLM_MAX_OUTPUT_TOKENS", "8192")), 32768)),
+            llm_max_retries=max(0, min(int(os.getenv("CEREBRO_LLM_MAX_RETRIES", "2")), 5)),
+            llm_retry_backoff_seconds=max(0.5, min(float(os.getenv("CEREBRO_LLM_RETRY_BACKOFF_SECONDS", "2")), 30)),
+            llm_timeout_backoff_multiplier=max(
+                1.0, min(float(os.getenv("CEREBRO_LLM_TIMEOUT_BACKOFF_MULTIPLIER", "1.5")), 3.0)
+            ),
         )
 
     def public_status(self) -> dict[str, object]:
@@ -79,6 +87,9 @@ class Settings:
             "response_mode": self.llm_response_mode,
             "llm_timeout_seconds": self.llm_timeout_seconds,
             "llm_max_output_tokens": self.llm_max_output_tokens,
+            "llm_max_retries": self.llm_max_retries,
+            "llm_retry_backoff_seconds": self.llm_retry_backoff_seconds,
+            "llm_timeout_backoff_multiplier": self.llm_timeout_backoff_multiplier,
             "api_key_configured": bool(self.llm_api_key),
             "embedding_model": self.embedding_model,
             "database_configured": self.database_path is not None,

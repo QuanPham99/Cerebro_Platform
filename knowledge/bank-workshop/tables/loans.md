@@ -1,31 +1,27 @@
 ---
-type: table
+type: Table
 id: table.loans
-name: Loans
+title: Loans
 description: Customer loans, principal, terms, rates, and performance status.
-status: active
-aliases:
-- credit facilities
-- lending
-- bad debt
-tags:
-- banking
-- loans
+status: stable
 links:
 - dataset.bank-workshop
-- relationship.loan_customer
 - relationship.loan_branch
+- relationship.loan_customer
 - relationship.loan_payment_loan
-- concept.branch-performance
-- concept.repayment-behavior
-- concept.bad-debt
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: loans
   schema: main
   grain: one row per originated loan
   primary_key: loan_id
@@ -76,6 +72,7 @@ cerebro:
     classification: internal
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/loans
 ---
 
 # Loans

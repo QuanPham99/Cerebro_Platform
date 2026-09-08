@@ -1,33 +1,53 @@
 ---
-type: metric
+type: Metric
 id: metric.transaction-volume
-name: Transaction volume
+title: Transaction Volume
 description: Total positive account transaction amount for a defined period and scope.
-status: active
-aliases:
-- transaction amount
-- monthly volume
-- total transactions
-tags:
-- metric
-- banking
-links: &id001
+status: stable
+links:
+- dimension.branch
+- dimension.transaction-channel
+- dimension.transaction-date
+- dimension.transaction-type
+- entity.transaction
 - table.transactions
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
   source: docs/semantic-layer-definition.md
 cerebro:
+  kind: metric
   classification: confidential
-  dependencies: *id001
+  entity: entity.transaction
+  measure:
+    kind: aggregate
+    aggregation: sum
+    source:
+      table: table.transactions
+      column: amount
+    predicates: []
+  dependencies:
+  - table.transactions
   formula: SUM(transactions.amount)
   filters: []
-  grain: requested dimensions over account transaction events
+  grain:
+    type: aggregate
+    description: Requested compatible dimensions
+  compatible_dimensions:
+  - dimension.transaction-type
+  - dimension.transaction-channel
+  - dimension.transaction-date
+  - dimension.branch
+  time_dimension: dimension.transaction-date
+  relative_time_anchor: max_available_date
   warnings:
-  - Direction requires txn_type; amount itself is unsigned.
-  - Use MAX(txn_date) as the relative-time anchor.
+  - Direction requires transaction type; amount itself is unsigned.
 ---
 
-# Transaction volume
+# Transaction Volume
 
 Total positive account transaction amount for a defined period and scope.
 

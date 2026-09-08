@@ -1,153 +1,162 @@
-"""Build the checked-in bank workshop OKF bundle from catalog-only metadata."""
+"""Build the reviewed bank-workshop Semantic Profile v0.1 bundle."""
 
 from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from cerebro.paths import DEFAULT_BUNDLE, DEFAULT_CONFIG
+from cerebro.semantic.compiler import metric_formula
 from cerebro.source import DuckDBSource
 from cerebro.upstream import OKFDocument
 
 
-CONCEPTS = [
-    {
-        "id": "concept.customer-demographics",
-        "name": "Customer demographics",
-        "description": "Customer count and composition by gender, geography, occupation, and age attributes.",
-        "aliases": ["customer count", "clients by gender", "customer profile"],
-        "maps_to": ["table.customers"],
-        "classification": "restricted",
-        "warnings": ["Use restricted identity attributes only when necessary; prefer aggregate output."],
-    },
-    {
-        "id": "concept.account-balance",
-        "name": "Account balance",
-        "description": "Current account balance analyzed by account type, status, customer, or branch.",
-        "aliases": ["average balance", "avg account balance", "deposits by account type"],
-        "maps_to": ["table.accounts"],
-        "classification": "confidential",
-        "warnings": ["Balance is a current snapshot, not a transaction flow."],
-    },
-    {
-        "id": "concept.support-workload",
-        "name": "Support workload",
-        "description": "Open, resolved, and escalated customer support cases by issue type.",
-        "aliases": ["open support tickets", "customer issues", "support cases"],
-        "maps_to": ["table.support_tickets", "table.customers"],
-        "classification": "internal",
-        "warnings": ["Satisfaction score is meaningful only for resolved cases."],
-    },
-    {
-        "id": "concept.card-fraud",
-        "name": "Card fraud",
-        "description": "Fraud incidence across card transactions, card types, customers, and accounts.",
-        "aliases": ["fraud rate", "fraud percentage", "card fraud percent", "is_fraud"],
-        "maps_to": ["table.card_transactions", "table.cards", "metric.card-fraud-rate"],
-        "classification": "confidential",
-        "warnings": ["Use card transaction grain; do not mix directly with account transactions."],
-    },
-    {
-        "id": "concept.branch-performance",
-        "name": "Branch performance",
-        "description": "Transaction amount, lending outcomes, and staffing analyzed by branch.",
-        "aliases": ["branch transaction amount", "branch lending", "branch comparison"],
-        "maps_to": ["table.branches", "table.accounts", "table.transactions", "table.loans", "table.employees"],
-        "classification": "internal",
-        "warnings": ["Account transactions reach branches through accounts; use both declared joins."],
-    },
-    {
-        "id": "concept.repayment-behavior",
-        "name": "Loan repayment behavior",
-        "description": "Late-payment incidence and payment composition by loan and loan type.",
-        "aliases": ["late payment rate", "repayment delinquency", "loan installments"],
-        "maps_to": ["table.loan_payments", "table.loans", "metric.late-payment-rate"],
-        "classification": "confidential",
-        "warnings": ["Payment events and loans have different grains; aggregate before comparing loan types."],
-    },
-    {
-        "id": "concept.transaction-activity",
-        "name": "Account transaction activity",
-        "description": "Unsigned account ledger events whose direction is determined by transaction type.",
-        "aliases": ["monthly transaction growth", "transaction volume", "money movement"],
-        "maps_to": ["table.transactions", "table.accounts", "metric.transaction-volume"],
-        "classification": "confidential",
-        "warnings": ["Amounts are positive; derive inflow/outflow from txn_type.", "Anchor recent periods to MAX(transactions.txn_date)."],
-    },
-    {
-        "id": "concept.active-customer",
-        "name": "Active customer",
-        "description": "Customer activity derived separately from account and card logs before customer-level combination.",
-        "aliases": ["top active customers", "top 5 percent customers", "account and card activity"],
-        "maps_to": ["table.customers", "table.accounts", "table.transactions", "table.cards", "table.card_transactions"],
-        "classification": "restricted",
-        "warnings": ["Aggregate each activity log to customer grain before combining; never use a naive UNION of raw events."],
-    },
-    {
-        "id": "concept.bad-debt",
-        "name": "Bad debt",
-        "description": "Loans with Defaulted or Written Off status compared with total originated loans.",
-        "aliases": ["bad debt rate", "non performing loan", "defaulted written off"],
-        "maps_to": ["table.loans", "table.branches", "table.employees", "metric.non-performing-loan-rate"],
-        "classification": "confidential",
-        "warnings": ["Loan Officer headcount and loans must each aggregate to branch grain before comparison."],
-    },
+ENTITY_NAMES = {
+    "customers": "Customer", "accounts": "Account", "transactions": "Transaction",
+    "cards": "Card", "card_transactions": "Card Transaction", "loans": "Loan",
+    "loan_payments": "Loan Payment", "branches": "Branch", "employees": "Employee",
+    "support_tickets": "Support Ticket",
+}
+
+SPECIAL_ENTITY_IDS = {
+    "card_transactions": "entity.card-transaction", "loan_payments": "entity.loan-payment",
+    "support_tickets": "entity.support-ticket", "branches": "entity.branch",
+}
+
+DIMENSIONS = [
+    ("customer-gender", "Customer Gender", "customer", [("customers", "gender")], "categorical", ["customer-count", "customer-net-cash-flow", "customer-loan-repayment-total", "supported-delinquency-population"], None),
+    ("customer-age", "Customer Age", "customer", [("customers", "date_of_birth")], "derived", ["customer-count", "customer-net-cash-flow", "customer-loan-repayment-total", "supported-delinquency-population"], "Completed years from date_of_birth at the relevant maximum available date."),
+    ("account-type", "Account Type", "account", [("accounts", "account_type")], "categorical", ["account-balance"], None),
+    ("branch", "Branch", "branch", [("branches", "branch_name")], "geographic", ["transaction-volume", "account-balance", "non-performing-loan-rate", "customer-net-cash-flow", "branch-fraud-exposure", "customer-loan-repayment-total", "supported-delinquency-population"], None),
+    ("transaction-type", "Transaction Type", "transaction", [("transactions", "txn_type")], "categorical", ["transaction-volume", "customer-net-cash-flow"], None),
+    ("transaction-channel", "Transaction Channel", "transaction", [("transactions", "channel")], "categorical", ["transaction-volume", "customer-net-cash-flow"], None),
+    ("merchant-category", "Merchant Category", "card-transaction", [("card_transactions", "merchant_category")], "categorical", ["card-fraud-rate", "branch-fraud-exposure"], None),
+    ("card-type", "Card Type", "card", [("cards", "card_type")], "categorical", ["card-fraud-rate", "branch-fraud-exposure"], None),
+    ("loan-type", "Loan Type", "loan", [("loans", "loan_type")], "categorical", ["late-payment-rate", "non-performing-loan-rate", "customer-loan-repayment-total", "supported-delinquency-population"], None),
+    ("loan-status", "Loan Status", "loan", [("loans", "status")], "categorical", ["non-performing-loan-rate", "customer-loan-repayment-total", "supported-delinquency-population"], None),
+    ("transaction-date", "Transaction Date", "transaction", [("transactions", "txn_date")], "temporal", ["transaction-volume", "customer-net-cash-flow"], None),
 ]
 
-METRICS = [
+METRICS: list[dict[str, Any]] = [
     {
-        "id": "metric.transaction-volume",
-        "name": "Transaction volume",
+        "id": "transaction-volume", "name": "Transaction Volume", "entity": "transaction",
         "description": "Total positive account transaction amount for a defined period and scope.",
-        "aliases": ["transaction amount", "monthly volume", "total transactions"],
+        "measure": {"kind": "aggregate", "aggregation": "sum", "source": {"table": "table.transactions", "column": "amount"}, "predicates": []},
         "dependencies": ["table.transactions"],
-        "formula": "SUM(transactions.amount)",
-        "filters": [],
-        "grain": "requested dimensions over account transaction events",
-        "warnings": ["Direction requires txn_type; amount itself is unsigned.", "Use MAX(txn_date) as the relative-time anchor."],
+        "dimensions": ["dimension.transaction-type", "dimension.transaction-channel", "dimension.transaction-date", "dimension.branch"],
+        "time_dimension": "dimension.transaction-date", "relative_time_anchor": "max_available_date",
+        "classification": "confidential", "warnings": ["Direction requires transaction type; amount itself is unsigned."],
     },
     {
-        "id": "metric.card-fraud-rate",
-        "name": "Card fraud rate",
+        "id": "account-balance", "name": "Account Balance", "entity": "account",
+        "description": "Average current account balance within the requested dimensional scope.",
+        "measure": {"kind": "aggregate", "aggregation": "avg", "source": {"table": "table.accounts", "column": "balance"}, "predicates": []},
+        "dependencies": ["table.accounts"], "dimensions": ["dimension.account-type", "dimension.branch"],
+        "classification": "confidential", "warnings": ["Balance is a current snapshot, not a transaction flow."],
+    },
+    {
+        "id": "customer-count", "name": "Customer Count", "entity": "customer",
+        "description": "Distinct count of banking customers.",
+        "aliases": ["customer gender population", "customer demographic total"],
+        "measure": {"kind": "aggregate", "aggregation": "count_distinct", "source": {"table": "table.customers", "column": "customer_id"}, "predicates": []},
+        "dependencies": ["table.customers"], "dimensions": ["dimension.customer-gender", "dimension.customer-age"],
+        "classification": "restricted", "warnings": ["Return aggregated results for restricted customer attributes."],
+    },
+    {
+        "id": "card-fraud-rate", "name": "Card Fraud Rate", "entity": "card-transaction",
         "description": "Percentage of card transactions flagged as fraud.",
-        "aliases": ["fraud percent", "fraud rate by card type"],
-        "dependencies": ["table.card_transactions"],
-        "formula": "100.0 * SUM(card_transactions.is_fraud) / NULLIF(COUNT(*), 0)",
-        "filters": [],
-        "grain": "aggregate over card transaction events",
-        "warnings": ["Safe division returns NULL for an empty population."],
+        "measure": {"kind": "ratio", "numerator": {"kind": "aggregate", "aggregation": "count", "source": None, "predicates": [{"source": {"table": "table.card_transactions", "column": "is_fraud"}, "operator": "eq", "value": 1}]}, "denominator": {"kind": "aggregate", "aggregation": "count", "source": None, "predicates": []}, "scale": 100.0},
+        "dependencies": ["table.card_transactions"], "dimensions": ["dimension.merchant-category", "dimension.card-type"],
+        "classification": "confidential", "warnings": ["Use card-transaction grain."],
     },
     {
-        "id": "metric.late-payment-rate",
-        "name": "Late payment rate",
-        "description": "Percentage of loan payment events flagged late.",
-        "aliases": ["late payments by loan type", "payment delinquency rate"],
-        "dependencies": ["table.loan_payments"],
-        "formula": "100.0 * SUM(loan_payments.late_payment_flag) / NULLIF(COUNT(*), 0)",
-        "filters": [],
-        "grain": "aggregate over loan payment events",
-        "warnings": ["Join loans only after preserving payment-event denominator."],
+        "id": "late-payment-rate", "name": "Late Payment Rate", "entity": "loan-payment",
+        "description": "Percentage of loan-payment events flagged late.",
+        "measure": {"kind": "ratio", "numerator": {"kind": "aggregate", "aggregation": "count", "source": None, "predicates": [{"source": {"table": "table.loan_payments", "column": "late_payment_flag"}, "operator": "eq", "value": 1}]}, "denominator": {"kind": "aggregate", "aggregation": "count", "source": None, "predicates": []}, "scale": 100.0},
+        "dependencies": ["table.loan_payments"], "dimensions": ["dimension.loan-type"],
+        "classification": "confidential", "warnings": ["Preserve payment-event denominator before joining loans."],
     },
     {
-        "id": "metric.non-performing-loan-rate",
-        "name": "Non-performing loan rate",
-        "description": "Percentage of loans that are Defaulted or Written Off.",
-        "aliases": ["bad debt rate", "default rate", "NPL rate"],
-        "dependencies": ["table.loans"],
-        "formula": "100.0 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)",
-        "filters": [],
-        "grain": "aggregate over originated loans",
-        "warnings": ["Safe division returns NULL for an empty population."],
+        "id": "non-performing-loan-rate", "name": "Non-performing Loan Rate", "entity": "loan",
+        "description": "Percentage of loans with Defaulted or Written Off status.",
+        "measure": {"kind": "ratio", "numerator": {"kind": "aggregate", "aggregation": "count", "source": None, "predicates": [{"source": {"table": "table.loans", "column": "status"}, "operator": "in", "value": ["Defaulted", "Written Off"]}]}, "denominator": {"kind": "aggregate", "aggregation": "count", "source": None, "predicates": []}, "scale": 100.0},
+        "dependencies": ["table.loans"], "dimensions": ["dimension.loan-type", "dimension.loan-status", "dimension.branch"],
+        "classification": "confidential", "warnings": ["Use originated-loan grain."],
+    },
+    {
+        "id": "customer-net-cash-flow", "name": "Customer Net Cash Flow", "entity": "customer",
+        "description": "Net signed account-transaction amount by customer and servicing branch.",
+        "measure": {"kind": "aggregate", "aggregation": "sum", "source": {"table": "table.transactions", "column": "amount"}, "predicates": []},
+        "dependencies": ["table.customers", "table.accounts", "table.transactions", "table.branches"],
+        "dimensions": ["dimension.customer-gender", "dimension.customer-age", "dimension.branch", "dimension.transaction-type", "dimension.transaction-channel", "dimension.transaction-date"],
+        "time_dimension": "dimension.transaction-date", "relative_time_anchor": "max_available_date",
+        "formula": "SUM(CASE WHEN transactions.txn_type IN ('Deposit', 'Transfer In', 'Interest Credit') THEN transactions.amount ELSE -transactions.amount END) FROM customers JOIN accounts ON customers.customer_id = accounts.customer_id JOIN transactions ON accounts.account_id = transactions.account_id JOIN branches ON accounts.branch_id = branches.branch_id",
+        "classification": "restricted", "warnings": ["Join customers to accounts before transactions; the branch join is many-to-one and does not change transaction grain."],
+    },
+    {
+        "id": "branch-fraud-exposure", "name": "Branch Fraud Exposure", "entity": "branch",
+        "description": "Total fraudulent card-transaction amount attributed to the account's servicing branch.",
+        "measure": {"kind": "aggregate", "aggregation": "sum", "source": {"table": "table.card_transactions", "column": "amount"}, "predicates": [{"source": {"table": "table.card_transactions", "column": "is_fraud"}, "operator": "eq", "value": 1}]},
+        "dependencies": ["table.branches", "table.accounts", "table.cards", "table.card_transactions"],
+        "dimensions": ["dimension.branch", "dimension.card-type", "dimension.merchant-category"],
+        "formula": "SUM(CASE WHEN card_transactions.is_fraud = 1 THEN card_transactions.amount ELSE 0 END) FROM branches JOIN accounts ON branches.branch_id = accounts.branch_id JOIN cards ON accounts.account_id = cards.account_id JOIN card_transactions ON cards.card_id = card_transactions.card_id",
+        "classification": "confidential", "warnings": ["Preserve card-transaction grain across the three many-to-one joins."],
+    },
+    {
+        "id": "customer-loan-repayment-total", "name": "Customer Loan Repayment Total", "entity": "customer",
+        "description": "Total loan-payment amount by customer, loan attributes, and originating branch.",
+        "measure": {"kind": "aggregate", "aggregation": "sum", "source": {"table": "table.loan_payments", "column": "amount_paid"}, "predicates": []},
+        "dependencies": ["table.customers", "table.loans", "table.loan_payments", "table.branches"],
+        "dimensions": ["dimension.customer-gender", "dimension.customer-age", "dimension.branch", "dimension.loan-type", "dimension.loan-status"],
+        "formula": "SUM(loan_payments.amount_paid) FROM customers JOIN loans ON customers.customer_id = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id JOIN branches ON loans.branch_id = branches.branch_id",
+        "classification": "restricted", "warnings": ["Aggregate from loan-payment grain; customer and branch are many-to-one lookup joins."],
+    },
+    {
+        "id": "supported-delinquency-population", "name": "Supported Delinquency Population", "entity": "customer",
+        "description": "Distinct customers who have both a support ticket and at least one late loan payment.",
+        "measure": {"kind": "aggregate", "aggregation": "count_distinct", "source": {"table": "table.customers", "column": "customer_id"}, "predicates": []},
+        "dependencies": ["table.customers", "table.support_tickets", "table.loans", "table.loan_payments"],
+        "dimensions": ["dimension.customer-gender", "dimension.customer-age", "dimension.branch", "dimension.loan-type", "dimension.loan-status"],
+        "formula": "COUNT(DISTINCT customers.customer_id) FROM customers JOIN support_tickets ON customers.customer_id = support_tickets.customer_id JOIN loans ON customers.customer_id = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id WHERE loan_payments.late_payment_flag = 1",
+        "classification": "restricted", "warnings": ["Count distinct customers after joining two one-to-many paths to prevent ticket-payment fanout."],
     },
 ]
 
+RULES = [
+    ("active-customer", "Active Customer", "customer", "classification", "boolean", ["entity.transaction", "entity.card-transaction"], "Aggregate account and card activity independently to customer grain, combine the aggregates, and never union raw event rows."),
+    ("fraudulent-card-transaction", "Fraudulent Card Transaction", "card-transaction", "predicate", "boolean", ["table.card_transactions"], "A card transaction is fraudulent when card_transactions.is_fraud equals 1."),
+    ("late-loan-payment", "Late Loan Payment", "loan-payment", "predicate", "boolean", ["table.loan_payments"], "A loan payment is late when loan_payments.late_payment_flag equals 1."),
+    ("non-performing-loan", "Non-performing Loan", "loan", "predicate", "boolean", ["table.loans"], "A loan is non-performing when loans.status is Defaulted or Written Off."),
+    ("transaction-direction", "Transaction Direction", "transaction", "classification", "direction", ["dimension.transaction-type"], "Deposit, Transfer In, and Interest Credit are inflows; Withdrawal, Transfer Out, and Fee Debit are outflows."),
+    ("relative-time-anchor", "Relative Time Anchor", "transaction", "time_anchor", "date", ["dimension.transaction-date"], "Interpret relative account-transaction periods from MAX(transactions.txn_date), not wall-clock time."),
+    ("high-value-multichannel-customer", "High-value Multichannel Customer", "customer", "classification", "boolean", ["table.customers", "table.accounts", "table.transactions", "table.cards"], "A customer qualifies when their accounts have at least one active card and at least 100000 in signed transaction activity across two or more channels during the latest 90-day period; join customers to accounts, then aggregate the transaction and card branches independently at customer grain."),
+    ("branch-fraud-escalation", "Branch Fraud Escalation", "branch", "classification", "boolean", ["table.branches", "table.accounts", "table.cards", "table.card_transactions"], "Escalate a branch when it has at least five fraudulent card transactions or at least 10000 in fraudulent card-transaction amount during the latest 30-day period; join branches to accounts, accounts to cards, and cards to card transactions while preserving card-transaction grain."),
+    ("delinquent-customer-support-priority", "Delinquent Customer Support Priority", "customer", "classification", "boolean", ["table.support_tickets", "table.customers", "table.loans", "table.loan_payments"], "Prioritize a customer when an open support ticket exists and any loan payment is flagged late during the latest 90-day period; join support tickets to customers, customers to loans, and loans to loan payments, then evaluate existence at customer grain to prevent fanout."),
+    ("employee-risk-portfolio-assignment", "Employee Risk Portfolio Assignment", "employee", "classification", "boolean", ["table.employees", "table.branches", "table.loans", "table.customers"], "Flag an employee assignment for review when the employee's branch owns at least three defaulted or written-off loans held by customers with credit scores below 600; join employees to branches, branches to loans, and loans to customers."),
+]
 
-def write_doc(path: Path, frontmatter: dict, body: str) -> None:
+
+def write_doc(path: Path, frontmatter: dict[str, Any], body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    document = OKFDocument(frontmatter=frontmatter, body=body.strip() + "\n")
-    path.write_text(document.serialize(), encoding="utf-8")
+    path.write_text(OKFDocument(frontmatter=frontmatter, body=body.strip() + "\n").serialize(), encoding="utf-8")
+
+
+def base_document(kind: str, object_id: str, title: str, description: str, links: list[str], cerebro: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": {"physical_table": "Table", "business_rule": "Business Rule"}.get(kind, kind.replace("_", " ").title()),
+        "id": object_id, "title": title, "description": description, "status": "stable",
+        "links": sorted(set(links)),
+        "sources": [{"id": "semantic-definition", "resource": "docs/semantic-layer-definition.md", "title": "Cerebro semantic-layer definition"}],
+        "provenance": {"origin": "human_reviewed", "source": "docs/semantic-layer-definition.md"},
+        "cerebro": {"kind": kind, **cerebro},
+    }
+
+
+def entity_id(table_name: str) -> str:
+    return SPECIAL_ENTITY_IDS.get(table_name, f"entity.{table_name.replace('_', '-').removesuffix('s')}")
 
 
 def main() -> None:
@@ -156,183 +165,105 @@ def main() -> None:
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
-    (root / "bundle.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "name": "bank-workshop",
-                "version": snapshot.source_version,
-                "generation_mode": "fallback",
-                "source": "bank workshop DuckDB catalog plus declared manifest",
-                "google_okf_repository": "https://github.com/GoogleCloudPlatform/open-knowledge-format.git",
-                "google_okf_commit": "ad30107c31c06aec8a7d5636e0d1058118604e6f",
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    write_doc(
-        root / "index.md",
-        {"type": "index", "name": "Bank workshop semantic layer"},
-        "# Bank workshop semantic layer\n\nA reviewed golden OKF bundle generated without source-row access.",
-    )
+    (root / "bundle.yaml").write_text(yaml.safe_dump({
+        "name": "bank-workshop", "version": "0.2.0", "generation_mode": "fallback",
+        "review_state": "approved", "okf_version": "0.2", "semantic_profile_version": "0.1",
+        "source": "bank workshop DuckDB catalog plus declared manifest",
+        "google_okf_repository": "https://github.com/GoogleCloudPlatform/open-knowledge-format.git",
+        "google_okf_commit": "ad30107c31c06aec8a7d5636e0d1058118604e6f",
+    }, sort_keys=False), encoding="utf-8")
+    write_doc(root / "index.md", {"okf_version": "0.2"}, "# Banking Semantic Layer\n\nGoverned banking Semantic Profile v0.1.")
+
     table_ids = [f"table.{table.name}" for table in snapshot.tables]
-    write_doc(
-        root / "datasets" / "bank-workshop.md",
-        {
-            "type": "dataset",
-            "id": "dataset.bank-workshop",
-            "name": "Bank workshop dataset",
-            "description": "Synthetic retail banking reference dataset with ten related tables.",
-            "status": "active",
-            "tags": ["banking", "duckdb", "synthetic"],
-            "links": table_ids + ["policy.sensitive-banking-data"],
-            "provenance": {"origin": "human_reviewed", "source": "config/bank-source.yaml"},
-            "cerebro": {"classification": "restricted", "table_count": 10, "column_count": 75, "row_sampling": "disabled"},
-        },
-        "# Bank workshop dataset\n\nCatalog structure is discovered; keys, relationships, and business rules are declared and reviewed.",
-    )
+    write_doc(root / "datasets" / "bank-workshop.md", base_document(
+        "dataset", "dataset.bank-workshop", "Bank Workshop Dataset",
+        "Synthetic retail-banking reference dataset with ten related tables.", table_ids,
+        {"classification": "restricted", "table_count": 10, "column_count": 75, "row_sampling": "disabled"},
+    ), "# Bank Workshop Dataset\n\nCatalog structure is discovered; semantic definitions are reviewed.")
+
     relationship_links: dict[str, list[str]] = {table_id: [] for table_id in table_ids}
     for relationship in snapshot.relationships:
         relationship_links[f"table.{relationship.source_table}"].append(f"relationship.{relationship.id}")
         relationship_links[f"table.{relationship.target_table}"].append(f"relationship.{relationship.id}")
-    concept_links: dict[str, list[str]] = {table_id: [] for table_id in table_ids}
-    for concept in CONCEPTS:
-        for mapped in concept["maps_to"]:
-            if mapped in concept_links:
-                concept_links[mapped].append(concept["id"])
+
     for table in snapshot.tables:
         table_id = f"table.{table.name}"
-        columns = [
-            {
-                "name": column.name,
-                "data_type": column.data_type,
-                "nullable": column.nullable,
-                "classification": column.classification,
-                "provenance": "discovered",
-            }
-            for column in table.columns
-        ]
-        classification = "restricted" if any(col["classification"] == "restricted" for col in columns) else (
-            "confidential" if any(col["classification"] == "confidential" for col in columns) else "internal"
-        )
-        warnings = []
-        if table.name == "transactions":
-            warnings = ["Amounts are positive; use txn_type for direction.", "Anchor relative time to MAX(txn_date).", "Do not UNION raw rows with card_transactions."]
-        elif table.name == "card_transactions":
-            warnings = ["Card-event grain differs from account transactions.", "Anchor relative time to MAX(txn_date)."]
-        write_doc(
-            root / "tables" / f"{table.name}.md",
-            {
-                "type": "table",
-                "id": table_id,
-                "name": table.name.replace("_", " ").title(),
-                "description": table.description,
-                "status": "active",
-                "aliases": table.aliases,
-                "tags": ["banking", table.name],
-                "links": ["dataset.bank-workshop", *relationship_links[table_id], *concept_links[table_id], "policy.sensitive-banking-data"],
-                "provenance": {"origin": "human_reviewed", "catalog": "DuckDB information_schema", "semantics": "config/bank-source.yaml"},
-                "cerebro": {
-                    "classification": classification,
-                    "schema": table.schema_name,
-                    "grain": table.grain,
-                    "primary_key": table.primary_key,
-                    "columns": columns,
-                    "warnings": warnings,
-                },
-            },
-            f"# {table.name.replace('_', ' ').title()}\n\n{table.description}\n\nGrain: **{table.grain}**.",
-        )
-    for relationship in snapshot.relationships:
-        write_doc(
-            root / "relationships" / f"{relationship.id}.md",
-            {
-                "type": "relationship",
-                "id": f"relationship.{relationship.id}",
-                "name": relationship.id.replace("_", " ").title(),
-                "description": f"Declared join from {relationship.source_table}.{relationship.source_column} to {relationship.target_table}.{relationship.target_column}.",
-                "status": "active",
-                "tags": ["join", "physical-fk"],
-                "links": [f"table.{relationship.source_table}", f"table.{relationship.target_table}"],
-                "provenance": {"origin": "human_reviewed", "source": "config/bank-source.yaml", "database_constraint": False},
-                "cerebro": {
-                    "classification": "internal",
-                    "edge_type": "physical_fk",
-                    "source_table": f"table.{relationship.source_table}",
-                    "source_column": relationship.source_column,
-                    "target_table": f"table.{relationship.target_table}",
-                    "target_column": relationship.target_column,
-                    "cardinality": relationship.cardinality,
-                    "warnings": ["Declared relationship; the source DuckDB does not define FK constraints."],
-                },
-            },
-            f"# {relationship.id.replace('_', ' ').title()}\n\nUse an exact ID join with `{relationship.cardinality}` cardinality.",
-        )
-    for concept in CONCEPTS:
-        payload = dict(concept)
-        object_id = payload.pop("id")
-        name = payload.pop("name")
-        description = payload.pop("description")
-        aliases = payload.pop("aliases")
-        write_doc(
-            root / "concepts" / f"{object_id.split('.', 1)[1]}.md",
-            {
-                "type": "concept",
-                "id": object_id,
-                "name": name,
-                "description": description,
-                "status": "active",
-                "aliases": aliases,
-                "tags": ["business-concept", "banking"],
-                "links": payload["maps_to"],
-                "provenance": {"origin": "human_reviewed", "source": "docs/semantic-layer-definition.md"},
-                "cerebro": payload,
-            },
-            f"# {name}\n\n{description}",
-        )
+        columns = [{"name": column.name, "data_type": column.data_type, "nullable": column.nullable, "classification": column.classification, "provenance": "discovered"} for column in table.columns]
+        classification = "restricted" if any(item["classification"] == "restricted" for item in columns) else "confidential" if any(item["classification"] == "confidential" for item in columns) else "internal"
+        document = base_document("physical_table", table_id, table.name.replace("_", " ").title(), table.description, ["dataset.bank-workshop", *relationship_links[table_id]], {
+            "classification": classification, "physical": {"schema": table.schema_name, "table": table.name},
+            "schema": table.schema_name, "grain": table.grain, "primary_key": table.primary_key, "columns": columns, "warnings": [],
+        })
+        document["resource"] = f"duckdb://bank/{table.schema_name}/{table.name}"
+        document["sources"] = [{"id": "duckdb-catalog", "resource": "DuckDB information_schema", "title": "DuckDB catalog metadata"}]
+        document["provenance"] = {"origin": "discovered", "source": "DuckDB information_schema"}
+        write_doc(root / "tables" / f"{table.name}.md", document, f"# {document['title']}\n\n{table.description}\n\nGrain: **{table.grain}**.")
+
+    table_by_name = {table.name: table for table in snapshot.tables}
+    for table_name, title in ENTITY_NAMES.items():
+        table = table_by_name[table_name]
+        object_id = entity_id(table_name)
+        write_doc(root / "entities" / f"{object_id.split('.', 1)[1]}.md", base_document("entity", object_id, title, f"Business entity for {title.lower()} records.", [f"table.{table_name}"], {
+            "classification": "restricted" if table_name == "customers" else "internal",
+            "physical_mapping": {"table": f"table.{table_name}", "key": [table.primary_key]},
+            "grain": {"type": "event" if table_name in {"transactions", "card_transactions", "loan_payments"} else "entity", "description": table.grain, "key": [table.primary_key]}, "warnings": [],
+        }), f"# {title}\n\n{title} is represented by one `{table_name}` record at its declared grain.")
+
+    for dim_id, title, entity, bindings, semantic_type, metrics, derivation in DIMENSIONS:
+        physical = [{"table": f"table.{table}", "column": column} for table, column in bindings]
+        links = [f"entity.{entity}", *[item["table"] for item in physical], *[f"metric.{metric}" for metric in metrics]]
+        write_doc(root / "dimensions" / f"{dim_id}.md", base_document("dimension", f"dimension.{dim_id}", title, f"Governed {title.lower()} dimension.", links, {
+            "classification": "restricted" if dim_id in {"customer-gender", "customer-age"} else "internal",
+            "entity": f"entity.{entity}", "physical_mappings": physical, "semantic_type": semantic_type,
+            "derivation": derivation, "compatible_metrics": [f"metric.{metric}" for metric in metrics], "warnings": [],
+        }), f"# {title}\n\n{derivation or f'Groups results by {title.lower()}.'}")
+
     for metric in METRICS:
-        payload = dict(metric)
-        object_id = payload.pop("id")
-        name = payload.pop("name")
-        description = payload.pop("description")
-        aliases = payload.pop("aliases")
-        write_doc(
-            root / "metrics" / f"{object_id.split('.', 1)[1]}.md",
-            {
-                "type": "metric",
-                "id": object_id,
-                "name": name,
-                "description": description,
-                "status": "active",
-                "aliases": aliases,
-                "tags": ["metric", "banking"],
-                "links": payload["dependencies"],
-                "provenance": {"origin": "human_reviewed", "source": "docs/semantic-layer-definition.md"},
-                "cerebro": {"classification": "confidential", **payload},
-            },
-            f"# {name}\n\n{description}\n\nFormula: `{payload['formula']}`",
-        )
-    write_doc(
-        root / "policies" / "sensitive-banking-data.md",
-        {
-            "type": "policy",
-            "id": "policy.sensitive-banking-data",
-            "name": "Sensitive banking data",
-            "description": "Treat synthetic identity, contact, financial, and credit fields as sensitive.",
-            "status": "active",
-            "aliases": ["PII policy", "restricted data"],
-            "tags": ["policy", "classification"],
-            "links": table_ids,
-            "provenance": {"origin": "human_reviewed", "source": "config/bank-source.yaml"},
-            "cerebro": {"classification": "restricted", "applies_to": table_ids, "rule": "Return aggregate results and minimize restricted fields."},
-        },
-        "# Sensitive banking data\n\nSynthetic data receives the same handling as real restricted banking data.",
-    )
-    for directory in ("datasets", "tables", "concepts", "relationships", "metrics", "policies"):
-        write_doc(root / directory / "index.md", {"type": "index", "name": directory.title()}, f"# {directory.title()}")
-    print(f"Wrote {root} with {sum(1 for _ in root.rglob('*.md'))} Markdown documents")
+        object_id = f"metric.{metric['id']}"
+        dimensions = metric["dimensions"]
+        links = [f"entity.{metric['entity']}", *metric["dependencies"], *dimensions]
+        if metric.get("time_dimension"):
+            links.append(metric["time_dimension"])
+        formula = metric.get("formula") or metric_formula(metric["measure"])
+        document = base_document("metric", object_id, metric["name"], metric["description"], links, {
+            "classification": metric["classification"], "entity": f"entity.{metric['entity']}", "measure": metric["measure"],
+            "dependencies": metric["dependencies"], "formula": formula, "filters": [],
+            "grain": {"type": "aggregate", "description": "Requested compatible dimensions"},
+            "compatible_dimensions": dimensions, "time_dimension": metric.get("time_dimension"),
+            "relative_time_anchor": metric.get("relative_time_anchor"), "warnings": metric["warnings"],
+        })
+        if metric.get("aliases"):
+            document["aliases"] = metric["aliases"]
+        write_doc(root / "metrics" / f"{metric['id']}.md", document, f"# {metric['name']}\n\n{metric['description']}\n\nFormula: `{formula}`")
+
+    for rule_id, title, entity, rule_kind, output_type, dependencies, logic in RULES:
+        write_doc(root / "rules" / f"{rule_id}.md", base_document("business_rule", f"rule.{rule_id}", title, logic, [f"entity.{entity}", *dependencies], {
+            "classification": "restricted" if entity == "customer" else "confidential", "entity": f"entity.{entity}",
+            "rule_kind": rule_kind, "output_type": output_type, "dependencies": dependencies, "logic": logic,
+            "grain": {"type": "entity", "description": f"One {entity.replace('-', ' ')}"}, "warnings": [],
+        }), f"# {title}\n\n{logic}")
+
+    for relationship in snapshot.relationships:
+        source_table, target_table = f"table.{relationship.source_table}", f"table.{relationship.target_table}"
+        source_entity, target_entity = entity_id(relationship.source_table), entity_id(relationship.target_table)
+        write_doc(root / "relationships" / f"{relationship.id}.md", base_document("relationship", f"relationship.{relationship.id}", relationship.id.replace("_", " ").title(), f"Declared join from {relationship.source_table}.{relationship.source_column} to {relationship.target_table}.{relationship.target_column}.", [source_table, target_table, source_entity, target_entity], {
+            "classification": "internal", "edge_type": "physical_fk", "semantic": {"from": source_entity, "to": target_entity},
+            "physical": {"source": {"table": source_table, "column": relationship.source_column}, "target": {"table": target_table, "column": relationship.target_column}},
+            "source_table": source_table, "source_column": relationship.source_column, "target_table": target_table, "target_column": relationship.target_column,
+            "cardinality": relationship.cardinality, "join_type": {"default": "left"},
+            "validation": {"target_unique": "not_checked", "source_fk_coverage": "not_checked", "fanout": "not_checked"},
+            "warnings": ["Declared relationship; source-row profiling is disabled."],
+        }), f"# {relationship.id.replace('_', ' ').title()}\n\nUse the declared `{relationship.cardinality}` join.")
+
+    write_doc(root / "policies" / "sensitive-banking-data.md", base_document("policy", "policy.sensitive-banking-data", "Sensitive Banking Data", "Treat synthetic identity, contact, financial, and credit fields as sensitive.", table_ids, {
+        "classification": "restricted", "applies_to": table_ids, "rule": "Return aggregate results and minimize restricted fields.",
+    }), "# Sensitive Banking Data\n\nSynthetic data receives the same handling as real restricted banking data.")
+
+    for directory in ("datasets", "tables", "entities", "dimensions", "metrics", "rules", "relationships", "policies"):
+        (root / directory / "index.md").write_text(f"# {directory.title()}\n", encoding="utf-8")
+    object_count = sum(1 for path in root.rglob("*.md") if path.name not in {"index.md", "log.md"})
+    print(f"Wrote {root} with {object_count} semantic objects")
 
 
 if __name__ == "__main__":
     main()
-

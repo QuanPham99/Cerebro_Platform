@@ -14,6 +14,13 @@ from mcp.server.fastmcp import FastMCP
 
 from .bundle import load_validated_bundle
 from .chat import ChatOrchestrator
+from .definitions import (
+    DefinitionConflictError,
+    DefinitionProviderUnavailable,
+    DefinitionRevisionManager,
+    DefinitionRevisionNotFound,
+    DefinitionValidationError,
+)
 from .enrichment import provider_from_environment
 from .generation import ActivationError, ReviewConflictError, ReviewValidationError
 from .generation_runs import GenerationRunConflict, GenerationRunManager, GenerationRunNotFound, GenerationRunNotReady
@@ -21,12 +28,14 @@ from .models import (
     AgentTrace,
     ChatRequest,
     ChatResponse,
+    DefinitionApplyRequest,
+    DefinitionTranslateRequest,
     GenerationStartRequest,
     GroundingResponse,
     ReviewRequest,
     SemanticObject,
 )
-from .paths import DEFAULT_CONFIG, ROOT
+from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG, ROOT
 from .retrieval import SemanticRetriever, embedder_from_environment
 from .settings import Settings, resolve_active_bundle
 from .source import DuckDBSource
@@ -46,7 +55,7 @@ def create_mcp_server(
 
     @server.tool()
     def retrieve_grounding(question: str, limit: int = 10) -> dict:
-        """Retrieve concepts, tables, safe joins, metrics, warnings, and provenance for a question."""
+        """Retrieve typed semantics, physical bindings, safe joins, warnings, and provenance."""
         if not question.strip():
             raise ValueError("question must not be empty")
         current = get_retriever()
@@ -85,6 +94,8 @@ def create_app(
     resolved_bundle_path = resolve_active_bundle(bundle_path)
     bundle = load_validated_bundle(resolved_bundle_path)
     retriever = SemanticRetriever(bundle, embedder=embedder_from_environment())
+    golden_bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    golden_retriever = SemanticRetriever(golden_bundle)
     provider = provider_from_environment()
     try:
         source: DuckDBSource | None = DuckDBSource(source_config, settings.database_path)
@@ -119,6 +130,13 @@ def create_app(
         on_activate=swap_runtime,
         **({"output_root": generation_output_root} if generation_output_root is not None else {}),
         **({"reviewed_root": reviewed_output_root} if reviewed_output_root is not None else {}),
+    )
+    definition_manager = DefinitionRevisionManager(
+        active_bundle=lambda: runtime["bundle"],
+        provider_factory=provider_from_environment,
+        output_root=Path(generation_output_root) if generation_output_root is not None else ROOT / "knowledge" / "generated",
+        reviewed_root=Path(reviewed_output_root) if reviewed_output_root is not None else ROOT / "knowledge" / "reviewed",
+        on_activate=swap_runtime,
     )
     mcp_server = create_mcp_server(lambda: runtime["retriever"])
     mcp_app = mcp_server.streamable_http_app()
@@ -171,23 +189,76 @@ def create_app(
         )
         return status
 
-    @app.get("/api/bundles/active")
-    async def active_bundle() -> dict:
-        current = runtime["bundle"]
+    def bundle_info(current) -> dict:
         counts: dict[str, int] = {}
+        kind_counts: dict[str, int] = {}
         for obj in current.objects:
             counts[obj.type] = counts.get(obj.type, 0) + 1
+            kind_counts[obj.profile_kind] = kind_counts.get(obj.profile_kind, 0) + 1
         return {
             "name": current.name,
             "version": current.version,
             "root": current.root,
             "counts": counts,
+            "kind_counts": kind_counts,
+            "okf_version": current.okf_version,
+            "semantic_profile_version": current.semantic_profile_version,
             "generation_mode": current.generation_mode,
             "review_state": current.review_state,
             "provider": current.provider,
             "model": current.model,
             "source_mode": current.source_mode,
             "discovery_evidence": current.discovery_evidence,
+        }
+
+    @app.get("/api/bundles/active")
+    async def active_bundle() -> dict:
+        return bundle_info(runtime["bundle"])
+
+    @app.get("/api/bundles/golden")
+    async def golden_bundle_info() -> dict:
+        return bundle_info(golden_bundle)
+
+    @app.get("/api/golden/graph")
+    async def golden_graph() -> dict:
+        return golden_retriever.graph().model_dump(mode="json")
+
+    @app.get("/api/golden/objects/{object_id}")
+    async def golden_object(object_id: str) -> SemanticObject:
+        obj = golden_retriever.by_id.get(object_id)
+        if obj is None:
+            raise HTTPException(status_code=404, detail={"code": "unknown_object", "id": object_id})
+        return obj
+
+    @app.get("/api/definitions/context")
+    async def definition_context() -> dict:
+        current = runtime["bundle"]
+        if current.review_state != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "active_graph_not_approved", "message": "Activate an approved graph before authoring definitions."},
+            )
+        return {
+            "version": current.version,
+            "entities": [
+                {"id": obj.id, "name": obj.name}
+                for obj in current.objects if obj.profile_kind == "entity"
+            ],
+            "dimensions": [
+                {"id": obj.id, "name": obj.name, "entity": obj.cerebro.get("entity")}
+                for obj in current.objects if obj.profile_kind == "dimension"
+            ],
+            "tables": [
+                {
+                    "id": obj.id,
+                    "name": obj.name,
+                    "columns": [
+                        {"name": column.get("name"), "data_type": column.get("data_type")}
+                        for column in obj.cerebro.get("columns", [])
+                    ],
+                }
+                for obj in current.objects if obj.profile_kind == "physical_table"
+            ],
         }
 
     @app.get("/api/graph")
@@ -209,7 +280,10 @@ def create_app(
     ) -> dict:
         requested = {item.strip() for item in types.split(",") if item.strip()} if types else None
         if requested:
-            allowed = {"dataset", "table", "concept", "relationship", "metric", "policy"}
+            allowed = {
+                "dataset", "table", "physical_table", "concept", "legacy_concept",
+                "entity", "dimension", "metric", "business_rule", "relationship", "policy",
+            }
             unknown = requested - allowed
             if unknown:
                 raise HTTPException(status_code=422, detail={"code": "unknown_types", "types": sorted(unknown)})
@@ -303,6 +377,13 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/api/generation/runs/{run_id}/trace")
+    async def generation_trace(run_id: str) -> dict:
+        try:
+            return generation_manager.trace(run_id).model_dump(mode="json")
+        except GenerationRunNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_generation_run"}) from exc
+
     @app.get("/api/generation/runs/{run_id}/graph")
     async def generation_graph(run_id: str) -> dict:
         try:
@@ -366,6 +447,79 @@ def create_app(
             raise HTTPException(status_code=404, detail={"code": "unknown_generation_run"}) from exc
         except GenerationRunNotReady as exc:
             raise HTTPException(status_code=409, detail={"code": "candidate_not_ready"}) from exc
+        except ActivationError as exc:
+            raise HTTPException(status_code=409, detail={"code": "activation_blocked", "message": str(exc)}) from exc
+
+    @app.post("/api/definitions/translate")
+    async def translate_definition(payload: DefinitionTranslateRequest) -> dict:
+        try:
+            return definition_manager.translate(payload).model_dump(mode="json")
+        except DefinitionProviderUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "definition_provider_unavailable", "message": str(exc)}) from exc
+        except (DefinitionValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_definition", "message": str(exc)}) from exc
+
+    @app.post("/api/definition-revisions", status_code=201)
+    async def create_definition_revision(payload: DefinitionApplyRequest) -> dict:
+        try:
+            return definition_manager.create(payload).model_dump(mode="json")
+        except DefinitionConflictError as exc:
+            raise HTTPException(status_code=409, detail={"code": "definition_conflict", "message": str(exc)}) from exc
+        except DefinitionValidationError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_definition", "message": str(exc)}) from exc
+
+    @app.get("/api/definition-revisions/{revision_id}")
+    async def get_definition_revision(revision_id: str) -> dict:
+        try:
+            return definition_manager.get(revision_id).model_dump(mode="json")
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+
+    @app.post("/api/definition-revisions/{revision_id}/definitions")
+    async def add_definition(revision_id: str, payload: DefinitionApplyRequest) -> dict:
+        try:
+            return definition_manager.add(revision_id, payload).model_dump(mode="json")
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+        except DefinitionConflictError as exc:
+            raise HTTPException(status_code=409, detail={"code": "definition_conflict", "message": str(exc)}) from exc
+        except DefinitionValidationError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_definition", "message": str(exc)}) from exc
+
+    @app.get("/api/definition-revisions/{revision_id}/graph")
+    async def definition_revision_graph(revision_id: str) -> dict:
+        try:
+            return definition_manager.graph(revision_id)
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+
+    @app.get("/api/definition-revisions/{revision_id}/objects/{object_id}")
+    async def definition_revision_object(revision_id: str, object_id: str) -> SemanticObject:
+        try:
+            obj = definition_manager.object(revision_id, object_id)
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+        if obj is None:
+            raise HTTPException(status_code=404, detail={"code": "unknown_object", "id": object_id})
+        return obj
+
+    @app.post("/api/definition-revisions/{revision_id}/reviews")
+    async def review_definition_revision(revision_id: str, payload: ReviewRequest) -> dict:
+        try:
+            return definition_manager.review(revision_id, payload).model_dump(mode="json")
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail={"code": "review_conflict", "message": str(exc)}) from exc
+        except ReviewValidationError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_review", "message": str(exc)}) from exc
+
+    @app.post("/api/definition-revisions/{revision_id}/activate")
+    async def activate_definition_revision(revision_id: str) -> dict:
+        try:
+            return definition_manager.activate(revision_id)
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
         except ActivationError as exc:
             raise HTTPException(status_code=409, detail={"code": "activation_blocked", "message": str(exc)}) from exc
 

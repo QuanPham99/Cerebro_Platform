@@ -1,13 +1,44 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from .settings import Settings
 
+logger = logging.getLogger(__name__)
+
 OutputT = TypeVar("OutputT", bound=BaseModel)
+
+# Reasons a request can fail for that are worth retrying with backoff. Anything else
+# (bad request, auth, unsupported response_format, invalid JSON) will not improve on retry.
+_RETRYABLE_REASONS = {"timeout", "rate_limited", "server_error", "connection_error"}
+
+
+def classify_llm_error(exc: Exception) -> str:
+    """Classify a chat-completions failure so callers can decide whether to retry and
+    give the user an actionable reason instead of a generic "generation failed"."""
+    try:
+        import openai
+    except ImportError:
+        openai = None  # type: ignore[assignment]
+    if openai is not None:
+        if isinstance(exc, openai.APITimeoutError):
+            return "timeout"
+        if isinstance(exc, openai.RateLimitError):
+            return "rate_limited"
+        if isinstance(exc, openai.InternalServerError):
+            return "server_error"
+        if isinstance(exc, openai.APIConnectionError):
+            return "connection_error"
+        if isinstance(exc, openai.APIStatusError):
+            return "status_error"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    return "unknown"
 
 
 class GenerationOutputError(RuntimeError):
@@ -72,6 +103,35 @@ class OpenAICompatibleGateway:
             )
         self.client = client
 
+    def _call_with_retry(self, **kwargs: object) -> object:
+        """Call chat.completions.create, retrying transient failures (timeout, rate limit,
+        connection error, 5xx) with exponential backoff. Non-transient failures (bad request,
+        auth, unsupported response_format) are raised immediately since retrying won't help."""
+        attempts = max(1, self.settings.llm_max_retries + 1)
+        delay = self.settings.llm_retry_backoff_seconds
+        timeout = float(self.settings.llm_timeout_seconds)
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.client.chat.completions.create(timeout=timeout, **kwargs)  # type: ignore[attr-defined]
+            except Exception as exc:
+                reason = classify_llm_error(exc)
+                exc.cerebro_reason = reason  # type: ignore[attr-defined]
+                exc.cerebro_attempts = attempt  # type: ignore[attr-defined]
+                last_exc = exc
+                if reason not in _RETRYABLE_REASONS or attempt == attempts:
+                    raise
+                logger.warning(
+                    "LLM request failed (%s) on attempt %d/%d; retrying in %.1fs: %s",
+                    reason, attempt, attempts, delay, exc,
+                )
+                time.sleep(delay)
+                delay *= 2
+                if reason == "timeout":
+                    timeout = min(timeout * self.settings.llm_timeout_backoff_multiplier, 600.0)
+        assert last_exc is not None  # pragma: no cover - loop always returns or raises
+        raise last_exc
+
     def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
         modes = [self.settings.llm_response_mode]
         if modes[0] == "auto":
@@ -95,12 +155,15 @@ class OpenAICompatibleGateway:
                 user_prompt = prompt
                 if mode == "json_object":
                     user_prompt += "\n\nReturn JSON matching this schema:\n" + json.dumps(output_model.model_json_schema())
-                response = self.client.chat.completions.create(  # type: ignore[attr-defined]
+                response = self._call_with_retry(
                     model=self.model,
                     messages=[
                         {
                             "role": "system",
-                            "content": "Return only concise, syntactically valid JSON matching the requested schema. Escape quotes inside strings. Never request credentials or hidden data.",
+                            "content": "Return only concise, syntactically valid JSON matching the requested schema. "
+                            "Escape quotes inside strings. Never request credentials or hidden data. Be direct and "
+                            "efficient: do not restate the input or add unrequested commentary, since large inputs "
+                            "must still complete within the request timeout.",
                         },
                         {"role": "user", "content": user_prompt},
                     ],
@@ -132,7 +195,7 @@ class OpenAICompatibleGateway:
         validation_error: Exception,
     ) -> OutputT:
         try:
-            response = self.client.chat.completions.create(  # type: ignore[attr-defined]
+            response = self._call_with_retry(
                 model=self.model,
                 messages=[
                     {

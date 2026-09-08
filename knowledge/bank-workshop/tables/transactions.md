@@ -1,30 +1,25 @@
 ---
-type: table
+type: Table
 id: table.transactions
-name: Transactions
+title: Transactions
 description: Account-level money movement with positive unsigned amounts.
-status: active
-aliases:
-- account activity
-- ledger
-- deposits
-- withdrawals
-tags:
-- banking
-- transactions
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.transaction_account
-- concept.branch-performance
-- concept.transaction-activity
-- concept.active-customer
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: transactions
   schema: main
   grain: one account-level ledger event
   primary_key: transaction_id
@@ -64,10 +59,8 @@ cerebro:
     nullable: true
     classification: internal
     provenance: discovered
-  warnings:
-  - Amounts are positive; use txn_type for direction.
-  - Anchor relative time to MAX(txn_date).
-  - Do not UNION raw rows with card_transactions.
+  warnings: []
+resource: duckdb://bank/main/transactions
 ---
 
 # Transactions

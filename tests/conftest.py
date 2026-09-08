@@ -23,7 +23,7 @@ def bank_database(tmp_path: Path) -> Path:
     bundle = load_validated_bundle(DEFAULT_BUNDLE)
     connection = duckdb.connect(str(path))
     try:
-        for table in [item for item in bundle.objects if item.type == "table"]:
+        for table in [item for item in bundle.objects if item.profile_kind == "physical_table"]:
             columns = table.cerebro.get("columns", [])
             definition = ", ".join(f'"{column["name"]}" {column["data_type"]}' for column in columns)
             connection.execute(f'CREATE TABLE "{table.id.removeprefix("table.")}" ({definition})')

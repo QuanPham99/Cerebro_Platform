@@ -1,27 +1,25 @@
 ---
-type: table
+type: Table
 id: table.support_tickets
-name: Support Tickets
+title: Support Tickets
 description: Customer issues, status, resolution dates, and satisfaction.
-status: active
-aliases:
-- cases
-- customer service
-- open issues
-tags:
-- banking
-- support_tickets
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.support_ticket_customer
-- concept.support-workload
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: support_tickets
   schema: main
   grain: one row per customer support case
   primary_key: ticket_id
@@ -62,6 +60,7 @@ cerebro:
     classification: internal
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/support_tickets
 ---
 
 # Support Tickets

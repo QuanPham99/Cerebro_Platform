@@ -1,29 +1,27 @@
 ---
-type: table
+type: Table
 id: table.branches
-name: Branches
+title: Branches
 description: Physical bank branches and routing identifiers.
-status: active
-aliases:
-- bank locations
-- branch network
-tags:
-- banking
-- branches
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.account_branch
-- relationship.loan_branch
 - relationship.employee_branch
-- concept.branch-performance
-- concept.bad-debt
-- policy.sensitive-banking-data
+- relationship.loan_branch
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: branches
   schema: main
   grain: one row per bank branch
   primary_key: branch_id
@@ -59,6 +57,7 @@ cerebro:
     classification: internal
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/branches
 ---
 
 # Branches

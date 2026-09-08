@@ -1,94 +1,171 @@
-import { useState } from 'react'
-import { AlertTriangle, ArrowLeft, Bot, Check, ChevronDown, Clock, Database, Eye, Network, Play, Rocket, ShieldCheck, Terminal, X } from 'lucide-react'
-import type { GenerationEvent, GenerationRun, GenerationStage, RuntimeStatus } from './types'
+import { AlertTriangle, ArrowLeft, Check, Clock, Database, Eye, Network, Play, Rocket, ShieldCheck, Terminal, X } from 'lucide-react'
+import type { GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GenerationTraceStep, RuntimeStatus } from './types'
 
-export const generationStages: Array<{ id: GenerationStage; short: string; label: string }> = [
-  { id: 'source_check', short: 'Source', label: 'Check source' },
-  { id: 'catalog_scan', short: 'Catalog', label: 'Scan catalog' },
-  { id: 'business_semantics', short: 'Meaning', label: 'Business semantics' },
-  { id: 'relationship_semantics', short: 'Links', label: 'Relationship semantics' },
-  { id: 'query_semantics', short: 'Query', label: 'Query semantics' },
-  { id: 'compile_okf', short: 'OKF', label: 'Compile OKF' },
-  { id: 'validate_candidate', short: 'Check', label: 'Validate candidate' },
-  { id: 'candidate_ready', short: 'Ready', label: 'Candidate ready' },
+export const generationStages: Array<{ id: GenerationStage; short: string; label: string; actor: string }> = [
+  { id: 'source_check', short: 'Source', label: 'Check source', actor: 'DuckDB adapter' },
+  { id: 'catalog_scan', short: 'Catalog', label: 'Scan catalog', actor: 'Catalog scanner' },
+  { id: 'business_semantics', short: 'Inventory', label: 'Semantic inventory', actor: 'SemanticInventoryAgent' },
+  { id: 'relationship_semantics', short: 'Links', label: 'Relationship semantics', actor: 'RelationshipAgent' },
+  { id: 'query_semantics', short: 'Deferred', label: 'Metrics and rules · after activation', actor: 'Definition composer' },
+  { id: 'compile_okf', short: 'OKF', label: 'Link and compile OKF', actor: 'Deterministic compiler' },
+  { id: 'validate_candidate', short: 'Check', label: 'Validate candidate', actor: 'Contract validator' },
+  { id: 'candidate_ready', short: 'Ready', label: 'Candidate ready', actor: 'Governance boundary' },
 ]
 
-function stageStatus(events: GenerationEvent[], stage: GenerationStage) {
-  return [...events].reverse().find((event) => event.stage === stage)?.status || 'waiting'
+export interface GenerationReviewDraft {
+  decision: 'approve' | 'reject'
+  reviewer: string
+  comment: string
+  acknowledged: boolean
 }
 
-export function GenerationRibbon({ events, run }: { events: GenerationEvent[]; run?: GenerationRun | null }) {
-  const [expanded, setExpanded] = useState(false)
-  if (events.length === 0) return null
-  const current = events[events.length - 1]
-  const completedCount = generationStages.filter((stage) => ['completed', 'skipped'].includes(stageStatus(events, stage.id))).length
-  return (
-    <section className={`generation-ribbon ${expanded ? 'expanded' : ''}`} aria-label="Candidate generation progress">
-      <button className="generation-ribbon-toggle" type="button" aria-expanded={expanded} aria-controls="generation-process-detail" aria-label={expanded ? 'Hide detailed generation process' : 'Show detailed generation process'} onClick={() => setExpanded((value) => !value)}>
-        <div className="generation-ribbon-track">
-          {generationStages.map((stage) => {
-            const status = stageStatus(events, stage.id)
-            return <span className={`generation-ribbon-step ${status}`} key={stage.id} title={`${stage.label}: ${status}`}><i />{stage.short}</span>
-          })}
-        </div>
-        <div className="generation-ribbon-summary">
-          <span><strong>{run?.source_mode === 'database_only' ? 'Database only' : 'Configured source'}</strong><em>{completedCount} / {generationStages.length} stages</em></span>
-          <small>{current.summary}</small>
-          <ChevronDown size={14} aria-hidden="true" />
-        </div>
-      </button>
+function stageStatus(events: GenerationEvent[], trace: GenerationTrace | null, stage: GenerationStage) {
+  const traced = trace?.steps.find((step) => step.stage === stage)?.status
+  if (traced) return traced
+  const event = [...events].reverse().find((item) => item.stage === stage)?.status
+  return event === 'started' ? 'running' : event || 'waiting'
+}
 
-      {expanded && (
-        <div className="generation-process-detail" id="generation-process-detail" role="region" aria-label="Detailed generation process" aria-live="polite">
-          <header><div><span>Live execution log</span><strong>{run?.id || 'Starting run'}</strong></div><em>{run?.status || 'running'}</em></header>
-          <ol>
-            {generationStages.map((stage, index) => {
-              const stageEvents = events.filter((event) => event.stage === stage.id)
-              const status = stageStatus(events, stage.id)
-              return (
-                <li className={`generation-process-step ${status}`} key={stage.id}>
-                  <div className="generation-process-marker"><span>{String(index + 1).padStart(2, '0')}</span><i /></div>
-                  <div className="generation-process-body">
-                    <div className="generation-process-title"><strong>{stage.label}</strong><em>{status}</em></div>
-                    {stageEvents.length === 0
-                      ? <p className="generation-process-waiting">Waiting for the previous step to finish.</p>
-                      : stageEvents.map((event) => (
-                        <div className="generation-process-event" key={event.sequence}>
-                          <div><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><span>{event.status}</span></div>
-                          <p>{event.summary}</p>
-                          {Object.keys(event.details).length > 0 && <dl>{Object.entries(event.details).map(([key, value]) => <div key={key}><dt>{key.replaceAll('_', ' ')}</dt><dd>{String(value)}</dd></div>)}</dl>}
-                          <code><Terminal size={11} aria-hidden="true" />{event.command}</code>
-                        </div>
-                      ))}
-                  </div>
-                </li>
-              )
-            })}
-          </ol>
-        </div>
-      )}
+function StatusIcon({ status }: { status: string }) {
+  if (status === 'completed') return <Check size={12} />
+  if (status === 'failed') return <X size={12} />
+  if (status === 'running' || status === 'started') return <Clock size={12} />
+  return <span>—</span>
+}
+
+export function GenerationProgressTab({
+  events,
+  trace,
+  run,
+  active,
+  starting,
+  onSelect,
+}: {
+  events: GenerationEvent[]
+  trace: GenerationTrace | null
+  run: GenerationRun | null
+  active: boolean
+  starting: boolean
+  onSelect: () => void
+}) {
+  const completedCount = generationStages.filter((stage) => ['completed', 'skipped', 'degraded'].includes(stageStatus(events, trace, stage.id))).length
+  const status = starting ? 'starting' : run?.status || 'idle'
+  const statusLabel = status === 'succeeded'
+    ? 'Candidate ready'
+    : status === 'failed'
+      ? 'Needs attention'
+      : ['starting', 'queued', 'running'].includes(status)
+        ? `${completedCount} / ${generationStages.length} stages`
+        : 'Idle'
+
+  return (
+    <button
+      type="button"
+      className={`semantic-version-tab generation ${active ? 'active' : ''} ${status}`}
+      role="tab"
+      aria-selected={active}
+      aria-label={`Semantic generation: ${statusLabel}`}
+      onClick={onSelect}
+    >
+      <span className="version-tab-copy"><strong>Semantic generation</strong><small>Raw catalog to candidate</small></span>
+      <code>{run?.candidate ? `v${run.candidate.version}` : statusLabel}</code>
+      <span className="generation-tab-track" aria-hidden="true">
+        {generationStages.map((stage) => {
+          const state = stageStatus(events, trace, stage.id)
+          return <i className={state} key={stage.id} title={`${stage.label}: ${state}`} />
+        })}
+      </span>
+    </button>
+  )
+}
+
+function JsonPane({ label, value, waiting }: { label: string; value: Record<string, unknown> | null | undefined; waiting: string }) {
+  return (
+    <section className="trace-json-pane" aria-label={`${label} payload`}>
+      <header><span>{label}</span><code>{value ? 'JSON' : '—'}</code></header>
+      {value
+        ? <pre>{JSON.stringify(value, null, 2)}</pre>
+        : <div className="trace-json-empty"><Terminal size={18} /><p>{waiting}</p></div>}
     </section>
   )
 }
 
-function StatusIcon({ status }: { status: GenerationEvent['status'] }) {
-  if (status === 'completed') return <Check size={12} />
-  if (status === 'failed') return <X size={12} />
-  if (status === 'started') return <Clock size={12} />
-  return <span>—</span>
+export function GenerationWorkspace({
+  run,
+  trace,
+  selectedStage,
+}: {
+  run: GenerationRun | null
+  trace: GenerationTrace | null
+  selectedStage: GenerationStage
+}) {
+  const definition = generationStages.find((stage) => stage.id === selectedStage) || generationStages[0]
+  const step = trace?.steps.find((item) => item.stage === selectedStage)
+
+  return (
+    <section className="generation-workspace" aria-label="Generation pipeline workspace">
+      <header className="workbench-heading">
+        <div>
+          <span className="workbench-kicker"><Network size={13} /> Full pipeline smoke test</span>
+          <h1>{run ? definition.label : 'Generate semantics from zero'}</h1>
+          <p>{run
+            ? step?.summary || 'This stage is waiting for its upstream input.'
+            : 'Start with the raw DuckDB catalog, observe every bounded agent, then validate a separate OKF candidate.'}</p>
+        </div>
+        <div className={`run-identity ${run?.status || 'idle'}`}>
+          <small>{run ? 'Current run' : 'Run state'}</small>
+          <code>{run?.id || 'Not started'}</code>
+          <span>{run?.status || 'idle'}</span>
+        </div>
+      </header>
+
+      {!run && (
+        <div className="pipeline-blueprint" aria-label="Pipeline blueprint">
+          {generationStages.map((stage, index) => (
+            <div key={stage.id}>
+              <span>{String(index + 1).padStart(2, '0')}</span>
+              <strong>{stage.short}</strong>
+              <small>{stage.actor}</small>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="trace-stage-meta">
+        <span className={`trace-stage-state ${step?.status || 'waiting'}`}><StatusIcon status={step?.status || 'waiting'} />{step?.status || 'waiting'}</span>
+        <span>{definition.actor}</span>
+        <code>{step?.agent_id || definition.id}</code>
+      </div>
+
+      <div className="trace-io-grid">
+        <JsonPane label="Input" value={step?.input} waiting={run ? 'Input becomes available when this stage starts.' : 'Start a smoke test to inspect the exact sanitized stage input.'} />
+        <JsonPane label="Output" value={step?.output} waiting={step?.status === 'running' ? 'Waiting for the validated stage output.' : 'No output has been produced for this stage.'} />
+      </div>
+
+      <footer className="trace-command"><Terminal size={13} /><span>CLI equivalent</span><code>{step?.command || 'cerebro generate --source-mode database-only'}</code></footer>
+    </section>
+  )
 }
 
 export function GenerationPanel({
   runtime,
   run,
   events,
+  trace,
+  selectedStage,
+  reviewDraft,
   starting,
   error,
   previewing,
   actioning,
+  onReviewDraftChange,
+  onSelectStage,
   onStart,
   onInspect,
-  onPreview,
+  onDefine,
+  canDefine,
+  onShowCandidate,
+  onShowTrace,
   onReturnActive,
   onReview,
   onActivate,
@@ -96,72 +173,79 @@ export function GenerationPanel({
   runtime: RuntimeStatus | null
   run: GenerationRun | null
   events: GenerationEvent[]
+  trace: GenerationTrace | null
+  selectedStage: GenerationStage
+  reviewDraft: GenerationReviewDraft
   starting: boolean
   error: string
   previewing: boolean
   actioning: boolean
+  onReviewDraftChange: (draft: GenerationReviewDraft) => void
+  onSelectStage: (stage: GenerationStage) => void
   onStart: (sourceMode: 'configured' | 'database_only') => void
   onInspect: () => void
-  onPreview: () => void
+  onDefine: () => void
+  canDefine: boolean
+  onShowCandidate: () => void
+  onShowTrace: () => void
   onReturnActive: () => void
   onReview: (payload: { decision: 'approve' | 'reject'; reviewer: string; comment: string; acknowledge_ai_risk: boolean }) => void
   onActivate: () => void
 }) {
-  const [sourceMode, setSourceMode] = useState<'' | 'configured' | 'database_only'>('')
-  const [decision, setDecision] = useState<'approve' | 'reject'>('approve')
-  const [reviewer, setReviewer] = useState('')
-  const [comment, setComment] = useState('')
-  const [acknowledged, setAcknowledged] = useState(false)
   const running = starting || run?.status === 'queued' || run?.status === 'running'
-  const canStart = Boolean(runtime?.database_reachable) && Boolean(sourceMode) && !running && !actioning
+  const canStart = Boolean(runtime?.database_reachable) && !running && !actioning
   const objectCount = run?.candidate ? Object.values(run.candidate.counts).reduce((sum, count) => sum + count, 0) : 0
+  const selectedStep: GenerationTraceStep | undefined = trace?.steps.find((step) => step.stage === selectedStage)
 
   return (
     <aside className="generation-panel" aria-label="Candidate generation">
       <div className="side-panel-tabs" role="tablist" aria-label="Semantic side panel">
-        <button onClick={onInspect} role="tab" aria-selected="false">Inspect</button>
+        <button onClick={onInspect} role="tab" aria-selected="false" disabled={!run?.candidate}>Inspect</button>
         <button className="active" role="tab" aria-selected="true">Build</button>
+        <button onClick={onDefine} role="tab" aria-selected="false" disabled={!canDefine}>Define</button>
       </div>
 
       <header className="generation-heading">
-        <span className="inspector-kicker"><Network size={12} /> Candidate observatory</span>
-        <h2>Build meaning,<br />not database tables.</h2>
-        <p>Cerebro reads the existing catalog, proposes semantics, and produces a separate OKF candidate. Downstream agents keep using the active reviewed bundle.</p>
+        <span className="inspector-kicker"><Network size={12} /> Pipeline control</span>
+        <h2>Raw catalog in.<br />Governed candidate out.</h2>
+        <p>Run the complete catalog-to-OKF path and inspect each stage without reading source rows.</p>
       </header>
 
       <div className="generation-actions">
-        <fieldset className="source-mode-picker">
-          <legend>Source mode</legend>
-          <label><input type="radio" name="source-mode" checked={sourceMode === 'database_only'} onChange={() => setSourceMode('database_only')} /><span><strong>Database only</strong><small>Raw DuckDB catalog; no source YAML or web content.</small></span></label>
-          <label><input type="radio" name="source-mode" checked={sourceMode === 'configured'} onChange={() => setSourceMode('configured')} /><span><strong>Configured</strong><small>Include reviewed source declarations.</small></span></label>
-        </fieldset>
-        <button className="generate-button" disabled={!canStart} onClick={() => sourceMode && onStart(sourceMode)}>
+        <label className="smoke-source-card selected">
+          <input type="radio" name="source-mode" checked readOnly />
+          <Database size={15} />
+          <span><strong>Raw DuckDB smoke test</strong><small>Catalog metadata only · zero source rows</small></span>
+        </label>
+        <p className="definition-note">Metrics and business rules are intentionally deferred until the graph is activated.</p>
+        <button className="generate-button" disabled={!canStart} onClick={() => onStart('database_only')}>
           {running ? <Clock size={14} /> : <Play size={14} />}
-          {running ? 'Generating candidate…' : 'Generate candidate'}
+          {running ? 'Running smoke test…' : run ? 'Start new smoke test' : 'Run full pipeline'}
         </button>
         {!runtime?.database_reachable && <p><AlertTriangle size={12} /> Configure a readable DuckDB source, then restart the server.</p>}
       </div>
 
-      <div className="generation-transcript" aria-live="polite">
-        {!run && !error && (
-          <div className="generation-empty">
-            <div><Database size={16} /><span><strong>1. Discover</strong><small>Read schema metadata only—never source rows.</small></span></div>
-            <div><Bot size={16} /><span><strong>2. Propose</strong><small>Generate typed business, relationship, and query semantics.</small></span></div>
-            <div><ShieldCheck size={16} /><span><strong>3. Compile and validate</strong><small>Write a reviewable OKF candidate without activating it.</small></span></div>
-          </div>
-        )}
-
-        {run && <article className="generation-message user"><span>You</span><p>Generate a semantic candidate in <code>{run.source_mode.replace('_', '-')}</code> mode.</p></article>}
-        {events.map((event) => (
-          <article className={`generation-message system ${event.status}`} key={event.sequence}>
-            <div className="generation-message-title"><span className="stage-status"><StatusIcon status={event.status} /></span><strong>{generationStages.find((stage) => stage.id === event.stage)?.label}</strong><em>{event.status}</em></div>
-            <p>{event.summary}</p>
-            {Object.keys(event.details).length > 0 && <div className="generation-detail-chips">{Object.entries(event.details).map(([key, value]) => <code key={key}>{key.replaceAll('_', ' ')}: {String(value)}</code>)}</div>}
-            <details><summary><Terminal size={11} /> CLI equivalent</summary><code>{event.command}</code></details>
-          </article>
-        ))}
-
-        {error && <article className="generation-message system failed"><div className="generation-message-title"><span className="stage-status"><X size={12} /></span><strong>Generation stopped</strong><em>failed</em></div><p>{error}</p></article>}
+      <div className="generation-timeline" aria-live="polite">
+        <div className="timeline-heading"><span>Pipeline signal</span><code>{run?.source_mode.replace('_', '-') || 'database-only'}</code></div>
+        {generationStages.map((stage, index) => {
+          const status = stageStatus(events, trace, stage.id)
+          const step = trace?.steps.find((item) => item.stage === stage.id)
+          const event = [...events].reverse().find((item) => item.stage === stage.id)
+          return (
+            <button
+              type="button"
+              className={`pipeline-step ${status} ${selectedStage === stage.id ? 'selected' : ''}`}
+              key={stage.id}
+              aria-current={selectedStage === stage.id ? 'step' : undefined}
+              onClick={() => onSelectStage(stage.id)}
+            >
+              <span className="pipeline-node"><StatusIcon status={status} /></span>
+              <span className="pipeline-copy"><strong><em>{String(index + 1).padStart(2, '0')}</em>{stage.label}</strong><small>{step?.summary || event?.summary || stage.actor}</small></span>
+              <code>{status}</code>
+            </button>
+          )
+        })}
+        {error && <article className="generation-error"><X size={13} /><span><strong>Generation stopped</strong><small>{error}</small></span></article>}
 
         {run?.candidate && (
           <article className="candidate-card">
@@ -169,32 +253,35 @@ export function GenerationPanel({
             <h3>{run.candidate.name}</h3>
             <code>v{run.candidate.version}</code>
             <dl><div><dt>Objects</dt><dd>{objectCount}</dd></div><div><dt>Mode</dt><dd>{run.candidate.generation_mode}</dd></div><div><dt>Model</dt><dd>{run.candidate.model || 'none'}</dd></div></dl>
-            <div className="discovery-evidence" aria-label="Discovery evidence">
-              {Object.entries(run.candidate.discovery_evidence).map(([key, value]) => <span key={key}><small>{key.replaceAll('_', ' ')}</small><strong>{String(value)}</strong></span>)}
+            <div className="candidate-view-actions">
+              {previewing
+                ? <button onClick={onShowTrace}><Terminal size={13} /> View pipeline trace</button>
+                : <button onClick={onShowCandidate}><Eye size={13} /> View candidate graph</button>}
+              <button onClick={onReturnActive}><ArrowLeft size={13} /> Active graph</button>
             </div>
-            {previewing
-              ? <button onClick={onReturnActive}><ArrowLeft size={13} /> Return to active graph</button>
-              : <button onClick={onPreview}><Eye size={13} /> Preview candidate graph</button>}
-            {run.candidate.review_state === 'candidate' && (
-              <form className="review-form" onSubmit={(event) => { event.preventDefault(); onReview({ decision, reviewer, comment, acknowledge_ai_risk: acknowledged }) }}>
-                <h4>Whole-candidate decision</h4>
-                <label>Reviewer<input aria-label="Reviewer name" value={reviewer} onChange={(event) => setReviewer(event.target.value)} required /></label>
-                <div className="review-decisions">
-                  <label><input type="radio" name="review-decision" checked={decision === 'approve'} onChange={() => setDecision('approve')} /> Approve</label>
-                  <label><input type="radio" name="review-decision" checked={decision === 'reject'} onChange={() => setDecision('reject')} /> Reject</label>
-                </div>
-                <label>Comment<textarea aria-label="Review comment" value={comment} onChange={(event) => setComment(event.target.value)} required={decision === 'reject'} /></label>
-                {decision === 'approve' && <label className="risk-check"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> I acknowledge that AI-proposed semantics require human judgment.</label>}
-                <button className="review-submit" disabled={actioning || !reviewer.trim() || (decision === 'approve' && !acknowledged) || (decision === 'reject' && !comment.trim())} type="submit"><ShieldCheck size={13} /> Record {decision}</button>
-              </form>
-            )}
-            {run.candidate.review_state === 'approved' && <div className="review-result approved"><strong>Approved by {run.candidate.review_record?.reviewer}</strong><small>Approval does not activate the bundle.</small><button disabled={actioning} onClick={onActivate}><Rocket size={13} /> Activate reviewed bundle</button></div>}
-            {run.candidate.review_state === 'rejected' && <div className="review-result rejected"><strong>Candidate rejected</strong><small>{run.candidate.review_record?.comment}</small></div>}
+
+            <section className="governance-gate">
+              <header><ShieldCheck size={13} /><span><strong>Human governance gate</strong><small>The automated smoke test stops here.</small></span></header>
+              {run.candidate.review_state === 'candidate' && (
+                <form className="review-form" onSubmit={(event) => { event.preventDefault(); onReview({ decision: reviewDraft.decision, reviewer: reviewDraft.reviewer, comment: reviewDraft.comment, acknowledge_ai_risk: reviewDraft.acknowledged }) }}>
+                  <label>Reviewer<input aria-label="Reviewer name" value={reviewDraft.reviewer} onChange={(event) => onReviewDraftChange({ ...reviewDraft, reviewer: event.target.value })} required /></label>
+                  <div className="review-decisions">
+                    <label><input type="radio" name="review-decision" checked={reviewDraft.decision === 'approve'} onChange={() => onReviewDraftChange({ ...reviewDraft, decision: 'approve' })} /> Approve</label>
+                    <label><input type="radio" name="review-decision" checked={reviewDraft.decision === 'reject'} onChange={() => onReviewDraftChange({ ...reviewDraft, decision: 'reject' })} /> Reject</label>
+                  </div>
+                  <label>Comment<textarea aria-label="Review comment" value={reviewDraft.comment} onChange={(event) => onReviewDraftChange({ ...reviewDraft, comment: event.target.value })} required={reviewDraft.decision === 'reject'} /></label>
+                  {reviewDraft.decision === 'approve' && <label className="risk-check"><input type="checkbox" checked={reviewDraft.acknowledged} onChange={(event) => onReviewDraftChange({ ...reviewDraft, acknowledged: event.target.checked })} /> I acknowledge that AI-proposed semantics require human judgment.</label>}
+                  <button className="review-submit" disabled={actioning || !reviewDraft.reviewer.trim() || (reviewDraft.decision === 'approve' && !reviewDraft.acknowledged) || (reviewDraft.decision === 'reject' && !reviewDraft.comment.trim())} type="submit"><ShieldCheck size={13} /> Record {reviewDraft.decision}</button>
+                </form>
+              )}
+              {run.candidate.review_state === 'approved' && <div className="review-result approved"><strong>Approved by {run.candidate.review_record?.reviewer}</strong><small>Approval does not activate the bundle.</small><button disabled={actioning} onClick={onActivate}><Rocket size={13} /> Activate reviewed bundle</button></div>}
+              {run.candidate.review_state === 'rejected' && <div className="review-result rejected"><strong>Candidate rejected</strong><small>{run.candidate.review_record?.comment}</small></div>}
+            </section>
           </article>
         )}
       </div>
 
-      <footer className="generation-boundary"><ShieldCheck size={13} /><span>Review and activation are separate recorded actions. AI provenance is preserved after approval.</span></footer>
+      <footer className="generation-boundary"><ShieldCheck size={13} /><span>{selectedStep?.agent_id ? `${selectedStep.agent_id} input/output is sanitized.` : 'Review and activation remain separate recorded actions.'}</span></footer>
     </aside>
   )
 }

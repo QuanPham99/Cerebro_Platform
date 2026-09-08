@@ -1,34 +1,66 @@
 ---
-type: metric
+type: Metric
 id: metric.non-performing-loan-rate
-name: Non-performing loan rate
-description: Percentage of loans that are Defaulted or Written Off.
-status: active
-aliases:
-- bad debt rate
-- default rate
-- NPL rate
-tags:
-- metric
-- banking
-links: &id001
+title: Non-performing Loan Rate
+description: Percentage of loans with Defaulted or Written Off status.
+status: stable
+links:
+- dimension.branch
+- dimension.loan-status
+- dimension.loan-type
+- entity.loan
 - table.loans
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
   source: docs/semantic-layer-definition.md
 cerebro:
+  kind: metric
   classification: confidential
-  dependencies: *id001
-  formula: 100.0 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN
-    1 ELSE 0 END) / NULLIF(COUNT(*), 0)
+  entity: entity.loan
+  measure:
+    kind: ratio
+    numerator:
+      kind: aggregate
+      aggregation: count
+      source: null
+      predicates:
+      - source:
+          table: table.loans
+          column: status
+        operator: in
+        value:
+        - Defaulted
+        - Written Off
+    denominator:
+      kind: aggregate
+      aggregation: count
+      source: null
+      predicates: []
+    scale: 100.0
+  dependencies:
+  - table.loans
+  formula: 100 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN 1
+    ELSE 0 END) / NULLIF(COUNT(*), 0)
   filters: []
-  grain: aggregate over originated loans
+  grain:
+    type: aggregate
+    description: Requested compatible dimensions
+  compatible_dimensions:
+  - dimension.loan-type
+  - dimension.loan-status
+  - dimension.branch
+  time_dimension: null
+  relative_time_anchor: null
   warnings:
-  - Safe division returns NULL for an empty population.
+  - Use originated-loan grain.
 ---
 
-# Non-performing loan rate
+# Non-performing Loan Rate
 
-Percentage of loans that are Defaulted or Written Off.
+Percentage of loans with Defaulted or Written Off status.
 
-Formula: `100.0 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)`
+Formula: `100 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)`

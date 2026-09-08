@@ -18,11 +18,27 @@ from .generation import (
     review_bundle,
     run_generation_workflow,
 )
-from .models import GenerationCandidate, GenerationEvent, GenerationRun, ReviewRecord, ReviewRequest, SemanticObject
+from .models import (
+    GenerationCandidate,
+    GenerationEvent,
+    GenerationRun,
+    GenerationTrace,
+    GenerationTraceStep,
+    ReviewRecord,
+    ReviewRequest,
+    SemanticObject,
+)
 from .paths import DEFAULT_CONFIG, ROOT
 from .retrieval import SemanticRetriever
 
 logger = logging.getLogger(__name__)
+
+_LLM_ERROR_MESSAGES = {
+    "timeout": "The model provider timed out",
+    "rate_limited": "The model provider rate-limited the request",
+    "server_error": "The model provider returned a server error",
+    "connection_error": "Could not connect to the model provider",
+}
 
 COMMANDS = {
     "source_check": "cerebro doctor",
@@ -33,6 +49,18 @@ COMMANDS = {
     "compile_okf": "cerebro generate",
     "validate_candidate": "cerebro validate --bundle <candidate>",
     "candidate_ready": "cerebro review --bundle <candidate> --reviewer <name> --acknowledge-ai-risk",
+}
+
+STAGE_ORDER = tuple(COMMANDS)
+STAGE_ACTORS = {
+    "source_check": ("source", None),
+    "catalog_scan": ("source", None),
+    "business_semantics": ("agent", "semantic_inventory"),
+    "relationship_semantics": ("agent", "relationship"),
+    "query_semantics": ("agent", "metric_rule"),
+    "compile_okf": ("compiler", None),
+    "validate_candidate": ("validator", None),
+    "candidate_ready": ("system", None),
 }
 
 
@@ -76,6 +104,7 @@ class GenerationRunManager:
         self._retrievers: dict[str, SemanticRetriever] = {}
         self._outputs: dict[str, Path] = {}
         self._reviews: dict[str, ReviewRecord] = {}
+        self._traces: dict[str, dict[str, GenerationTraceStep]] = {}
         self._active_id: str | None = None
         self._lock = threading.Lock()
 
@@ -97,6 +126,7 @@ class GenerationRunManager:
                 source_mode=source_mode,  # type: ignore[arg-type]
             )
             self._runs[run_id] = run
+            self._traces[run_id] = {}
             self._active_id = run_id
         threading.Thread(target=self._execute, args=(run_id,), daemon=True, name=f"cerebro-generation-{run_id}").start()
         return self.get(run_id)
@@ -112,6 +142,14 @@ class GenerationRunManager:
         run = self.get(run_id)
         events = [event for event in run.events if event.sequence > sequence]
         return events, run.status in {"succeeded", "failed"}
+
+    def trace(self, run_id: str) -> GenerationTrace:
+        with self._lock:
+            if run_id not in self._runs:
+                raise GenerationRunNotFound(run_id)
+            steps = self._traces.get(run_id, {})
+            ordered = [steps[stage].model_copy(deep=True) for stage in STAGE_ORDER if stage in steps]
+        return GenerationTrace(run_id=run_id, steps=ordered)
 
     def graph(self, run_id: str) -> dict[str, Any]:
         retriever = self._get_retriever(run_id)
@@ -181,18 +219,72 @@ class GenerationRunManager:
     def _emit(self, run_id: str, stage: str, status: str, summary: str, details: dict[str, Any]) -> None:
         with self._lock:
             run = self._runs[run_id]
+            timestamp = _timestamp()
             event = GenerationEvent(
                 sequence=len(run.events) + 1,
                 stage=stage,
                 status=status,
                 summary=summary,
                 command=COMMANDS[stage],
-                timestamp=_timestamp(),
+                timestamp=timestamp,
                 details=details,
             )
             run.events.append(event)
             run.status = "running"
             run.updated_at = event.timestamp
+            traces = self._traces[run_id]
+            trace_status = "running" if status == "started" else status
+            step = traces.get(stage)
+            if step is None:
+                actor, agent_id = STAGE_ACTORS[stage]
+                step = GenerationTraceStep(
+                    stage=stage,
+                    actor=actor,
+                    agent_id=agent_id,
+                    status=trace_status,
+                    command=COMMANDS[stage],
+                )
+                traces[stage] = step
+            step.status = trace_status
+            step.summary = summary
+            if status == "started" and step.started_at is None:
+                step.started_at = timestamp
+            if status in {"completed", "skipped", "failed", "degraded"}:
+                step.completed_at = timestamp
+
+    def _record_trace(
+        self,
+        run_id: str,
+        stage: str,
+        status: str,
+        input_payload: dict[str, Any] | None,
+        output_payload: dict[str, Any] | None,
+    ) -> None:
+        with self._lock:
+            traces = self._traces[run_id]
+            step = traces.get(stage)
+            if step is None:
+                actor, agent_id = STAGE_ACTORS[stage]
+                step = GenerationTraceStep(
+                    stage=stage,
+                    actor=actor,
+                    agent_id=agent_id,
+                    status="running" if status == "started" else status,
+                    command=COMMANDS[stage],
+                )
+                traces[stage] = step
+            step.status = "running" if status == "started" else status
+            if input_payload is not None:
+                step.input = input_payload
+            if output_payload is not None:
+                step.output = output_payload
+            if status == "started" and step.started_at is None:
+                step.started_at = _timestamp()
+            if status in {"completed", "skipped", "failed", "degraded"}:
+                step.completed_at = _timestamp()
+            if status == "failed":
+                message = str((output_payload or {}).get("error", "This stage failed."))
+                step.error = {"message": message}
 
     def _execute(self, run_id: str) -> None:
         output = self.output_root / run_id
@@ -205,8 +297,12 @@ class GenerationRunManager:
                 on_stage=lambda stage, status, summary, details: self._emit(
                     run_id, stage, status, summary, details
                 ),
+                on_trace=lambda stage, status, input_payload, output_payload: self._record_trace(
+                    run_id, stage, status, input_payload, output_payload
+                ),
                 source_mode=self.get(run_id).source_mode,
                 database_schema=self.database_schema,
+                include_query_semantics=False,
             )
             counts: dict[str, int] = {}
             for obj in result.bundle.objects:
@@ -243,6 +339,18 @@ class GenerationRunManager:
                 error = {
                     "code": "generation_output_invalid",
                     "message": exc.public_message,
+                    "type": type(exc).__name__,
+                }
+            elif getattr(exc, "cerebro_reason", None) in _LLM_ERROR_MESSAGES:
+                reason = exc.cerebro_reason  # type: ignore[attr-defined]
+                attempts = getattr(exc, "cerebro_attempts", None)
+                attempt_note = f" after {attempts} attempt(s)" if attempts else ""
+                error = {
+                    "code": f"llm_{reason}",
+                    "message": (
+                        f"{_LLM_ERROR_MESSAGES[reason]}{attempt_note}. Check the CEREBRO_LLM_TIMEOUT_SECONDS "
+                        "and CEREBRO_LLM_MAX_RETRIES settings and the provider's status, then retry the build."
+                    ),
                     "type": type(exc).__name__,
                 }
             else:

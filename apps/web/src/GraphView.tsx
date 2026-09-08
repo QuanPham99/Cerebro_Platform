@@ -1,9 +1,12 @@
 import cytoscape, { type Core, type ElementDefinition } from 'cytoscape'
-import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
-import type { GraphResponse } from './types'
+import { ChevronDown } from 'lucide-react'
+import { forwardRef, useEffect, useId, useImperativeHandle, useRef, useState } from 'react'
+import { PROFILE_PRESENTATION } from './profilePresentation'
+import type { GraphEdgeType, GraphResponse, ProfileKind } from './types'
 
 export interface GraphHandle {
   fit: () => void
+  resize: () => void
   reset: () => void
 }
 
@@ -12,24 +15,6 @@ interface GraphViewProps {
   visibleIds: Set<string>
   selectedId: string | null
   onSelect: (id: string) => void
-}
-
-const colors: Record<string, string> = {
-  dataset: '#58C7D9',
-  table: '#3EA6B8',
-  concept: '#A78BFA',
-  relationship: '#6E7A90',
-  metric: '#F2B56B',
-  policy: '#F17B91',
-}
-
-const shapes: Record<string, cytoscape.Css.NodeShape> = {
-  dataset: 'round-rectangle',
-  table: 'rectangle',
-  concept: 'ellipse',
-  relationship: 'diamond',
-  metric: 'hexagon',
-  policy: 'tag',
 }
 
 function cardinalityEndpoint(edge: cytoscape.EdgeSingular, endpoint: 0 | 1) {
@@ -41,7 +26,7 @@ export const physicalRelationshipRule = {
   selector: 'edge[type = "physical_fk"]',
   style: {
     width: 1.4,
-    'line-color': '#3EA6B8AA',
+    'line-color': '#3EA6B8',
     'target-arrow-color': '#3EA6B8',
     'target-arrow-shape': 'triangle',
     'arrow-scale': 1,
@@ -62,65 +47,80 @@ export const physicalRelationshipRule = {
   },
 } as const
 
-export const semanticRelationshipRules = [
-  {
-    selector: 'edge[type = "semantic_mapping"]',
-    style: {
-      width: 1.4,
-      'line-color': '#A78BFA',
-      'target-arrow-color': '#A78BFA',
-      'target-arrow-shape': 'triangle',
-      'arrow-scale': 1,
-      'line-style': 'solid',
-    },
+type EdgeStyle = {
+  color: string
+  lineStyle: 'solid' | 'dashed' | 'dotted'
+  arrow: 'triangle' | 'none'
+  width?: number
+  opacity?: number
+  persistentLabel?: boolean
+}
+
+export const EDGE_PRESENTATION: Record<Exclude<GraphEdgeType, 'physical_fk'>, EdgeStyle> = {
+  semantic_mapping: { color: '#A78BFA', lineStyle: 'solid', arrow: 'triangle' },
+  entity_mapping: { color: '#A78BFA', lineStyle: 'solid', arrow: 'triangle' },
+  dimension_entity: { color: '#60A5FA', lineStyle: 'solid', arrow: 'triangle' },
+  dimension_binding: { color: '#60A5FA', lineStyle: 'dotted', arrow: 'triangle' },
+  metric_entity: { color: '#F2B56B', lineStyle: 'solid', arrow: 'triangle' },
+  metric_dimension: { color: '#F2B56B', lineStyle: 'dashed', arrow: 'triangle' },
+  metric_dependency: { color: '#F2B56B', lineStyle: 'dotted', arrow: 'triangle' },
+  rule_entity: { color: '#5CCB8A', lineStyle: 'solid', arrow: 'triangle' },
+  rule_dependency: { color: '#5CCB8A', lineStyle: 'dashed', arrow: 'triangle' },
+  semantic_relationship: { color: '#6E7A90', lineStyle: 'solid', arrow: 'triangle', width: 1.8, persistentLabel: true },
+  policy_coverage: { color: '#F17B91', lineStyle: 'dotted', arrow: 'triangle' },
+  relationship_endpoint: { color: '#66728A', lineStyle: 'solid', arrow: 'none', width: 1, opacity: 0.42 },
+}
+
+export const semanticRelationshipRules = Object.entries(EDGE_PRESENTATION).map(([type, presentation]) => ({
+  selector: `edge[type = "${type}"]`,
+  style: {
+    width: presentation.width ?? 1.4,
+    'line-color': presentation.color,
+    'target-arrow-color': presentation.color,
+    'target-arrow-shape': presentation.arrow,
+    'arrow-scale': 1,
+    'line-style': presentation.lineStyle,
+    opacity: presentation.opacity ?? 0.82,
+    ...(presentation.persistentLabel ? {
+      label: 'data(label)',
+      color: '#C5CEDB',
+      'font-family': 'JetBrains Mono',
+      'font-size': 7,
+      'text-background-color': '#0B1020',
+      'text-background-opacity': 0.92,
+      'text-background-padding': 2,
+    } : {}),
   },
-  {
-    selector: 'edge[type = "metric_dependency"]',
-    style: {
-      width: 1.4,
-      'line-color': '#F2B56B',
-      'target-arrow-color': '#F2B56B',
-      'target-arrow-shape': 'triangle',
-      'arrow-scale': 1,
-      'line-style': 'dashed',
-    },
-  },
-  {
-    selector: 'edge[type = "policy_coverage"]',
-    style: {
-      width: 1.4,
-      'line-color': '#F17B91',
-      'target-arrow-color': '#F17B91',
-      'target-arrow-shape': 'triangle',
-      'arrow-scale': 1,
-      'line-style': 'dotted',
-    },
-  },
-  {
-    selector: 'edge[type = "relationship_endpoint"]',
-    style: {
-      width: 1,
-      'line-color': '#66728A',
-      'target-arrow-color': '#66728A',
-      'target-arrow-shape': 'none',
-      'line-style': 'solid',
-      opacity: 0.46,
-    },
-  },
-] as const
+}))
 
 export function GraphLegend() {
+  const [expanded, setExpanded] = useState(true)
+  const contentId = useId()
+
   return (
-    <div className="legend" aria-label="Graph edge legend">
-      <span className="cardinality-legend">
-        <code aria-label="Table join cardinality example: many to one">many → one</code>
-        <span>table join</span>
-      </span>
-      <span><i className="line semantic directional" /><span><code>concept → table</code> maps to</span></span>
-      <span><i className="line metric directional" /><span><code>metric → table</code> depends on</span></span>
-      <span><i className="line policy directional" /><span><code>policy → table</code> applies to</span></span>
-      <span><i className="line endpoint" /><span>relationship endpoint</span></span>
-    </div>
+    <section className={`graph-legend ${expanded ? 'expanded' : 'collapsed'}`} aria-label="Graph edge legend">
+      <button
+        type="button"
+        className="graph-legend-toggle"
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        aria-label={`${expanded ? 'Collapse' : 'Expand'} graph legend`}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span><i aria-hidden="true" />Edge legend</span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      <div id={contentId} className="legend" hidden={!expanded}>
+        <span className="cardinality-legend"><code aria-label="Table join cardinality example: many to one">many → one</code><span>physical join</span></span>
+        <span><i className="line semantic directional" /><span><code>entity → table</code> semantic mapping</span></span>
+        <span><i className="line relationship directional" /><span><code>entity → entity</code> governed relationship</span></span>
+        <span><i className="line dimension directional" /><span><code>dimension → entity/table</code> ownership / binding</span></span>
+        <span><i className="line metric directional" /><span><code>metric → entity/dimension/table</code> ownership / compatibility / dependency</span></span>
+        <span><i className="line rule directional" /><span><code>rule → semantic object</code> ownership / dependency</span></span>
+        <span><i className="line policy directional" /><span><code>policy → object</code> coverage</span></span>
+        <span><i className="line endpoint" /><span>relationship audit membership</span></span>
+      </div>
+    </section>
   )
 }
 
@@ -133,6 +133,7 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
 
   useImperativeHandle(ref, () => ({
     fit: () => core.current?.fit(undefined, 52),
+    resize: () => core.current?.resize(),
     reset: () => {
       core.current?.elements().removeClass('focused dimmed edge-selected')
       core.current?.fit(undefined, 52)
@@ -156,10 +157,10 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
         {
           selector: 'node',
           style: {
-            'background-color': (element: cytoscape.NodeSingular) => colors[element.data('type')] || '#8491A7',
-            shape: (element: cytoscape.NodeSingular) => shapes[element.data('type')] || 'ellipse',
-            width: (element: cytoscape.NodeSingular) => (element.data('type') === 'dataset' ? 58 : 34),
-            height: (element: cytoscape.NodeSingular) => (element.data('type') === 'dataset' ? 38 : 34),
+            'background-color': (element: cytoscape.NodeSingular) => PROFILE_PRESENTATION[element.data('profile_kind') as ProfileKind]?.color ?? PROFILE_PRESENTATION.generic.color,
+            shape: (element: cytoscape.NodeSingular) => PROFILE_PRESENTATION[element.data('profile_kind') as ProfileKind]?.shape ?? PROFILE_PRESENTATION.generic.shape,
+            width: (element: cytoscape.NodeSingular) => element.data('profile_kind') === 'dataset' ? 58 : element.data('profile_kind') === 'relationship' ? 22 : 34,
+            height: (element: cytoscape.NodeSingular) => element.data('profile_kind') === 'dataset' ? 38 : element.data('profile_kind') === 'relationship' ? 22 : 34,
             label: 'data(label)',
             color: '#BFC8D7',
             'font-family': 'Instrument Sans',
@@ -172,108 +173,34 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
             'border-color': '#E7ECF455',
           },
         },
-        {
-          selector: 'edge',
-          style: {
-            width: 1,
-            'line-color': '#66728A77',
-            'target-arrow-color': '#66728A99',
-            'target-arrow-shape': 'none',
-            'curve-style': 'bezier',
-            opacity: 0.82,
-          },
-        },
+        { selector: 'node[profile_kind = "relationship"]', style: { opacity: 0.66, 'font-size': 7, 'text-max-width': 74 } },
+        { selector: 'edge', style: { width: 1, 'line-color': '#66728A77', 'target-arrow-color': '#66728A99', 'target-arrow-shape': 'none', 'curve-style': 'bezier', opacity: 0.82 } },
         physicalRelationshipRule,
         ...semanticRelationshipRules,
-        {
-          selector: 'node.focused',
-          style: {
-            'border-width': 3,
-            'border-color': '#F3F6FF',
-            'shadow-blur': 24,
-            'shadow-color': '#A78BFA',
-            'shadow-opacity': 0.9,
-            'shadow-offset-x': 0,
-            'shadow-offset-y': 0,
-            'z-index': 20,
-          },
-        },
-        {
-          selector: 'edge.focused, edge.hovered, edge.edge-selected',
-          style: {
-            width: 2.5,
-            opacity: 1,
-            label: 'data(label)',
-            color: '#E7ECF4',
-            'font-size': 7,
-            'text-background-color': '#151D30',
-            'text-background-opacity': 0.9,
-            'text-background-padding': 3,
-          },
-        },
-        {
-          selector: 'edge[type = "physical_fk"].focused, edge[type = "physical_fk"].hovered, edge[type = "physical_fk"].edge-selected',
-          style: {
-            'line-color': '#58C7D9',
-            'target-arrow-color': '#58C7D9',
-            'text-border-color': '#58C7D9',
-            label: '',
-          },
-        },
-        {
-          selector: 'edge[type = "semantic_mapping"].focused, edge[type = "semantic_mapping"].hovered, edge[type = "semantic_mapping"].edge-selected',
-          style: { 'line-color': '#A78BFA', 'target-arrow-color': '#A78BFA' },
-        },
-        {
-          selector: 'edge[type = "metric_dependency"].focused, edge[type = "metric_dependency"].hovered, edge[type = "metric_dependency"].edge-selected',
-          style: { 'line-color': '#F2B56B', 'target-arrow-color': '#F2B56B' },
-        },
-        {
-          selector: 'edge[type = "policy_coverage"].focused, edge[type = "policy_coverage"].hovered, edge[type = "policy_coverage"].edge-selected',
-          style: { 'line-color': '#F17B91', 'target-arrow-color': '#F17B91' },
-        },
+        { selector: 'node.focused', style: { 'border-width': 3, 'border-color': '#F3F6FF', 'shadow-blur': 24, 'shadow-color': '#A78BFA', 'shadow-opacity': 0.9, 'shadow-offset-x': 0, 'shadow-offset-y': 0, 'z-index': 20, opacity: 1 } },
+        { selector: 'edge.focused, edge.hovered, edge.edge-selected', style: { width: 2.5, opacity: 1, label: 'data(label)', color: '#E7ECF4', 'font-size': 7, 'text-background-color': '#151D30', 'text-background-opacity': 0.9, 'text-background-padding': 3 } },
+        { selector: 'edge[type = "physical_fk"].focused, edge[type = "physical_fk"].hovered, edge[type = "physical_fk"].edge-selected', style: { 'line-color': '#58C7D9', 'target-arrow-color': '#58C7D9', 'text-border-color': '#58C7D9', label: '' } },
+        ...Object.entries(EDGE_PRESENTATION).map(([type, presentation]) => ({ selector: `edge[type = "${type}"].focused, edge[type = "${type}"].hovered, edge[type = "${type}"].edge-selected`, style: { 'line-color': presentation.color, 'target-arrow-color': presentation.color } })),
         { selector: '.dimmed', style: { opacity: 0.1 } },
       ] as any),
-      layout: {
-        name: 'cose',
-        animate: !reducedMotion,
-        animationDuration: reducedMotion ? 0 : 650,
-        nodeRepulsion: () => 135000,
-        idealEdgeLength: () => 118,
-        edgeElasticity: () => 90,
-        gravity: 0.28,
-        randomize: true,
-        padding: 52,
-      },
+      layout: { name: 'cose', animate: !reducedMotion, animationDuration: reducedMotion ? 0 : 650, nodeRepulsion: () => 135000, idealEdgeLength: () => 118, edgeElasticity: () => 90, gravity: 0.28, randomize: true, padding: 52 },
     })
     cy.on('tap', 'node', (event) => onSelect(event.target.id()))
     cy.on('mouseover', 'node', (event) => event.target.addClass('hovered'))
     cy.on('mouseout', 'node', (event) => event.target.removeClass('hovered'))
     cy.on('mouseover', 'edge', (event) => event.target.addClass('hovered'))
     cy.on('mouseout', 'edge', (event) => event.target.removeClass('hovered'))
-    cy.on('tap', 'edge', (event) => {
-      cy.edges().removeClass('edge-selected')
-      event.target.addClass('edge-selected')
-    })
-    cy.on('tap', (event) => {
-      if (event.target === cy) cy.edges().removeClass('edge-selected')
-    })
+    cy.on('tap', 'edge', (event) => { cy.edges().removeClass('edge-selected'); event.target.addClass('edge-selected') })
+    cy.on('tap', (event) => { if (event.target === cy) cy.edges().removeClass('edge-selected') })
     core.current = cy
-    return () => {
-      cy.destroy()
-      core.current = null
-    }
+    return () => { cy.destroy(); core.current = null }
   }, [graph, onSelect])
 
   useEffect(() => {
     const cy = core.current
     if (!cy) return
-    cy.nodes().forEach((node) => {
-      node.style('display', visibleIds.has(node.id()) ? 'element' : 'none')
-    })
-    cy.edges().forEach((edge) => {
-      edge.style('display', visibleIds.has(edge.source().id()) && visibleIds.has(edge.target().id()) ? 'element' : 'none')
-    })
+    cy.nodes().forEach((node) => { node.style('display', visibleIds.has(node.id()) ? 'element' : 'none') })
+    cy.edges().forEach((edge) => { edge.style('display', visibleIds.has(edge.source().id()) && visibleIds.has(edge.target().id()) ? 'element' : 'none') })
     cy.fit(cy.elements(':visible'), 52)
   }, [visibleIds])
 

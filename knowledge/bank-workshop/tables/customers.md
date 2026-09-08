@@ -1,32 +1,28 @@
 ---
-type: table
+type: Table
 id: table.customers
-name: Customers
+title: Customers
 description: Customer profile, demographics, income, and credit attributes.
-status: active
-aliases:
-- clients
-- account holders
-- customer demographics
-tags:
-- banking
-- customers
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.account_customer
 - relationship.card_customer
 - relationship.loan_customer
 - relationship.support_ticket_customer
-- concept.customer-demographics
-- concept.support-workload
-- concept.active-customer
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: restricted
+  physical:
+    schema: main
+    table: customers
   schema: main
   grain: one row per bank customer
   primary_key: customer_id
@@ -92,6 +88,7 @@ cerebro:
     classification: confidential
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/customers
 ---
 
 # Customers

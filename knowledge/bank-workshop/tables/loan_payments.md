@@ -1,27 +1,25 @@
 ---
-type: table
+type: Table
 id: table.loan_payments
-name: Loan Payments
+title: Loan Payments
 description: Loan repayment events and late-payment outcomes.
-status: active
-aliases:
-- repayments
-- late payments
-- installments
-tags:
-- banking
-- loan_payments
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.loan_payment_loan
-- concept.repayment-behavior
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: loan_payments
   schema: main
   grain: one scheduled or received payment event per loan
   primary_key: payment_id
@@ -62,6 +60,7 @@ cerebro:
     classification: internal
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/loan_payments
 ---
 
 # Loan Payments

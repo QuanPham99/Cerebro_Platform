@@ -11,14 +11,15 @@ Cerebro turns changing datasets into a living, machine-readable knowledge system
 This branch contains a working, spec-driven semantic-layer slice for the bank workshop dataset:
 
 - Google Cloud's full Open Knowledge Format repository is vendored as an unmodified Git subtree at commit `ad30107c31c06aec8a7d5636e0d1058118604e6f`.
-- `DuckDBSource` implements Google's `Source` contract and reads only `information_schema` through a read-only connection.
-- The checked-in `knowledge/bank-workshop` golden bundle describes 10 tables, 75 columns, 11 declared relationships, 9 business concepts, 4 metrics, and a sensitive-data policy.
-- Bounded definition, relationship, and query-semantics stages use one configurable OpenAI-compatible model gateway and never receive source rows.
-- The in-memory retriever uses lexical ranking, optional `text-embedding-3-small` vectors, reciprocal-rank fusion, and typed one-hop graph expansion.
+- `DuckDBSource` implements Google's `Source` contract and reads only DuckDB catalog metadata through a read-only connection.
+- The checked-in `knowledge/bank-workshop` golden bundle uses OKF v0.2 and Cerebro Semantic Profile v0.1. It describes 10 tables, 75 columns, 10 entities, 11 dimensions, 6 metrics, 6 business rules, 11 governed relationships, and 1 policy.
+- Three bounded specialist stages propose the semantic inventory, relationship semantics, and metric/rule semantics through one configurable OpenAI-compatible model gateway. They receive catalog metadata without source rows.
+- A deterministic linker, compiler, and validator reject invalid references before review. Approved copies become `stable`, record human verification, and remain separate from generated candidates.
+- The in-memory retriever uses type-aware lexical ranking, optional embeddings, reciprocal-rank fusion, progressive semantic expansion, and shortest governed join paths.
 - FastAPI serves semantic retrieval, runtime status, and governed database chat; MCP exposes the same grounding contract through local Streamable HTTP.
 - The React workspace combines the read-only semantic constellation with a conversational Text-to-SQL experience that discloses SQL, results, evidence, warnings, and agent trace.
 
-The production code traces to the eight contracts in [`specs/`](specs/README.md). Semantic definitions and design rationale remain in [`docs/semantic-layer-definition.md`](docs/semantic-layer-definition.md). The complete manual test procedure is [`docs/product-tester-guide.md`](docs/product-tester-guide.md).
+The production code traces to the contracts in [`specs/`](specs/README.md), including the [Semantic Profile v0.1 contract](specs/011-semantic-profile-v0.1.md). Semantic definitions and design rationale remain in [`docs/semantic-layer-definition.md`](docs/semantic-layer-definition.md). The complete manual test procedure is [`docs/product-tester-guide.md`](docs/product-tester-guide.md).
 
 ### Quick start
 
@@ -46,7 +47,7 @@ For live frontend development, install dependencies and run:
 
 The launcher prefers `.venv/bin/python` when the project virtual environment exists. It starts the API/MCP service on port 8000 and Vite on port 5173, and exits with the backend error instead of starting Vite when the API cannot initialize.
 
-In **Semantic constellation**, open the **Build** tab or the terminal button, explicitly choose **Database only** or **Configured**, and then choose **Generate candidate**. The guided transcript scans the catalog, runs the three typed semantic stages, compiles and validates a separate OKF bundle, and exposes its graph, evidence, provenance, and Markdown. A whole-candidate review decision is recorded before a separately confirmed activation updates HTTP, MCP, graph, document, and chat consumers.
+In **Semantic constellation**, open **Semantic generation** and choose **Run full pipeline**. The workbench defaults to a raw DuckDB smoke test, keeps **Configured** under advanced options, restores the current server-process run after tab switches or a browser refresh, and exposes sanitized structured input/output for every stage. The active graph stays hidden until validation produces a separate candidate graph. A whole-candidate review decision is still recorded before a separately confirmed activation updates HTTP, MCP, graph, document, and chat consumers.
 
 ### Core commands
 
@@ -66,10 +67,10 @@ cerebro validate --bundle knowledge/generated/tester-001
 cerebro review --bundle knowledge/generated/tester-001 --reviewer 'Data Owner' --acknowledge-ai-risk
 cerebro activate --bundle knowledge/reviewed/tester-001
 
-# Validate Google OKF syntax plus Cerebro relationship/metric/link contracts
+# Validate Google OKF syntax plus all typed Cerebro profile contracts
 cerebro validate
 
-# Evaluate all ten representative banking questions
+# Evaluate 30 typed semantic-grounding questions
 cerebro evaluate
 
 # Ask one governed database question from the terminal.
@@ -86,7 +87,15 @@ CEREBRO_LLM_MODEL=your_endpoint_supported_model
 CEREBRO_LLM_RESPONSE_MODE=auto
 CEREBRO_LLM_TIMEOUT_SECONDS=120
 CEREBRO_LLM_MAX_OUTPUT_TOKENS=8192
+CEREBRO_LLM_MAX_RETRIES=2
+CEREBRO_LLM_RETRY_BACKOFF_SECONDS=2
 ```
+
+If a build keeps failing with a timeout, connection, rate-limit, or server error from the model provider,
+each generation agent call retries automatically with exponential backoff (`CEREBRO_LLM_MAX_RETRIES` attempts,
+starting at `CEREBRO_LLM_RETRY_BACKOFF_SECONDS` and doubling). A failed run's error `code` (e.g. `llm_timeout`,
+`llm_rate_limited`) tells you which of these it was after retries were exhausted; raise `CEREBRO_LLM_TIMEOUT_SECONDS`
+or `CEREBRO_LLM_MAX_RETRIES` if your endpoint is simply slow on large catalogs.
 
 Run `cerebro doctor` after changing configuration. Model and key changes require no source edits, and secrets are never returned to the browser. No database rows are included in OKF generation. Chat may send only bounded, policy-approved query results to the model; restricted fields and raw confidential values are blocked. Embeddings remain optional and lexical-plus-graph retrieval is the deterministic fallback.
 
@@ -104,12 +113,13 @@ Run `cerebro doctor` after changing configuration. Model and key changes require
 | `POST /api/generation/runs` | Start one configured or database-only candidate run |
 | `GET /api/generation/runs/{id}` | Generation state, replayable events, and candidate summary |
 | `GET /api/generation/runs/{id}/events` | Live Server-Sent Events progress stream |
+| `GET /api/generation/runs/{id}/trace` | Ordered sanitized stage inputs and validated outputs |
 | `GET /api/generation/runs/{id}/graph` | Validated candidate graph preview; never activates it |
 | `GET /api/generation/runs/{id}/snapshot` | Sanitized catalog facts and discovery evidence |
 | `GET /api/generation/runs/{id}/documents/{path}` | Generated candidate Markdown |
 | `POST /api/generation/runs/{id}/reviews` | Record an idempotent whole-candidate approval or rejection |
 | `POST /api/generation/runs/{id}/activate` | Verify and activate the immutable approved bundle |
-| MCP `retrieve_grounding` | Concepts, tables, joins, metrics, warnings, classifications, and provenance |
+| MCP `retrieve_grounding` | Entities, dimensions, metrics, rules, physical bindings, joins, warnings, classifications, and provenance |
 | MCP `get_concept` | Stable-ID lookup |
 | MCP `expand_neighborhood` | Typed graph expansion up to depth three |
 
@@ -128,69 +138,40 @@ The result is a feedback loop in which data changes update the knowledge layer, 
 
 ## Platform architecture
 
+### Implemented architecture
+
 ```mermaid
 flowchart TB
-    subgraph Sources[Data and context sources]
-        DB[(Databases / Warehouses)]
-        BI[BI models and metrics]
-        DOCS[Glossaries / Documentation]
-        MCP[MCP Servers]
-    end
-
-    subgraph Semantic[Semantic Intelligence Layer]
-        SCAN[Metadata Scanner]
-        SNAP[Schema Snapshot Store]
-        DIFF[Change Detection]
-        ENRICH[OKF Generation Agents]
-        REVIEW[Validation and Human Review]
-        OKF[(Versioned OKF Repository)]
-        GRAPH[(Semantic Graph)]
-        SEARCH[Semantic Search / Retrieval]
-    end
-
-    subgraph Agentic[Text-to-SQL Agentic Platform]
-        API[Chat / API / Application]
-        ORCH[Orchestrator Agent]
-        PLAN[Query Planning Agent]
-        KNOW[Knowledge Retrieval Agent]
-        SQL[SQL Generation Agent]
-        VALIDATE[SQL and Result Validation Agent]
-        EXEC[Governed Query Executor]
-        INSIGHT[Insight and Report Agent]
-        DASH[Dashboard Generation Agent]
-    end
-
-    DB --> SCAN
-    BI --> ENRICH
-    DOCS --> ENRICH
-    MCP --> SCAN
-    SCAN --> SNAP --> DIFF --> ENRICH --> REVIEW --> OKF
-    OKF --> GRAPH
-    OKF --> SEARCH
-
-    API --> ORCH
-    ORCH --> PLAN
-    ORCH --> KNOW
-    KNOW --> SEARCH
-    KNOW --> GRAPH
-    PLAN --> SQL
-    KNOW --> SQL
-    SQL --> VALIDATE
-    VALIDATE --> EXEC
-    EXEC --> DB
-    EXEC -. optional .-> MCP
-    EXEC --> VALIDATE
-    VALIDATE --> INSIGHT
-    INSIGHT --> DASH
-    INSIGHT --> API
-    DASH --> API
+    DB[(Read-only DuckDB)] --> SCAN[Catalog Scan]
+    SCAN --> INVENTORY[SemanticInventoryAgent]
+    INVENTORY --> RELATIONSHIP[RelationshipAgent]
+    RELATIONSHIP --> METRIC[MetricRuleAgent]
+    METRIC --> LINKER[Deterministic Semantic Linker]
+    LINKER --> COMPILER[OKF Compiler]
+    COMPILER --> VALIDATOR[Deterministic Validator]
+    VALIDATOR --> CANDIDATE[(Isolated Candidate)]
+    CANDIDATE --> REVIEW[Human Review]
+    REVIEW --> ACTIVATE[Explicit Activation]
+    ACTIVATE --> OKF[(Active Versioned OKF)]
+    OKF --> SEARCH[Semantic Retrieval and MCP]
+    OKF --> GRAPH[Profile-aware Graph Projection]
+    SEARCH --> CHAT[Governed Chat Orchestrator]
+    CHAT --> GUARD[SQL Guardrail]
+    GUARD --> DB
+    GRAPH --> UI[Semantic Constellation]
 ```
+
+The implemented builder is a fixed, bounded workflow—not an autonomous swarm. Each semantic agent makes one typed provider call from catalog-only input. It cannot read source rows, compile documents, validate, review, or activate. Deterministic components and human authority own those later boundaries.
 
 The architecture separates **knowledge production** from **knowledge consumption**:
 
-- The semantic pipeline continuously creates reliable, versioned knowledge about the data estate.
-- The runtime agent system consumes that knowledge to answer questions safely and consistently.
-- MCP servers can provide standardized access to datasets, catalogs, query engines, or other tools while Cerebro retains its own orchestration, policies, and semantic contracts.
+- The semantic pipeline creates an isolated, versioned candidate from the current catalog.
+- Review and activation are separate recorded actions; downstream consumers continue using the active bundle until activation.
+- The current chat runtime retrieves the active semantic contract, proposes one query, validates it, executes it read-only, and returns evidence-linked results.
+
+### Future Text-to-SQL multi-agent target
+
+The longer-term target may split runtime query work into intent, semantic planning, physical planning, SQL generation, validation, execution, and reporting agents. That topology is not the current semantic builder or current chat implementation. Source-row profiling, semantic/physical planner decomposition, SQL-architecture migration, dashboard agents, and durable remote orchestration remain future work.
 
 ## 1. Semantic Intelligence Layer
 
@@ -220,17 +201,13 @@ Changes can trigger targeted regeneration instead of rebuilding the entire knowl
 
 ### OKF generation agents
 
-Specialized generation agents translate raw metadata and organizational context into an Open Knowledge Format knowledge repository. Their responsibilities include:
+The implemented builder has exactly three bounded provider wrappers:
 
-- **Concept discovery** — identifies business entities, events, measures, and dimensions.
-- **Semantic enrichment** — writes clear definitions, aliases, usage guidance, and examples.
-- **Relationship inference** — proposes joins, cardinalities, hierarchies, and entity links.
-- **Metric definition** — captures formulas, grains, dimensions, time semantics, and caveats.
-- **Policy classification** — records sensitivity, access expectations, and prohibited uses.
-- **Lineage mapping** — connects source fields, derived models, metrics, and downstream artifacts.
-- **Quality validation** — checks OKF completeness, consistency, references, and schema alignment.
+- **`SemanticInventoryAgent`** proposes entities, dimensions, table purposes, classifications, and reviewable policies.
+- **`RelationshipAgent`** proposes catalog-bounded physical endpoints, optional entity endpoints, cardinality, confidence, and evidence.
+- **`MetricRuleAgent`** proposes structured aggregate or ratio metrics, compatible dimensions, time semantics, and typed business rules.
 
-Generated knowledge is treated as a proposed artifact, not unquestioned truth. Confidence, provenance, validation state, and human decisions should be recorded wherever possible.
+`SemanticEnricher` sanitizes the snapshot once and calls them in that order. The deterministic linker resolves profile references, the OKF compiler writes a separate draft candidate, and the validator rejects invalid or incompatible targets before human review. Explicit activation is the only operation that changes the active bundle. Credential-free fallback emits structural dataset, table, and catalog-relationship documents without inventing business meaning.
 
 ### Versioned OKF repository
 
@@ -251,18 +228,20 @@ Keeping these artifacts in version control makes changes reviewable, auditable, 
 
 The graph builder projects OKF entities and relations into a navigable model. The visualization helps users and agents explore:
 
-- how business concepts map to physical data;
-- valid and risky join paths;
-- metric dependencies and calculation lineage;
-- upstream and downstream impact of schema changes;
-- dataset domains, ownership, and access boundaries;
-- disconnected, ambiguous, or weakly documented areas.
+- entities and their physical table mappings;
+- dimensions, owning entities, physical bindings, and compatible metrics;
+- structured metrics, business rules, and their semantic or physical dependencies;
+- canonical entity-to-entity relationships beside subordinate relationship audit nodes;
+- physical joins with endpoint cardinalities;
+- policy coverage, provenance, verification, and source documents.
+
+The UI uses backend `profile_kind` for presentation and filtering while preserving raw OKF `type`. It supports All, Physical, Semantic, Metrics, and Governance presets plus per-kind filters for dataset, physical table, entity, dimension, metric, business rule, relationship, policy, legacy concept, and generic objects.
 
 The graph is not only a UI. It is a reasoning substrate for retrieving connected context, selecting join routes, analyzing impact, and explaining how an answer was produced.
 
-## 2. Text-to-SQL Agentic Platform
+## 2. Future Text-to-SQL Agentic Platform
 
-The query runtime uses a coordinator and bounded specialist agents. Agents exchange structured plans and evidence rather than relying on a single opaque prompt.
+The following topology is the longer-term target, not a description of the currently implemented chat runtime. In the target, a coordinator and bounded specialist agents exchange structured plans and evidence rather than relying on a single opaque prompt.
 
 | Component | Responsibility |
 | --- | --- |
@@ -321,19 +300,21 @@ MCP is useful as a standardized tool boundary: an MCP server can expose schema d
 ### Knowledge generation flow
 
 ```text
-1. Connect a data source
-2. Scan metadata and collect a schema snapshot
-3. Compare the snapshot with the previous version
-4. Identify affected concepts and relationships
-5. Run targeted OKF generation agents
-6. Validate references, semantics, policies, and graph integrity
-7. Request human review for uncertain or high-impact changes
-8. Publish a versioned OKF bundle
-9. Rebuild search indexes and the semantic graph
-10. Notify downstream consumers of material changes
+1. Scan the read-only catalog
+2. Run SemanticInventoryAgent
+3. Run RelationshipAgent with the inventory
+4. Run MetricRuleAgent with inventory and relationships
+5. Link semantic references deterministically
+6. Compile a separate draft OKF candidate
+7. Validate all physical and semantic contracts
+8. Record a whole-candidate human review
+9. Activate the immutable reviewed bundle explicitly
+10. Rebuild retrieval and graph projections from the active bundle
 ```
 
 ### Text-to-SQL query flow
+
+Future target:
 
 ```text
 1. A user asks a business question

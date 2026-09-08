@@ -18,18 +18,18 @@ Retrieve relevant OKF objects using lexical/vector fusion and graph expansion, t
 
 - FR-401: Index title, ID, aliases, tags, descriptions, columns, and body in memory.
 - FR-402: Rank lexically and, when configured, embed with `text-embedding-3-small`; fuse rankings by reciprocal rank fusion with `k=60`.
-- FR-403: Expand one hop over typed edges and apply trust, status, policy, and classification filters.
+- FR-403: Resolve typed semantic intent first, add its declared mappings second, and add only shortest required relationship paths and physical bindings third.
 - FR-404: Fall back to lexical plus graph retrieval when embeddings are unavailable.
 - FR-405: Serve active bundle, graph, concept detail, and search HTTP endpoints.
 - FR-406: Expose MCP tools `retrieve_grounding`, `get_concept`, and `expand_neighborhood` over local Streamable HTTP.
-- FR-407: Grounding includes semantic version, mode, concepts, tables, columns, joins, grain, metrics, filters, warnings, classifications, provenance, and ranking evidence.
-- FR-408: The graph emits one canonical directional edge for each semantic contract: concept maps to table, metric depends on table, policy applies to table, dataset contains table, and physical relationships point from source table to target table. Reverse table back-references and duplicate generic relationship edges are omitted.
+- FR-407: Grounding includes semantic version, mode, entities, dimensions, rules, legacy concepts, tables, columns, joins, grain, metrics, filters, warnings, classifications, provenance, and ranking evidence.
+- FR-408: The graph emits canonical directional edges for entity mappings, dimensions, metrics, rules, policies, datasets, semantic relationships, and physical relationships. Reverse table back-references and duplicate generic relationship edges are omitted.
 - FR-409: The graph viewer distinguishes concept, metric, policy, physical, and relationship-endpoint edges by source-aligned color, line pattern, arrow presence, and a direction-explicit legend. Human-readable edge labels appear on hover, tap, or focused neighborhoods.
 
 ## Acceptance Criteria
 
 - AC-401: Retrieval is deterministic for the same bundle and query.
-- AC-402: All ten golden questions return required concepts and joins within top 10.
+- AC-402: All 30 semantic questions and the 10 legacy intent cases return their required typed objects and join paths.
 - AC-403: Missing embeddings never prevent server startup.
 - AC-404: MCP tool responses validate against the same schemas as HTTP responses.
 - AC-405: Unknown IDs and malformed parameters return typed errors.

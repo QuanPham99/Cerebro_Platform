@@ -1,8 +1,7 @@
 ---
-type: index
-name: Bank workshop semantic layer
+okf_version: '0.2'
 ---
 
-# Bank workshop semantic layer
+# Banking Semantic Layer
 
-A reviewed golden OKF bundle generated without source-row access.
+Governed banking Semantic Profile v0.1.

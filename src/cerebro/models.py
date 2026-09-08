@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .semantic.profile import normalize_profile_kind
+
+
+Classification = Literal["public", "internal", "confidential", "restricted"]
 
 
 class Provenance(BaseModel):
@@ -58,6 +63,124 @@ class CatalogSnapshot(BaseModel):
         return sum(len(table.columns) for table in self.tables)
 
 
+class PhysicalColumnBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    table: str = Field(min_length=1)
+    column: str = Field(min_length=1)
+
+
+class EntityPhysicalMapping(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    table: str = Field(min_length=1)
+    key: list[str] = Field(min_length=1)
+
+
+class GrainDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    key: list[str] = Field(default_factory=list)
+
+
+class MetricPredicate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: PhysicalColumnBinding
+    operator: Literal["eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "is_null", "not_null"]
+    value: Any | None = None
+
+
+class AggregateMeasure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["aggregate"] = "aggregate"
+    aggregation: Literal["count", "count_distinct", "sum", "avg", "min", "max"]
+    source: PhysicalColumnBinding | None = None
+    predicates: list[MetricPredicate] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_source_for_column_aggregates(self) -> "AggregateMeasure":
+        if self.aggregation != "count" and self.source is None:
+            raise ValueError(f"{self.aggregation} requires a source column")
+        return self
+
+
+class RatioMeasure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["ratio"] = "ratio"
+    numerator: AggregateMeasure
+    denominator: AggregateMeasure
+    scale: float = 100.0
+
+
+MetricMeasure = Annotated[AggregateMeasure | RatioMeasure, Field(discriminator="kind")]
+
+
+class EntityCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
+    classification: Classification
+    physical_mapping: EntityPhysicalMapping
+    grain: GrainDefinition
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DimensionCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    entity: str = Field(min_length=1)
+    physical_mappings: list[PhysicalColumnBinding] = Field(min_length=1)
+    semantic_type: Literal["categorical", "temporal", "numeric", "geographic", "derived"]
+    derivation: str | None = None
+    compatible_metrics: list[str] = Field(default_factory=list)
+    classification: Classification
+    warnings: list[str] = Field(default_factory=list)
+
+
+class StructuredMetricCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    entity: str = Field(min_length=1)
+    measure: MetricMeasure
+    dependencies: list[str] = Field(min_length=1)
+    grain: GrainDefinition
+    compatible_dimensions: list[str] = Field(default_factory=list)
+    time_dimension: str | None = None
+    relative_time_anchor: Literal["max_available_date"] | None = None
+    classification: Classification
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BusinessRuleCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    entity: str = Field(min_length=1)
+    rule_kind: Literal["predicate", "classification", "time_anchor", "aggregation_constraint"]
+    output_type: Literal["boolean", "category", "direction", "date"]
+    dependencies: list[str] = Field(min_length=1)
+    logic: str = Field(min_length=1)
+    grain: GrainDefinition
+    classification: Classification
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ConceptCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -85,10 +208,14 @@ class PolicyCandidate(BaseModel):
 
 
 class BusinessSemantics(BaseModel):
-    table_purposes: dict[str, str]
-    concepts: list[ConceptCandidate]
+    model_config = ConfigDict(extra="forbid")
+
+    table_purposes: dict[str, str] = Field(default_factory=dict)
+    concepts: list[ConceptCandidate] = Field(default_factory=list)
+    entities: list[EntityCandidate] = Field(default_factory=list)
+    dimensions: list[DimensionCandidate] = Field(default_factory=list)
     policies: list[PolicyCandidate] = Field(default_factory=list)
-    classifications: dict[str, str]
+    classifications: dict[str, str] = Field(default_factory=dict)
 
 
 class MetricCandidate(BaseModel):
@@ -106,27 +233,37 @@ class MetricCandidate(BaseModel):
 
 
 class QuerySemantics(BaseModel):
-    grains: dict[str, str]
-    dimensions: list[dict[str, Any]]
-    measures: list[MetricCandidate]
-    joins: list[dict[str, Any]]
-    guidance: list[str]
-    warnings: list[str]
+    model_config = ConfigDict(extra="forbid")
+
+    grains: dict[str, str] = Field(default_factory=dict)
+    dimensions: list[dict[str, Any]] = Field(default_factory=list)
+    measures: list[MetricCandidate] = Field(default_factory=list)
+    structured_measures: list[StructuredMetricCandidate] = Field(default_factory=list)
+    rules: list[BusinessRuleCandidate] = Field(default_factory=list)
+    joins: list[dict[str, Any]] = Field(default_factory=list)
+    guidance: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RelationshipCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     source_table: str
     source_column: str
     target_table: str
     target_column: str
     cardinality: Literal["one-to-one", "one-to-many", "many-to-one", "many-to-many"]
+    source_entity: str | None = None
+    target_entity: str | None = None
     description: str = ""
     confidence: float = Field(default=0.5, ge=0, le=1)
     evidence: list[str] = Field(default_factory=list)
 
 
 class RelationshipSemantics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     relationships: list[RelationshipCandidate] = Field(default_factory=list)
 
 
@@ -134,7 +271,7 @@ class SemanticProposal(BaseModel):
     business: BusinessSemantics
     relationships: RelationshipSemantics = Field(default_factory=RelationshipSemantics)
     query: QuerySemantics
-    generation_mode: Literal["live", "fallback"]
+    generation_mode: Literal["live", "fallback", "partial", "authored"]
     provider: str
     model: str
 
@@ -154,18 +291,37 @@ GenerationStage = Literal[
 class GenerationEvent(BaseModel):
     sequence: int
     stage: GenerationStage
-    status: Literal["started", "completed", "skipped", "failed"]
+    status: Literal["started", "completed", "skipped", "failed", "degraded"]
     summary: str
     command: str
     timestamp: str
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class GenerationTraceStep(BaseModel):
+    stage: GenerationStage
+    actor: Literal["source", "agent", "compiler", "validator", "system"]
+    agent_id: str | None = None
+    status: Literal["running", "completed", "skipped", "failed", "degraded"]
+    started_at: str | None = None
+    completed_at: str | None = None
+    summary: str = ""
+    command: str
+    input: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
+    error: dict[str, str] | None = None
+
+
+class GenerationTrace(BaseModel):
+    run_id: str
+    steps: list[GenerationTraceStep] = Field(default_factory=list)
+
+
 class GenerationCandidate(BaseModel):
     name: str
     version: str
     counts: dict[str, int]
-    generation_mode: Literal["live", "fallback"]
+    generation_mode: Literal["live", "fallback", "partial", "authored"]
     provider: str | None = None
     model: str | None = None
     source_mode: Literal["configured", "database_only"] = "configured"
@@ -206,6 +362,58 @@ class ReviewRecord(BaseModel):
     candidate_digest: str
     reviewed_bundle: str | None = None
     reviewed_digest: str | None = None
+
+
+class MetricDefinitionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["metric"]
+    definition: StructuredMetricCandidate
+
+
+class BusinessRuleDefinitionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["business_rule"]
+    definition: BusinessRuleCandidate
+
+
+DefinitionPayload = Annotated[
+    MetricDefinitionPayload | BusinessRuleDefinitionPayload,
+    Field(discriminator="kind"),
+]
+
+
+class DefinitionTranslateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["metric", "business_rule"]
+    intent: str = Field(min_length=1, max_length=4000)
+    entity_id: str | None = None
+
+
+class DefinitionTranslation(BaseModel):
+    payload: DefinitionPayload
+    warnings: list[str] = Field(default_factory=list)
+    provider: str
+    model: str
+
+
+class DefinitionApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payload: DefinitionPayload
+    origin: Literal["ai_proposed", "declared"] = "declared"
+
+
+class DefinitionRevision(BaseModel):
+    id: str
+    base_version: str
+    version: str
+    counts: dict[str, int]
+    generation_mode: Literal["authored"] = "authored"
+    review_state: Literal["candidate", "approved", "rejected"] = "candidate"
+    review_record: dict[str, Any] | None = None
 
 
 class QueryPlan(BaseModel):
@@ -263,17 +471,41 @@ class SemanticObject(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str
-    type: Literal["dataset", "table", "concept", "relationship", "metric", "policy"]
+    type: str = Field(min_length=1)
     name: str
+    title: str = ""
+    profile_kind: str = "generic"
     description: str = ""
-    status: Literal["active", "draft", "deprecated"] = "active"
+    resource: str | None = None
+    status: Literal["stable", "draft", "deprecated"] = "stable"
     aliases: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     links: list[str] = Field(default_factory=list)
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    generated: dict[str, Any] | None = None
+    verified: list[dict[str, Any]] = Field(default_factory=list)
+    stale_after: str | None = None
     provenance: dict[str, Any] = Field(default_factory=dict)
     cerebro: dict[str, Any] = Field(default_factory=dict)
     body: str = ""
     path: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_okf_compatibility(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        title = str(data.get("title") or data.get("name") or data.get("id") or "")
+        data.setdefault("title", title)
+        data.setdefault("name", title)
+        if data.get("status") == "active":
+            data["status"] = "stable"
+        verified = data.get("verified")
+        if isinstance(verified, dict):
+            data["verified"] = [verified]
+        data.setdefault("profile_kind", normalize_profile_kind(data.get("type"), data.get("cerebro")))
+        return data
 
 
 class SemanticBundle(BaseModel):
@@ -287,6 +519,8 @@ class SemanticBundle(BaseModel):
     model: str | None = None
     source_mode: Literal["configured", "database_only"] = "configured"
     discovery_evidence: dict[str, Any] = Field(default_factory=dict)
+    okf_version: str | None = None
+    semantic_profile_version: str | None = None
 
     def by_id(self) -> dict[str, SemanticObject]:
         return {obj.id: obj for obj in self.objects}
@@ -310,6 +544,7 @@ class GraphNode(BaseModel):
     label: str
     description: str = ""
     classification: str = "internal"
+    profile_kind: str = "generic"
 
 
 class GraphEdge(BaseModel):
@@ -330,6 +565,7 @@ class RankedResult(BaseModel):
     id: str
     type: str
     name: str
+    profile_kind: str = "generic"
     score: float
     evidence: list[str]
 
@@ -339,6 +575,9 @@ class GroundingResponse(BaseModel):
     retrieval_mode: Literal["lexical_graph", "hybrid_graph"]
     question: str
     concepts: list[dict[str, Any]]
+    entities: list[dict[str, Any]] = Field(default_factory=list)
+    dimensions: list[dict[str, Any]] = Field(default_factory=list)
+    rules: list[dict[str, Any]] = Field(default_factory=list)
     tables: list[dict[str, Any]]
     columns: list[str]
     joins: list[dict[str, Any]]

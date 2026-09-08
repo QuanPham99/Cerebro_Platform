@@ -1,8 +1,36 @@
-export type NodeType = 'dataset' | 'table' | 'concept' | 'relationship' | 'metric' | 'policy'
+export type ProfileKind =
+  | 'dataset'
+  | 'physical_table'
+  | 'entity'
+  | 'dimension'
+  | 'metric'
+  | 'business_rule'
+  | 'relationship'
+  | 'policy'
+  | 'legacy_concept'
+  | 'generic'
+
+export type NodeType = ProfileKind
+
+export type GraphEdgeType =
+  | 'physical_fk'
+  | 'relationship_endpoint'
+  | 'semantic_mapping'
+  | 'entity_mapping'
+  | 'dimension_entity'
+  | 'dimension_binding'
+  | 'metric_entity'
+  | 'metric_dimension'
+  | 'metric_dependency'
+  | 'rule_entity'
+  | 'rule_dependency'
+  | 'semantic_relationship'
+  | 'policy_coverage'
 
 export interface GraphNode {
   id: string
-  type: NodeType
+  type: string
+  profile_kind: ProfileKind
   label: string
   description: string
   classification: string
@@ -12,7 +40,7 @@ export interface GraphEdge {
   id: string
   source: string
   target: string
-  type: 'physical_fk' | 'relationship_endpoint' | 'semantic_mapping' | 'metric_dependency' | 'policy_coverage'
+  type: GraphEdgeType
   label: string
 }
 
@@ -24,10 +52,15 @@ export interface GraphResponse {
 
 export interface SemanticObject extends GraphNode {
   name: string
-  status: 'active' | 'draft' | 'deprecated'
+  status: 'stable' | 'active' | 'draft' | 'deprecated'
   aliases: string[]
   tags: string[]
   links: string[]
+  sources?: Array<Record<string, unknown>>
+  generated?: Record<string, unknown> | null
+  verified?: Array<Record<string, unknown>> | Record<string, unknown>
+  stale_after?: string | null
+  resource?: string | null
   provenance: Record<string, unknown>
   cerebro: Record<string, unknown>
   body: string
@@ -104,24 +137,74 @@ export type GenerationStage =
 export interface GenerationEvent {
   sequence: number
   stage: GenerationStage
-  status: 'started' | 'completed' | 'skipped' | 'failed'
+  status: 'started' | 'completed' | 'skipped' | 'failed' | 'degraded'
   summary: string
   command: string
   timestamp: string
   details: Record<string, string | number | boolean>
 }
 
+export interface GenerationTraceStep {
+  stage: GenerationStage
+  actor: 'source' | 'agent' | 'compiler' | 'validator' | 'system'
+  agent_id: string | null
+  status: 'running' | 'completed' | 'skipped' | 'failed' | 'degraded'
+  started_at: string | null
+  completed_at: string | null
+  summary: string
+  command: string
+  input: Record<string, unknown> | null
+  output: Record<string, unknown> | null
+  error: { message: string } | null
+}
+
+export interface GenerationTrace {
+  run_id: string
+  steps: GenerationTraceStep[]
+}
+
 export interface GenerationCandidate {
   name: string
   version: string
   counts: Record<string, number>
-  generation_mode: 'live' | 'fallback'
+  generation_mode: 'live' | 'fallback' | 'partial' | 'authored'
   provider: string | null
   model: string | null
   source_mode: 'configured' | 'database_only'
   discovery_evidence: Record<string, string | number | boolean>
   review_state: 'candidate' | 'approved' | 'rejected'
   review_record: ReviewRecord | null
+}
+
+export type DefinitionKind = 'metric' | 'business_rule'
+
+export interface DefinitionPayload {
+  kind: DefinitionKind
+  definition: Record<string, unknown>
+}
+
+export interface DefinitionTranslation {
+  payload: DefinitionPayload
+  warnings: string[]
+  provider: string
+  model: string
+}
+
+export interface DefinitionRevision {
+  id: string
+  base_version: string
+  version: string
+  counts: Record<string, number>
+  generation_mode: 'authored'
+  review_state: 'candidate' | 'approved' | 'rejected'
+  review_record: ReviewRecord | null
+}
+
+export interface DefinitionContext {
+  version: string
+  entities: Array<{ id: string; name: string }>
+  dimensions: Array<{ id: string; name: string; entity?: string | null }>
+  tables: Array<{ id: string; name: string; columns: Array<{ name: string; data_type: string }> }>
 }
 
 export interface ReviewRecord {

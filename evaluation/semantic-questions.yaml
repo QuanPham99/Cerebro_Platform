@@ -1,0 +1,150 @@
+questions:
+  - id: SQ-01
+    question: Transaction volume by transaction channel
+    expected:
+      metrics: [metric.transaction-volume]
+      dimensions: [dimension.transaction-channel]
+  - id: SQ-02
+    question: Transaction volume by transaction type
+    expected:
+      metrics: [metric.transaction-volume]
+      dimensions: [dimension.transaction-type]
+  - id: SQ-03
+    question: Monthly transaction volume using transaction date
+    expected:
+      metrics: [metric.transaction-volume]
+      dimensions: [dimension.transaction-date]
+  - id: SQ-04
+    question: Average account balance by account type
+    expected:
+      metrics: [metric.account-balance]
+      dimensions: [dimension.account-type]
+  - id: SQ-05
+    question: Customer count by customer gender
+    expected:
+      metrics: [metric.customer-count]
+      dimensions: [dimension.customer-gender]
+  - id: SQ-06
+    question: Customer count by customer age
+    expected:
+      metrics: [metric.customer-count]
+      dimensions: [dimension.customer-age]
+  - id: SQ-07
+    question: Card fraud rate by card type
+    expected:
+      metrics: [metric.card-fraud-rate]
+      dimensions: [dimension.card-type]
+  - id: SQ-08
+    question: Card fraud rate by merchant category
+    expected:
+      metrics: [metric.card-fraud-rate]
+      dimensions: [dimension.merchant-category]
+  - id: SQ-09
+    question: Late payment rate by loan type
+    expected:
+      metrics: [metric.late-payment-rate]
+      dimensions: [dimension.loan-type]
+  - id: SQ-10
+    question: Non-performing loan rate by loan status
+    expected:
+      metrics: [metric.non-performing-loan-rate]
+      dimensions: [dimension.loan-status]
+  - id: SQ-11
+    question: Non-performing loan rate by branch
+    expected:
+      metrics: [metric.non-performing-loan-rate]
+      dimensions: [dimension.branch]
+  - id: SQ-12
+    question: Active customer rule
+    expected:
+      rules: [rule.active-customer]
+      entities: [entity.customer]
+  - id: SQ-13
+    question: Fraudulent card transaction rule
+    expected:
+      rules: [rule.fraudulent-card-transaction]
+      entities: [entity.card-transaction]
+  - id: SQ-14
+    question: Late loan payment rule
+    expected:
+      rules: [rule.late-loan-payment]
+      entities: [entity.loan-payment]
+  - id: SQ-15
+    question: Non-performing loan rule
+    expected:
+      rules: [rule.non-performing-loan]
+      entities: [entity.loan]
+  - id: SQ-16
+    question: Transaction direction rule
+    expected:
+      rules: [rule.transaction-direction]
+      entities: [entity.transaction]
+  - id: SQ-17
+    question: Relative time anchor rule
+    expected:
+      rules: [rule.relative-time-anchor]
+      dimensions: [dimension.transaction-date]
+  - id: SQ-18
+    question: Customer entity physical mapping
+    expected:
+      entities: [entity.customer]
+      tables: [table.customers]
+  - id: SQ-19
+    question: Account entity physical mapping
+    expected:
+      entities: [entity.account]
+      tables: [table.accounts]
+  - id: SQ-20
+    question: Card transaction entity physical mapping
+    expected:
+      entities: [entity.card-transaction]
+      tables: [table.card_transactions]
+  - id: SQ-21
+    question: Loan payment entity physical mapping
+    expected:
+      entities: [entity.loan-payment]
+      tables: [table.loan_payments]
+  - id: SQ-22
+    question: Support ticket entity physical mapping
+    expected:
+      entities: [entity.support-ticket]
+      tables: [table.support_tickets]
+  - id: SQ-23
+    question: Account customer relationship
+    expected:
+      relationships: [relationship.account_customer]
+      entities: [entity.account, entity.customer]
+  - id: SQ-24
+    question: Transaction account relationship
+    expected:
+      relationships: [relationship.transaction_account]
+      entities: [entity.transaction, entity.account]
+  - id: SQ-25
+    question: Card transaction card relationship
+    expected:
+      relationships: [relationship.card_transaction_card]
+      entities: [entity.card-transaction, entity.card]
+  - id: SQ-26
+    question: Loan payment loan relationship
+    expected:
+      relationships: [relationship.loan_payment_loan]
+      entities: [entity.loan-payment, entity.loan]
+  - id: SQ-27
+    question: Loan branch relationship
+    expected:
+      relationships: [relationship.loan_branch]
+      entities: [entity.loan, entity.branch]
+  - id: SQ-28
+    question: Employee branch relationship
+    expected:
+      relationships: [relationship.employee_branch]
+      entities: [entity.employee, entity.branch]
+  - id: SQ-29
+    question: Support ticket customer relationship
+    expected:
+      relationships: [relationship.support_ticket_customer]
+      entities: [entity.support-ticket, entity.customer]
+  - id: SQ-30
+    question: Sensitive banking data policy
+    expected:
+      tables: [table.customers, table.accounts]

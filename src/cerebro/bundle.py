@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .models import SemanticBundle, SemanticObject, ValidationIssue, ValidationReport
+from .semantic.validator import validate_profile_object
 from .upstream import OKFDocument, OKFDocumentError
 
 ALLOWED_CARDINALITIES = {"one-to-one", "one-to-many", "many-to-one", "many-to-many"}
@@ -24,9 +25,14 @@ class BundleLoader:
         if not root_path.exists():
             raise FileNotFoundError(f"OKF bundle not found: {root_path}")
         objects: list[SemanticObject] = []
+        okf_version: str | None = None
         for path in sorted(root_path.rglob("*.md")):
             try:
                 document = OKFDocument.parse(path.read_text(encoding="utf-8"))
+                if path.name in {"index.md", "log.md"}:
+                    if path == root_path / "index.md" and document.frontmatter.get("okf_version"):
+                        okf_version = str(document.frontmatter["okf_version"])
+                    continue
                 document.validate()
             except OKFDocumentError as exc:
                 raise BundleLoadError(f"{path}: {exc}") from exc
@@ -56,6 +62,8 @@ class BundleLoader:
             model=metadata.get("model"),
             source_mode=metadata.get("source_mode", "configured"),
             discovery_evidence=metadata.get("discovery_evidence", {}),
+            okf_version=okf_version or metadata.get("okf_version"),
+            semantic_profile_version=metadata.get("semantic_profile_version"),
         )
 
 
@@ -67,7 +75,7 @@ class BundleValidator:
             if obj.id in by_id:
                 issues.append(ValidationIssue(code="duplicate_id", message=f"Duplicate ID: {obj.id}", path=obj.path))
             by_id[obj.id] = obj
-        tables = {obj.id: obj for obj in bundle.objects if obj.type == "table"}
+        tables = {obj.id: obj for obj in bundle.objects if obj.profile_kind == "physical_table"}
         table_columns = {
             obj.id: {str(col.get("name")) for col in obj.cerebro.get("columns", [])}
             for obj in tables.values()
@@ -77,19 +85,20 @@ class BundleValidator:
             if classification not in ALLOWED_CLASSIFICATIONS:
                 issues.append(ValidationIssue(code="invalid_classification", message=f"{obj.id} has invalid classification {classification}", path=obj.path))
             provenance_origin = str(obj.provenance.get("origin", ""))
-            if provenance_origin not in ALLOWED_PROVENANCE:
+            if obj.provenance and provenance_origin not in ALLOWED_PROVENANCE:
                 issues.append(ValidationIssue(code="invalid_provenance", message=f"{obj.id} has invalid provenance origin {provenance_origin}", path=obj.path))
             for link in obj.links:
-                if link not in by_id:
+                if obj.profile_kind != "generic" and link not in by_id:
                     issues.append(ValidationIssue(code="dangling_link", message=f"{obj.id} links to missing {link}", path=obj.path))
-            if obj.type == "relationship":
+            if obj.profile_kind == "relationship":
                 self._validate_relationship(obj, tables, table_columns, issues)
-            if obj.type == "concept":
+            if obj.profile_kind == "legacy_concept":
                 self._validate_concept(obj, by_id, issues)
-            if obj.type == "metric":
+            if obj.profile_kind == "metric" and not obj.cerebro.get("measure"):
                 self._validate_metric(obj, by_id, issues)
-            if obj.type == "policy":
+            if obj.profile_kind == "policy":
                 self._validate_policy(obj, by_id, table_columns, issues)
+            issues.extend(validate_profile_object(obj, by_id, tables, table_columns))
         return ValidationReport(valid=not issues, document_count=len(bundle.objects), issues=issues)
 
     @staticmethod
@@ -118,7 +127,7 @@ class BundleValidator:
         issues: list[ValidationIssue],
     ) -> None:
         mappings = cls._validate_semantic_links(obj, "maps_to", obj.cerebro.get("maps_to", []), issues)
-        if not any(target in by_id and by_id[target].type == "table" for target in mappings):
+        if not any(target in by_id and by_id[target].profile_kind == "physical_table" for target in mappings):
             issues.append(
                 ValidationIssue(
                     code="missing_concept_table_mapping",
@@ -127,7 +136,7 @@ class BundleValidator:
                 )
             )
         for target in mappings:
-            if target not in by_id or by_id[target].type not in {"table", "metric"}:
+            if target not in by_id or by_id[target].profile_kind not in {"physical_table", "metric"}:
                 issues.append(
                     ValidationIssue(
                         code="invalid_concept_mapping_target",
@@ -144,15 +153,26 @@ class BundleValidator:
         issues: list[ValidationIssue],
     ) -> None:
         spec = obj.cerebro
-        source = str(spec.get("source_table", ""))
-        target = str(spec.get("target_table", ""))
-        cardinality = str(spec.get("cardinality", ""))
+        physical = spec.get("physical", {}) if isinstance(spec.get("physical"), dict) else {}
+        physical_source = physical.get("source", {}) if isinstance(physical.get("source"), dict) else {}
+        physical_target = physical.get("target", {}) if isinstance(physical.get("target"), dict) else {}
+        source = str(spec.get("source_table") or physical_source.get("table") or "")
+        target = str(spec.get("target_table") or physical_target.get("table") or "")
+        raw_cardinality = spec.get("cardinality", "")
+        cardinality = (
+            f"{raw_cardinality.get('source')}-to-{raw_cardinality.get('target')}"
+            if isinstance(raw_cardinality, dict)
+            else str(raw_cardinality)
+        )
         if source not in tables or target not in tables:
             issues.append(ValidationIssue(code="missing_endpoint", message=f"{obj.id} has missing relationship endpoint", path=obj.path))
         if cardinality not in ALLOWED_CARDINALITIES:
             issues.append(ValidationIssue(code="invalid_cardinality", message=f"{obj.id} has invalid cardinality {cardinality}", path=obj.path))
-        for table_id, field in ((source, "source_column"), (target, "target_column")):
-            column = str(spec.get(field, ""))
+        for table_id, field, binding in (
+            (source, "source_column", physical_source),
+            (target, "target_column", physical_target),
+        ):
+            column = str(spec.get(field) or binding.get("column") or "")
             if table_id in table_columns and column not in table_columns[table_id]:
                 issues.append(ValidationIssue(code="undeclared_join_column", message=f"{obj.id} references missing {table_id}.{column}", path=obj.path))
 
@@ -177,7 +197,7 @@ class BundleValidator:
         for dependency in dependencies:
             if dependency not in by_id:
                 issues.append(ValidationIssue(code="unresolved_metric_dependency", message=f"{obj.id} depends on missing {dependency}", path=obj.path))
-            elif by_id[dependency].type != "table":
+            elif by_id[dependency].profile_kind != "physical_table":
                 issues.append(
                     ValidationIssue(
                         code="invalid_metric_dependency_target",
@@ -215,7 +235,7 @@ class BundleValidator:
                 )
             )
         for target in targets:
-            if target not in by_id or by_id[target].type != "table":
+            if target not in by_id or by_id[target].profile_kind != "physical_table":
                 issues.append(
                     ValidationIssue(
                         code="invalid_policy_target",

@@ -1,28 +1,25 @@
 ---
-type: table
+type: Table
 id: table.card_transactions
-name: Card Transactions
+title: Card Transactions
 description: Card-level payment activity with fraud outcomes.
-status: active
-aliases:
-- card activity
-- card payments
-- fraud transactions
-tags:
-- banking
-- card_transactions
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.card_transaction_card
-- concept.card-fraud
-- concept.active-customer
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: card_transactions
   schema: main
   grain: one purchase or withdrawal event per card
   primary_key: card_txn_id
@@ -57,9 +54,8 @@ cerebro:
     nullable: true
     classification: internal
     provenance: discovered
-  warnings:
-  - Card-event grain differs from account transactions.
-  - Anchor relative time to MAX(txn_date).
+  warnings: []
+resource: duckdb://bank/main/card_transactions
 ---
 
 # Card Transactions

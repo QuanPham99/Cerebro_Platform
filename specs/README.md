@@ -2,7 +2,7 @@
 
 Status: Approved implementation baseline  
 Target: five-day hackathon prototype  
-Branch: `feature/okf-semantic-layer-sdd`
+Branch: `feature/upgrade_semantic_layer`
 
 These specifications are the contract for implementation. Production code must trace to a functional requirement and an acceptance test below.
 
@@ -18,6 +18,7 @@ These specifications are the contract for implementation. Production code must t
 8. [008 — OKF agents and governed database chat](008-okf-agents-and-governed-chat.md)
 9. [009 — Generation observability UI](009-generation-observability-ui.md)
 10. [010 — Database-only generation, review, and activation](010-database-only-review-activation.md)
+11. [011 — Cerebro Semantic Profile v0.1](011-semantic-profile-v0.1.md)
 
 ## Shared constraints
 
@@ -25,7 +26,7 @@ These specifications are the contract for implementation. Production code must t
 - The source DuckDB is opened read-only. No source rows are sampled, persisted, logged, or sent to an AI provider.
 - Discovered facts, declared facts, AI proposals, and reviewed facts retain distinct provenance.
 - The checked-in golden bundle is the default demo input and makes the demo independent of credentials.
-- Bounded semantic agents perform typed definition, relationship, and query-semantics stages; discovery, compilation, validation, and activation remain deterministic.
+- Bounded semantic agents perform typed inventory, relationship, and metric/rule stages; discovery, linking, compilation, validation, review, and activation remain deterministic.
 - Text-to-SQL execution is read-only, policy-gated, local DuckDB access as specified in 008.
 
 ## Compliance IDs

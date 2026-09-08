@@ -1,28 +1,25 @@
 ---
-type: table
+type: Table
 id: table.employees
-name: Employees
+title: Employees
 description: Employees assigned to branches, including Loan Officers.
-status: active
-aliases:
-- staff
-- loan officers
-- branch employees
-tags:
-- banking
-- employees
+status: stable
 links:
 - dataset.bank-workshop
 - relationship.employee_branch
-- concept.branch-performance
-- concept.bad-debt
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: restricted
+  physical:
+    schema: main
+    table: employees
   schema: main
   grain: one row per bank employee
   primary_key: employee_id
@@ -58,6 +55,7 @@ cerebro:
     classification: confidential
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/employees
 ---
 
 # Employees

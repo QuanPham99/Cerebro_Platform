@@ -1,13 +1,9 @@
 ---
-type: dataset
+type: Dataset
 id: dataset.bank-workshop
-name: Bank workshop dataset
-description: Synthetic retail banking reference dataset with ten related tables.
-status: active
-tags:
-- banking
-- duckdb
-- synthetic
+title: Bank Workshop Dataset
+description: Synthetic retail-banking reference dataset with ten related tables.
+status: stable
 links:
 - table.accounts
 - table.branches
@@ -19,17 +15,21 @@ links:
 - table.loans
 - table.support_tickets
 - table.transactions
-- policy.sensitive-banking-data
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
-  source: config/bank-source.yaml
+  source: docs/semantic-layer-definition.md
 cerebro:
+  kind: dataset
   classification: restricted
   table_count: 10
   column_count: 75
   row_sampling: disabled
 ---
 
-# Bank workshop dataset
+# Bank Workshop Dataset
 
-Catalog structure is discovered; keys, relationships, and business rules are declared and reviewed.
+Catalog structure is discovered; semantic definitions are reviewed.

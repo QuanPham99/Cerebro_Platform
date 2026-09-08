@@ -1,32 +1,31 @@
 questions:
   - id: GQ-01
     question: How many customers are there by gender?
-    required_ids: [concept.customer-demographics, table.customers]
+    required_ids: [metric.customer-count, dimension.customer-gender, table.customers]
   - id: GQ-02
     question: What is the average account balance by account type?
-    required_ids: [concept.account-balance, table.accounts]
+    required_ids: [metric.account-balance, dimension.account-type, table.accounts]
   - id: GQ-03
     question: How many open support tickets are there by issue type?
-    required_ids: [concept.support-workload, table.support_tickets]
+    required_ids: [entity.support-ticket, table.support_tickets]
   - id: GQ-04
     question: What percentage of card transactions are fraud?
-    required_ids: [concept.card-fraud, metric.card-fraud-rate, table.card_transactions]
+    required_ids: [metric.card-fraud-rate, table.card_transactions]
   - id: GQ-05
     question: What is total transaction amount by branch?
-    required_ids: [concept.branch-performance, table.transactions, table.accounts, table.branches, relationship.transaction_account, relationship.account_branch]
+    required_ids: [metric.transaction-volume, dimension.branch, table.transactions, table.accounts, table.branches, relationship.transaction_account, relationship.account_branch]
   - id: GQ-06
     question: What is the late payment rate by loan type?
-    required_ids: [concept.repayment-behavior, metric.late-payment-rate, table.loan_payments, table.loans, relationship.loan_payment_loan]
+    required_ids: [dimension.loan-type, metric.late-payment-rate, table.loan_payments, table.loans, relationship.loan_payment_loan]
   - id: GQ-07
     question: What is the fraud rate by card type?
-    required_ids: [concept.card-fraud, metric.card-fraud-rate, table.card_transactions, table.cards, relationship.card_transaction_card]
+    required_ids: [dimension.card-type, metric.card-fraud-rate, table.card_transactions, table.cards, relationship.card_transaction_card]
   - id: GQ-08
     question: What is monthly transaction growth for the last 24 months?
-    required_ids: [concept.transaction-activity, metric.transaction-volume, table.transactions]
+    required_ids: [dimension.transaction-date, metric.transaction-volume, table.transactions]
   - id: GQ-09
     question: Who are the top 5 percent most active customers combining account and card activity?
-    required_ids: [concept.active-customer, table.customers, table.transactions, table.card_transactions]
+    required_ids: [rule.active-customer, entity.customer, table.customers, table.transactions, table.card_transactions]
   - id: GQ-10
     question: Compare bad debt rate with Loan Officer headcount by branch.
-    required_ids: [concept.bad-debt, metric.non-performing-loan-rate, table.loans, table.employees, table.branches, relationship.loan_branch, relationship.employee_branch]
-
+    required_ids: [metric.non-performing-loan-rate, dimension.branch, table.loans, table.branches, relationship.loan_branch]

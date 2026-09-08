@@ -1,32 +1,28 @@
 ---
-type: table
+type: Table
 id: table.accounts
-name: Accounts
+title: Accounts
 description: Bank accounts owned by customers and serviced by branches.
-status: active
-aliases:
-- bank accounts
-- account balance
-tags:
-- banking
-- accounts
+status: stable
 links:
 - dataset.bank-workshop
-- relationship.account_customer
 - relationship.account_branch
-- relationship.transaction_account
+- relationship.account_customer
 - relationship.card_account
-- concept.account-balance
-- concept.branch-performance
-- concept.transaction-activity
-- concept.active-customer
-- policy.sensitive-banking-data
+- relationship.transaction_account
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: confidential
+  physical:
+    schema: main
+    table: accounts
   schema: main
   grain: one row per bank account
   primary_key: account_id
@@ -67,6 +63,7 @@ cerebro:
     classification: internal
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/accounts
 ---
 
 # Accounts

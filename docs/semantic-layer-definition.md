@@ -1,661 +1,297 @@
 # Cerebro Semantic Layer Definition
 
-> **Status:** Final prototype design baseline
+> **Status:** Implemented prototype contract
 >
-> **Scope:** PostgreSQL retail-banking semantic foundation grounded in Google OKF v0.2
+> **Format:** Google Open Knowledge Format v0.2 with Cerebro Semantic Profile v0.1
+>
+> **Scope:** The checked-in ten-table retail-banking DuckDB dataset
 
-## What a semantic layer is
+## Purpose
 
-A semantic layer is a governed translation between physical database structures and business language.
+Cerebro's semantic layer is a governed translation between business language and physical data. It records the entities people reason about, the dimensions used to group them, the metrics and rules used to analyze them, the relationships that connect them, and the physical tables and columns that support those meanings.
 
-A database can tell us that `transactions.amount` is a numeric column connected to an account through `account_id`. It does not inherently explain:
-
-- Whether the amount is signed or always positive.
-- How credits and debits should be interpreted.
-- Whether "customer" means a person, legal party, or account holder.
-- Which join path avoids duplicated transactions.
-- Whether a balance is current, end-of-day, or averaged.
-- Which fields contain personal or financial information.
-- Whether a definition was generated, reviewed, or is stale.
-
-The semantic layer records those meanings as an explicit contract:
+The runtime follows this direction:
 
 ```text
 Business question
-       |
-       v
-Business concepts and definitions
-       |
-       v
-Metrics, grain, dimensions, and policies
-       |
-       v
-Approved relationships and join paths
-       |
-       v
-Physical PostgreSQL tables and columns
+    -> metric, dimension, or business rule
+    -> owning entities and governed relationships
+    -> physical tables, columns, and join path
 ```
 
-For Cerebro, the semantic layer is not merely a graph visualization or a collection of AI-generated descriptions. It is versioned knowledge that tells an agent:
+This keeps table selection and join inference grounded in reviewed contracts. It also gives every selected object a stable identifier and source metadata that can be returned with grounding evidence.
 
-1. What the data means.
-2. Where that meaning exists physically.
-3. How the data can safely be joined.
-4. Which assumptions and restrictions apply.
-5. Why the information should be trusted.
-
-## What Google Open Knowledge Format provides
-
-Cerebro builds upon Google's maintained [Open Knowledge Format repository](https://github.com/GoogleCloudPlatform/open-knowledge-format) and the [OKF v0.2 specification](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md).
-
-An OKF bundle is a directory of Markdown documents with YAML frontmatter. Google OKF permits domain-specific directory structures, so Cerebro organizes the generated banking bundle as follows:
+## Architecture and ownership
 
 ```text
-knowledge/bank-demo/
-├── index.md
-├── datasets/
-│   ├── index.md
-│   └── retail_bank.md
-├── tables/
-│   ├── index.md
-│   ├── customers.md
-│   ├── accounts.md
-│   ├── account_holders.md
-│   └── transactions.md
-├── concepts/
-│   ├── index.md
-│   ├── customer.md
-│   ├── account.md
-│   └── transaction.md
-├── relationships/
-│   ├── index.md
-│   ├── customer_account_ownership.md
-│   └── account_transactions.md
-├── metrics/
-│   ├── index.md
-│   └── outgoing_transaction_volume.md
-└── policies/
-    ├── index.md
-    └── restricted_customer_data.md
+Catalog Scan
+    -> SemanticInventoryAgent
+    -> RelationshipAgent
+    -> MetricRuleAgent
+    -> Semantic Linker
+    -> OKF Compiler
+    -> Validator
+    -> Human Review
+    -> Activation
 ```
 
-The directory taxonomy is Cerebro's convention; the documents inside it remain valid OKF v0.2 concepts.
+The boundaries are deliberate:
 
-| Folder | Semantic purpose |
-| --- | --- |
-| `datasets/` | Data-source and schema-level knowledge |
-| `tables/` | Physical PostgreSQL tables, columns, keys, and grain |
-| `concepts/` | Business meanings independent of physical table names |
-| `relationships/` | Approved cardinalities and executable SQL join paths |
-| `metrics/` | Governed calculations, filters, grains, and aggregation rules |
-| `policies/` | Sensitivity classifications and usage restrictions |
+- `DuckDBSource` owns physical discovery and opens the database read-only.
+- The three agents are bounded provider wrappers. Each makes exactly one typed call from sanitized catalog metadata and cannot read source rows, compile documents, validate candidates, review, or activate.
+- Pydantic models constrain each proposal before compilation.
+- The linker derives graph edges from typed contracts.
+- The compiler writes a separate candidate bundle with `draft` objects.
+- The validator owns physical references, compatible types, links, keys, grain, relationship endpoints, and metric bindings.
+- A human owns business approval. Approval creates an immutable reviewed copy, promotes its documents to `stable`, and records the verifier.
+- Activation accepts only a validated approved copy whose content still matches its review digest.
 
-The bundle root is the progressive-disclosure entry point for people and agents:
+Generated output never updates the active semantic layer directly.
 
-```markdown
+## OKF and the Cerebro profile
+
+OKF supplies the portable Markdown and YAML envelope. Cerebro uses the namespaced `cerebro` block for executable semantic contracts.
+
+The root `index.md` contains the OKF version:
+
+```yaml
 ---
 okf_version: "0.2"
 ---
-
-# Retail Banking Knowledge Bundle
-
-Semantic knowledge generated from the `bank-demo` PostgreSQL source.
-
-## Contents
-
-- [Retail bank dataset](datasets/retail_bank.md)
-- [Physical tables](tables/index.md)
-- [Business concepts](concepts/index.md)
-- [Approved relationships](relationships/index.md)
-- [Metrics](metrics/index.md)
-- [Policies](policies/index.md)
 ```
 
-A simplified table concept could look like this:
+Nested `index.md` files are navigation documents without frontmatter. Semantic documents use normal OKF fields such as `type`, `id`, `title`, `description`, `status`, `links`, `sources`, `generated`, and `verified`.
 
-```markdown
----
-type: PostgreSQL Table
-title: Accounts
-resource: postgresql://bank/public/accounts
-status: stable
-tags: [retail-banking, accounts]
-generated:
-  by: cerebro/openai
-  at: 2026-08-26T10:00:00Z
-verified:
-  - by: human:reviewer
-    at: 2026-08-26T11:00:00Z
----
-
-# Accounts
-
-One row represents one retail banking account.
-
-An account can have multiple holders through
-[Account Ownership](/relationships/account_ownership.md).
-```
-
-Standard Markdown links create graph connections between concepts. OKF v0.2 also defines fields for provenance, verification, trust, freshness, and lifecycle while deliberately avoiding a prescribed database, retrieval engine, or agent runtime.
-
-The normal OKF frontmatter and Markdown body provide portability. Cerebro's additional `cerebro` frontmatter block provides deterministic SQL-grounding details while remaining compatible with the format.
-
-Google's reference implementation currently supplies:
-
-- An agent that produces OKF from BigQuery metadata.
-- Optional web-based enrichment.
-- OKF parsing and bundle generation.
-- Sample bundles and validation tests.
-- A Cytoscape-based static graph viewer.
-- Trust and freshness metadata handling.
-
-It does not supply:
-
-- A PostgreSQL semantic scanner.
-- A complete business semantic model.
-- Typed SQL join contracts.
-- Hybrid semantic retrieval.
-- A Text-to-SQL retrieval agent.
-- A review-and-publish web application.
-- A production knowledge-serving API.
-
-Cerebro adds these capabilities around the portable OKF contract.
-
-## Four-layer ownership: Google and Cerebro
-
-Google provides the OKF foundation and proof-of-concept production and visualization tools. It does not provide a complete four-layer semantic system.
-
-| Layer | Google currently provides | Cerebro must develop |
-| --- | --- | --- |
-| **1. Physical** | BigQuery source abstraction, metadata reading, concept listing, and optional row sampling | PostgreSQL scanning, normalized snapshots, and deterministic PK/FK extraction |
-| **2. Business concepts** | Gemini/Google ADK enrichment that writes general OKF documents from BigQuery metadata and optional web sources | Banking concepts, aliases, classifications, OpenAI integration, and human review |
-| **3. Query semantics** | Extensible OKF documents, Markdown links, provenance, trust, and lifecycle fields | Structured grain, dimensions, measures, join contracts, cardinalities, warnings, and validators |
-| **4. Retrieval** | Static Cytoscape viewer, basic title/ID/tag search, type filtering, and backlinks | Hybrid search, typed graph expansion, active versions, policy filtering, MCP tools, and grounding responses |
-
-### What Cerebro reuses directly
-
-- OKF v0.2 document and bundle conventions.
-- Markdown with YAML frontmatter.
-- Concept paths and progressive `index.md` navigation.
-- Standard provenance, generation, verification, trust, freshness, and lifecycle fields.
-- Bundle parsing, writing, path handling, and relevant validation tests.
-- Markdown-link graph extraction and Cytoscape viewer concepts.
-- Example bundles as conformance and visualization references.
-
-### What Cerebro adapts
-
-- Replace the BigQuery source with a normalized PostgreSQL scanner.
-- Replace Google-specific model invocation with a provider-neutral interface whose first adapter uses the OpenAI Responses API.
-- Replace general enrichment prompts with retail-banking semantic instructions.
-- Disable row sampling and web enrichment for the metadata-only prototype.
-- Replace the static viewer with a React-based graph review workspace.
-- Preserve standard OKF fields while adding the namespaced `cerebro` query-semantics contract.
-
-### What Cerebro builds as new functionality
-
-- PostgreSQL schema snapshots and physical metadata models.
-- Banking concept, classification, relationship, and metric proposal schemas.
-- Deterministic physical-reference, grain, join, and link validation.
-- Human review, editing, approval, rejection, and publication.
-- Full-text, vector, and typed-graph retrieval projections.
-- MCP tools that return Text-to-SQL grounding packages.
-- Golden banking questions for retrieval evaluation.
-
-The implementation boundary is:
-
-```text
-Google
-  OKF format
-  + BigQuery/Gemini reference producer
-  + static graph viewer
-
-Cerebro
-  PostgreSQL ingestion
-  + banking business semantics
-  + deterministic query contracts
-  + human review
-  + hybrid retrieval
-  + MCP grounding
-```
-
-## How Cerebro maps the semantic layer
-
-Cerebro maps knowledge through four connected levels.
-
-### 1. Physical layer
-
-The physical layer is discovered deterministically from PostgreSQL:
-
-```text
-public.customers
-  customer_id UUID PK
-  full_name TEXT
-  date_of_birth DATE
-  risk_rating TEXT
-
-public.accounts
-  account_id UUID PK
-  product_code TEXT
-  current_balance NUMERIC
-
-public.account_holders
-  customer_id UUID FK -> customers.customer_id
-  account_id UUID FK -> accounts.account_id
-
-public.transactions
-  transaction_id UUID PK
-  account_id UUID FK -> accounts.account_id
-  amount NUMERIC
-  direction TEXT
-  booked_at TIMESTAMP
-```
-
-The scanner records database identifiers, data types, primary keys, foreign keys, constraints, and comments. An LLM is not allowed to invent this technical metadata.
-
-### 2. Business concept layer
-
-The enrichment model proposes mappings between physical objects and business ideas:
-
-| Business concept | Physical mapping | Meaning |
-| --- | --- | --- |
-| Customer | `customers` | A retail banking party recognized by the bank |
-| Account | `accounts` | A deposit or transactional account |
-| Account holder | `account_holders` | Association between customers and accounts |
-| Transaction | `transactions` | A booked movement affecting one account |
-
-These mappings remain proposals until reviewed and approved by a person.
-
-### 3. Query semantics layer
-
-Text-to-SQL requires more deterministic structure than ordinary Markdown links. Cerebro keeps each document valid OKF and adds a namespaced `cerebro` frontmatter block:
+The bundle manifest declares the profile independently:
 
 ```yaml
-cerebro:
-  physical:
-    source: bank-demo
-    schema: public
-    table: transactions
-    snapshot: snapshot-2026-08-26
-
-  grain:
-    description: One row per booked account transaction
-    key:
-      - transaction_id
-
-  dimensions:
-    - column: booked_at
-      semantic_type: booking_timestamp
-    - column: direction
-      semantic_type: transaction_direction
-
-  measures:
-    - column: amount
-      aggregation: sum
-      currency_column: currency_code
-
-  relationships:
-    - target: tables/accounts
-      type: many_to_one
-      join:
-        - from: account_id
-          to: account_id
-      approved: true
-
-  classifications:
-    - target: account_id
-      sensitivity: financial_identifier
-
-  guidance:
-    - Treat credits and debits according to the direction column.
-    - Do not join customers directly to transactions.
+name: bank-workshop
+version: 0.2.0
+okf_version: "0.2"
+semantic_profile_version: "0.1"
+review_state: approved
 ```
 
-This produces a governed join path:
+`cerebro.kind` selects the profile contract. The loader also normalizes legacy documents:
+
+- `table` becomes `physical_table` internally.
+- `concept` becomes `legacy_concept` internally.
+- `name` supplies `title` when needed.
+- `active` is accepted as the legacy form of `stable`.
+- Unknown OKF types and fields remain available rather than being discarded.
+
+## Bundle structure
 
 ```text
-Customer
-   `-- account_holders
-          `-- Account
-                 `-- Transaction
+knowledge/bank-workshop/
+├── index.md
+├── bundle.yaml
+├── datasets/
+├── tables/
+├── entities/
+├── dimensions/
+├── metrics/
+├── rules/
+├── relationships/
+└── policies/
 ```
 
-It prevents a query agent from inventing invalid joins such as:
+The reviewed golden bundle contains:
 
-```sql
-customers.customer_id = transactions.account_id
-```
+| Kind | Count | Purpose |
+| --- | ---: | --- |
+| Dataset | 1 | Groups the physical catalog |
+| Physical table | 10 | Records 75 discovered columns and table grain |
+| Entity | 10 | Defines business objects and their physical identity |
+| Dimension | 11 | Defines governed grouping attributes |
+| Metric | 6 | Defines aggregate and ratio measures |
+| Business rule | 6 | Defines predicates, classifications, direction, and time behavior |
+| Relationship | 11 | Connects semantic entities and physical join endpoints |
+| Policy | 1 | Defines handling for sensitive banking data |
 
-The mapping can also warn that joint accounts may cause one transaction to be attributed to multiple customers.
+Physical table documents contain catalog facts and relationship membership. They do not carry reverse backlinks for every semantic object; the linker derives semantic edges from the objects that own those mappings.
 
-#### Business concept example
+## Profile contracts
 
-`concepts/customer.md` separates the business meaning of a customer from the physical `customers` table:
+### Entity
 
-```markdown
----
-type: Business Concept
+An entity has one primary physical table, one or more key columns, and a typed grain.
+
+```yaml
+type: Entity
+id: entity.customer
 title: Customer
-description: A retail banking party recognized by the bank.
 status: stable
-tags: [retail-banking, party, customer]
-generated:
-  by: cerebro/openai
-  at: 2026-08-26T10:00:00Z
-verified:
-  - by: human:reviewer
-    at: 2026-08-26T11:00:00Z
-
+links: [table.customers]
 cerebro:
-  mappings:
-    primary:
-      table: tables/customers
-      key: [customer_id]
-
-  aliases:
-    - client
-    - account holder
-    - retail customer
-
-  classifications:
-    - target: full_name
-      sensitivity: pii
-    - target: date_of_birth
-      sensitivity: restricted
-
-  relationships:
-    - target: concepts/account
-      via: relationships/customer_account_ownership
-      type: many_to_many
----
-
-# Customer
-
-A customer is an individual retail-banking party.
-
-A customer can hold multiple [Accounts](/concepts/account.md), and an account
-can be jointly held by multiple customers.
-
-The approved connection is described by
-[Customer Account Ownership](/relationships/customer_account_ownership.md).
+  kind: entity
+  classification: restricted
+  physical_mapping:
+    table: table.customers
+    key: [customer_id]
+  grain:
+    type: entity
+    description: one row per bank customer
+    key: [customer_id]
 ```
 
-This separation allows a business concept to map to multiple physical sources in a future version without changing how users ask questions.
+### Dimension
 
-#### Approved relationship example
+A dimension belongs to an entity and binds to one or more real columns. It declares its semantic type and compatible metrics.
 
-`relationships/customer_account_ownership.md` converts a graph connection into an executable and reviewable join contract:
-
-```markdown
----
-type: Semantic Relationship
-title: Customer Account Ownership
-description: Approved relationship connecting customers to their accounts.
-status: stable
-tags: [ownership, approved-join]
-
+```yaml
+type: Dimension
+id: dimension.transaction-channel
+title: Transaction Channel
+links: [entity.transaction, metric.transaction-volume, table.transactions]
 cerebro:
-  source: tables/customers
-  target: tables/accounts
-  cardinality: many_to_many
-
-  bridge:
-    table: tables/account_holders
-
-  joins:
-    - left:
-        table: customers
-        column: customer_id
-      right:
-        table: account_holders
-        column: customer_id
-
-    - left:
-        table: account_holders
-        column: account_id
-      right:
-        table: accounts
-        column: account_id
-
-  warnings:
-    - Joint accounts can cause one transaction to be attributed to multiple customers.
----
-
-# Customer Account Ownership
-
-Customers and accounts have a many-to-many relationship through the
-[Account Holders table](/tables/account_holders.md).
+  kind: dimension
+  entity: entity.transaction
+  physical_mappings:
+    - table: table.transactions
+      column: channel
+  semantic_type: categorical
+  compatible_metrics: [metric.transaction-volume]
 ```
 
-#### Simple metric example
+Derived dimensions include a deterministic derivation description. The customer-age dimension, for example, defines completed years from `date_of_birth` at the relevant maximum available date.
 
-`metrics/outgoing_transaction_volume.md` demonstrates how a governed calculation links business language to query behavior:
+### Metric
 
-```markdown
----
+A metric belongs to an entity and stores a typed measure tree. Aggregate measures support `count`, `count_distinct`, `sum`, `avg`, `min`, and `max`. Ratio measures contain typed numerator and denominator aggregates plus a scale. Column bindings and predicates must resolve to the catalog.
+
+```yaml
 type: Metric
-title: Outgoing Transaction Volume
-description: Total value of booked debit transactions.
-status: stable
-tags: [transaction, debit, volume]
-
+id: metric.card-fraud-rate
+title: Card Fraud Rate
 cerebro:
-  source: tables/transactions
-  expression: SUM(transactions.amount)
-  grain: Query-dependent
-  filter:
-    column: transactions.direction
-    operator: equals
-    value: DEBIT
-  time_column: transactions.booked_at
-  allowed_dimensions:
-    - concepts/customer
-    - concepts/account
-  warnings:
-    - Customer-level grouping can duplicate values for jointly owned accounts.
----
-
-# Outgoing Transaction Volume
-
-The sum of transaction amounts where `direction = 'DEBIT'`.
-
-Use [Customer Account Ownership](/relationships/customer_account_ownership.md)
-when analyzing this metric by customer.
+  kind: metric
+  entity: entity.card-transaction
+  measure:
+    kind: ratio
+    numerator:
+      kind: aggregate
+      aggregation: count
+      predicates:
+        - source: {table: table.card_transactions, column: is_fraud}
+          operator: eq
+          value: 1
+    denominator:
+      kind: aggregate
+      aggregation: count
+      predicates: []
+    scale: 100
+  dependencies: [table.card_transactions]
+  compatible_dimensions:
+    - dimension.merchant-category
+    - dimension.card-type
+  grain:
+    type: aggregate
+    description: Requested compatible dimensions
 ```
 
-This is a simple demonstration metric. Complex metric authoring and validation remain outside the five-day prototype.
+The compiler derives a readable SQL expression from the typed measure. That expression is explanatory output; the typed measure remains the semantic source of truth.
 
-### 4. Retrieval layer
+The golden metrics are transaction volume, account balance, customer count, card fraud rate, late payment rate, and non-performing loan rate.
 
-Published OKF concepts are projected into three retrieval views:
+### Business rule
 
-- PostgreSQL full-text search for exact identifiers, aliases, and banking terminology.
-- pgvector embeddings for semantic similarity.
-- Typed graph edges for approved joins and connected business concepts.
+A business rule belongs to an entity and declares its rule kind, output type, dependencies, logic, and grain. Rules are definitions for later planning; they are not free-form instructions to execute.
 
-For the question:
+The golden rules define active customer behavior, fraudulent card transactions, late loan payments, non-performing loans, transaction direction, and the maximum-available-date anchor for relative time.
 
-> Which customers had the largest outgoing transaction volume?
+### Relationship
 
-Cerebro's MCP retrieval tool should return a grounding package similar to:
+A relationship stores semantic and physical views of the same governed connection:
 
-```json
-{
-  "semantic_version": "bank-2026-08-26-01",
-  "concepts": [
-    "concepts/customer",
-    "concepts/account",
-    "concepts/transaction"
-  ],
-  "tables": [
-    "tables/customers",
-    "tables/account_holders",
-    "tables/accounts",
-    "tables/transactions"
-  ],
-  "join_path": [
-    "customers.customer_id = account_holders.customer_id",
-    "account_holders.account_id = accounts.account_id",
-    "accounts.account_id = transactions.account_id"
-  ],
-  "filters": [
-    "transactions.direction = 'DEBIT'"
-  ],
-  "grain": "customer",
-  "warnings": [
-    "Joint accounts can attribute one transaction to multiple customers."
-  ],
-  "provenance": [
-    "snapshot-2026-08-26",
-    "human-reviewed"
-  ]
-}
+```yaml
+type: Relationship
+id: relationship.transaction_account
+cerebro:
+  kind: relationship
+  semantic:
+    from: entity.transaction
+    to: entity.account
+  physical:
+    source: {table: table.transactions, column: account_id}
+    target: {table: table.accounts, column: account_id}
+  cardinality: many-to-one
+  join_type:
+    default: left
+  validation:
+    target_unique: not_checked
+    source_fk_coverage: not_checked
+    fanout: not_checked
 ```
 
-The Text-to-SQL team consumes this grounding package and generates SQL from it. Its agent should not need to parse the whole knowledge graph or guess relationship meanings.
+Catalog constraints and reviewed declarations are allowed evidence. Source-row uniqueness, coverage, and fanout profiling are disabled, so those checks are explicitly stored as `not_checked`.
 
-## Agent allocation
+### Policy
 
-Cerebro should not create one agent for every layer. Layers 1 and 4 are deterministic system responsibilities; only Layers 2 and 3 require semantic judgment.
+Policies link handling rules to physical tables. The banking policy requires aggregate results and minimization of restricted fields. SQL enforcement remains in the guarded chat runtime; the policy object provides the reviewed semantic evidence for that enforcement.
 
-| Layer | Component | LLM agent? | Reason |
-| --- | --- | --- | --- |
-| Physical | `PostgreSQLScanner` | No | Database metadata is ground truth and must not be invented |
-| Business concepts | `SemanticEnrichmentAgent` | Yes | Definitions, aliases, and conceptual mappings require semantic judgment |
-| Query semantics | `SemanticEnrichmentAgent` plus `OKFValidator` | Partly | The agent proposes grain and guidance; deterministic code verifies physical claims |
-| Retrieval | `SemanticRetriever` and MCP server | No | Ranking, graph traversal, filtering, and response construction should be reproducible |
+## Bounded semantic generation
 
-For the prototype, one bounded semantic-enrichment workflow handles three structured stages:
+`SemanticEnricher` sanitizes the catalog snapshot once. The interactive Build smoke test invokes two structural agents in order:
 
-```text
-Stage 1: Business enrichment
-  concepts
-  definitions
-  aliases
-  table purpose
-  classifications
+1. **`SemanticInventoryAgent`** proposes entities, dimensions, aliases, classifications, table purposes, and reviewable policies.
+2. **`RelationshipAgent`** receives the inventory and proposes catalog-bounded physical endpoints plus optional entity endpoints, cardinality, confidence, and evidence.
+3. **`MetricRuleAgent`** remains an optional compatibility path, but is not invoked by the smoke test. Its stable `query_semantics` progress stage is reported as skipped because metrics and rules are authored after activation.
 
-Stage 2: Relationship enrichment
-  relationship purpose
-  cardinality and evidence
-  join guidance
-  ambiguity and fan-out warnings
+The externally visible progress identifiers remain `business_semantics`, `relationship_semantics`, and `query_semantics` for client compatibility. Events identify the responsible wrapper through `details.agent_id` values `semantic_inventory`, `relationship`, and `metric_rule`. The compilation stage remains `compile_okf` and is presented as **Link and compile OKF**.
 
-Stage 3: Query enrichment
-  grain
-  dimensions and measures
-  query guidance
-  metric and policy proposals
+When no model is configured, fallback generation emits only the discovered dataset, physical tables, and catalog or declared relationships. It does not invent entities, dimensions, metrics, rules, or policies. A configured smoke run may propose entities, dimensions, relationships, and policies, but still emits no metrics or business rules.
+
+## Post-activation definition authoring
+
+Metrics and business rules are governed semantic objects, but they are not guessed during the raw-database smoke test. Once a structural graph is approved and activated, the Definition composer lets a user describe one definition in natural language or start from a compact typed form. Natural-language translation receives approved graph metadata only and never source rows.
+
+Saving a definition forks the active bundle into an `authored` candidate revision. The form validates entity ownership, table and column bindings, dimensions, dependencies, measure structure, and rule logic before the draft graph is shown. The active graph and `bank-workshop` v0.2.0 golden graph are never mutated. The authored revision must be reviewed, copied immutably, and activated through the same explicit gates as a generated candidate.
+
+## Deterministic validation
+
+A candidate cannot reach review when it contains:
+
+- duplicate semantic IDs;
+- missing or incompatible semantic targets;
+- invented tables, columns, entity keys, metric bindings, or join endpoints;
+- invalid classifications, cardinalities, grain contracts, or relationship semantics;
+- links that disagree with the typed profile;
+- empty metric dependencies or rule logic;
+- policy targets outside the physical catalog.
+
+Generated candidates remain `draft` with `ai_proposed` provenance. Approval preserves that origin, records human verification on every reviewed document, promotes the reviewed copy to `stable`, and computes the review digest after promotion.
+
+## Progressive retrieval
+
+Grounding does not expand the complete graph. It performs three bounded steps:
+
+1. Rank typed semantic candidates with lexical retrieval, optional embeddings, and reciprocal-rank fusion.
+2. Select the best metric, dimension, rule, entity, relationship, or policy seeds for the question and follow only their declared mappings.
+3. Add the shortest governed relationship paths between the selected entities and then add the required physical tables and columns.
+
+The grounding response includes `entities`, `dimensions`, `metrics`, `rules`, legacy `concepts`, physical `tables`, `joins`, columns, grain, warnings, classifications, provenance, and ranking evidence. Existing HTTP routes and MCP tool names remain compatible.
+
+## Profile-aware graph projection
+
+The implemented graph projects entities, dimensions, metrics, business rules, policies, physical bindings, and governed relationships from the golden, active, generated-candidate, or authored-revision bundle. Backend `profile_kind` is the canonical presentation and filtering key; raw OKF `type` remains available in the inspector. Every graph uses one shared visual schema, including amber/yellow hexagons for metrics and green octagons for business rules. Canonical entity-to-entity semantic relationships carry direction and cardinality, while smaller relationship nodes preserve audit and source navigation. Physical joins retain source-to-target arrows plus explicit endpoint cardinality labels.
+
+The UI exposes All, Physical, Semantic, Metrics, and Governance layer presets, per-kind checkboxes, grouped keyboard navigation, search, focused-path fading, source links, and profile-specific inspection. The inspector also shows status, source records, generated metadata, verification records, provenance, and legacy `active` status as `stable`.
+
+## Evaluation
+
+`evaluation/semantic-questions.yaml` contains 30 typed semantic cases. Each case records expected objects by kind so metric, dimension, rule, entity, table, and relationship resolution can be assessed independently. `evaluation/golden-questions.yaml` retains ten earlier banking intents mapped to the new profile.
+
+`compare_semantic_oracle` reports the full precision and recall profile. `compare_structural_oracle` scores physical tables, entities, dimensions, relationships, and policies for smoke runs while explicitly marking metrics and business rules as deferred. Golden semantics are never included in generation prompts.
+
+Run the release checks with:
+
+```bash
+cerebro validate
+cerebro evaluate
+pytest -q
 ```
 
-The stages may use separate prompts, but they share one workflow and one structured output contract. The agent can propose semantics but cannot publish them directly.
+## Current boundary
 
-The complete control flow is:
-
-```text
-PostgreSQLScanner
-  deterministic metadata
-        |
-        v
-SchemaSnapshot
-        |
-        v
-SemanticEnrichmentAgent
-  proposes business and query semantics
-        |
-        v
-OKFValidator
-  verifies schema references, joins, links, and required fields
-        |
-        v
-Human reviewer
-  corrects and approves business meaning
-        |
-        v
-BundlePublisher
-  activates an immutable reviewed bundle
-        |
-        v
-SemanticRetriever + MCP
-  supplies grounding to the Text-to-SQL team
-```
-
-A future production version may split concept, relationship, metric, and policy enrichment into specialist agents. That split should follow semantic responsibilities and measured workflow needs rather than mirroring the four architectural layers.
-
-## Complete semantic mapping example
-
-The full interpretation of a business question can be traced from language to physical SQL inputs:
-
-```text
-Question:
-"Which customers had the largest outgoing transaction volume?"
-                         |
-                         v
-Metric:
-Outgoing Transaction Volume
-SUM(transactions.amount)
-WHERE direction = 'DEBIT'
-                         |
-                         v
-Business concepts:
-Customer -> Account -> Transaction
-                         |
-                         v
-Approved semantic relationship:
-Customer <-> Account through account_holders
-                         |
-                         v
-Physical join path:
-customers.customer_id
-    = account_holders.customer_id
-
-account_holders.account_id
-    = accounts.account_id
-
-accounts.account_id
-    = transactions.account_id
-                         |
-                         v
-Policy and warning:
-Customer PII is restricted.
-Joint ownership may duplicate transaction attribution.
-```
-
-The generated OKF bundle is therefore simultaneously:
-
-- A human-readable knowledge repository.
-- A machine-readable semantic contract.
-- A navigable knowledge graph.
-- A grounding source for Text-to-SQL agents.
-
-## Five-day prototype mapping
-
-The prototype proves one central claim:
-
-> A mock PostgreSQL banking schema can be transformed into reviewed, visual, machine-retrievable knowledge that reliably grounds a Text-to-SQL agent.
-
-```text
-PostgreSQL metadata
-        |
-        v
-Deterministic schema scan
-        |
-        v
-Technical OKF concepts
-        |
-        v
-OpenAI structured enrichment
-        |
-        v
-Business definitions and proposed semantics
-        |
-        v
-Human review and publication
-        |
-        v
-Full-text, vector, and typed-graph indexes
-        |
-        v
-MCP grounding context for Text-to-SQL
-```
-
-The five-day version focuses on tables, concepts, grain, joins, classifications, graph exploration, and retrieval. Complex metric authoring, schema-change automation, authentication, document crawling, and production governance remain later phases.
+Semantic query-planner decomposition, deterministic physical planning, SQL-architecture migration, and source-row relationship profiling remain separate follow-up work. The longer-term Text-to-SQL multi-agent topology is a target, not current builder behavior. The current runtime consumes the upgraded grounding contract while retaining its existing query-plan and SQL interfaces.

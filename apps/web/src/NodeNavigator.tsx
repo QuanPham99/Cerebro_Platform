@@ -1,15 +1,7 @@
-import type { GraphNode, NodeType } from './types'
+import { PROFILE_KINDS, PROFILE_PRESENTATION } from './profilePresentation'
+import type { GraphNode } from './types'
 
-export const nodeTypes: NodeType[] = ['dataset', 'table', 'concept', 'relationship', 'metric', 'policy']
-
-const typeLabels: Record<NodeType, string> = {
-  dataset: 'Datasets',
-  table: 'Tables',
-  concept: 'Concepts',
-  relationship: 'Relationships',
-  metric: 'Metrics',
-  policy: 'Policies',
-}
+export const nodeTypes = PROFILE_KINDS
 
 interface NodeNavigatorProps {
   nodes: GraphNode[]
@@ -19,20 +11,20 @@ interface NodeNavigatorProps {
 }
 
 export function NodeNavigator({ nodes, visibleIds, selectedId, onSelect }: NodeNavigatorProps) {
-  const groups = nodeTypes
-    .map((type) => ({
-      type,
-      label: typeLabels[type],
-      nodes: nodes.filter((node) => node.type === type && visibleIds.has(node.id)),
+  const groups = PROFILE_KINDS
+    .map((kind) => ({
+      kind,
+      label: PROFILE_PRESENTATION[kind].plural,
+      nodes: nodes.filter((node) => node.profile_kind === kind && visibleIds.has(node.id)),
     }))
     .filter((group) => group.nodes.length > 0)
 
   return (
     <nav className="node-navigator" aria-label="Visible semantic objects">
       {groups.map((group) => (
-        <details className="navigator-group" key={group.type} open>
+        <details className="navigator-group" key={group.kind} open>
           <summary>
-            <span className={`type-symbol ${group.type}`} aria-hidden="true" />
+            <span className={`type-symbol ${group.kind}`} aria-hidden="true" />
             <strong>{group.label}</strong>
             <em>{group.nodes.length}</em>
             <span className="navigator-chevron" aria-hidden="true" />
@@ -45,7 +37,7 @@ export function NodeNavigator({ nodes, visibleIds, selectedId, onSelect }: NodeN
                   className={selectedId === node.id ? 'active' : ''}
                   onClick={() => onSelect(node.id)}
                 >
-                  <span className={`type-dot ${node.type}`} aria-hidden="true" />
+                  <span className={`type-dot ${node.profile_kind}`} aria-hidden="true" />
                   <span>{node.label}</span>
                 </button>
               </li>

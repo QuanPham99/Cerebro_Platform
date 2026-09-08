@@ -1,31 +1,50 @@
 ---
-type: relationship
+type: Relationship
 id: relationship.employee_branch
-name: Employee Branch
+title: Employee Branch
 description: Declared join from employees.branch_id to branches.branch_id.
-status: active
-tags:
-- join
-- physical-fk
+status: stable
 links:
-- table.employees
+- entity.branch
+- entity.employee
 - table.branches
+- table.employees
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
-  source: config/bank-source.yaml
-  database_constraint: false
+  source: docs/semantic-layer-definition.md
 cerebro:
+  kind: relationship
   classification: internal
   edge_type: physical_fk
+  semantic:
+    from: entity.employee
+    to: entity.branch
+  physical:
+    source:
+      table: table.employees
+      column: branch_id
+    target:
+      table: table.branches
+      column: branch_id
   source_table: table.employees
   source_column: branch_id
   target_table: table.branches
   target_column: branch_id
   cardinality: many-to-one
+  join_type:
+    default: left
+  validation:
+    target_unique: not_checked
+    source_fk_coverage: not_checked
+    fanout: not_checked
   warnings:
-  - Declared relationship; the source DuckDB does not define FK constraints.
+  - Declared relationship; source-row profiling is disabled.
 ---
 
 # Employee Branch
 
-Use an exact ID join with `many-to-one` cardinality.
+Use the declared `many-to-one` join.

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
     events: [], candidate: null, error: null, source_mode: 'database_only',
   }),
   getGenerationGraph: vi.fn().mockResolvedValue({ version: '0.1.0+candidate', nodes: [], edges: [] }),
+  getGenerationTrace: vi.fn().mockResolvedValue({ run_id: 'run-1', steps: [] }),
   getGenerationConcept: vi.fn(),
   reviewGeneration: vi.fn().mockResolvedValue({ decision: 'approve', reviewer: 'Data Owner' }),
   activateGeneration: vi.fn().mockResolvedValue({ path: '/reviewed/run-1', name: 'bank', version: '0.1.0+candidate' }),
@@ -46,15 +47,44 @@ class MockEventSource {
 vi.mock('./api', () => ({
   getGraph: vi.fn().mockResolvedValue({
     version: '0.1.0',
-    nodes: [],
+    nodes: [
+      { id: 'dataset.bank', type: 'Dataset', profile_kind: 'dataset', label: 'Bank', description: 'Bank dataset', classification: 'internal' },
+      { id: 'table.customers', type: 'Table', profile_kind: 'physical_table', label: 'Customers', description: 'Customer records', classification: 'restricted' },
+      { id: 'entity.customer', type: 'Entity', profile_kind: 'entity', label: 'Customer', description: 'Customer meaning', classification: 'restricted' },
+      { id: 'dimension.gender', type: 'Dimension', profile_kind: 'dimension', label: 'Gender', description: 'Gender dimension', classification: 'restricted' },
+      { id: 'rule.active', type: 'Business Rule', profile_kind: 'business_rule', label: 'Active customer', description: 'Activity rule', classification: 'restricted' },
+      { id: 'metric.count', type: 'Metric', profile_kind: 'metric', label: 'Customer count', description: 'Count metric', classification: 'restricted' },
+      { id: 'relationship.account-customer', type: 'Relationship', profile_kind: 'relationship', label: 'Account customer', description: 'Join', classification: 'internal' },
+      { id: 'policy.sensitive', type: 'Policy', profile_kind: 'policy', label: 'Sensitive data', description: 'Policy', classification: 'restricted' },
+      { id: 'concept.customer', type: 'Concept', profile_kind: 'legacy_concept', label: 'Legacy customer', description: 'Legacy meaning', classification: 'internal' },
+      { id: 'custom.note', type: 'Note', profile_kind: 'generic', label: 'Custom note', description: 'Other object', classification: 'internal' },
+    ],
+    edges: [],
+  }),
+  getGoldenGraph: vi.fn().mockResolvedValue({
+    version: '0.2.0',
+    nodes: [
+      { id: 'dataset.bank', type: 'Dataset', profile_kind: 'dataset', label: 'Bank', description: 'Bank dataset', classification: 'internal' },
+      { id: 'table.customers', type: 'Table', profile_kind: 'physical_table', label: 'Customers', description: 'Customer records', classification: 'restricted' },
+      { id: 'entity.customer', type: 'Entity', profile_kind: 'entity', label: 'Customer', description: 'Customer meaning', classification: 'restricted' },
+      { id: 'dimension.gender', type: 'Dimension', profile_kind: 'dimension', label: 'Gender', description: 'Gender dimension', classification: 'restricted' },
+      { id: 'rule.active', type: 'Business Rule', profile_kind: 'business_rule', label: 'Active customer', description: 'Activity rule', classification: 'restricted' },
+      { id: 'metric.count', type: 'Metric', profile_kind: 'metric', label: 'Customer count', description: 'Count metric', classification: 'restricted' },
+      { id: 'relationship.account-customer', type: 'Relationship', profile_kind: 'relationship', label: 'Account customer', description: 'Join', classification: 'internal' },
+      { id: 'policy.sensitive', type: 'Policy', profile_kind: 'policy', label: 'Sensitive data', description: 'Policy', classification: 'restricted' },
+      { id: 'concept.customer', type: 'Concept', profile_kind: 'legacy_concept', label: 'Legacy customer', description: 'Legacy meaning', classification: 'internal' },
+      { id: 'custom.note', type: 'Note', profile_kind: 'generic', label: 'Custom note', description: 'Other object', classification: 'internal' },
+    ],
     edges: [],
   }),
   getBundle: vi.fn().mockResolvedValue({
     name: 'Bank workshop',
-    version: '0.1.0',
+    version: '0.2.0',
     counts: {},
     generation_mode: 'reviewed',
   }),
+  getGoldenBundle: vi.fn().mockResolvedValue({ name: 'bank-workshop', version: '0.2.0', counts: {}, generation_mode: 'fallback', review_state: 'approved' }),
+  getGoldenObject: vi.fn(),
   getConcept: vi.fn(),
   getRuntimeStatus: vi.fn().mockResolvedValue({
     llm_configured: true,
@@ -75,29 +105,40 @@ vi.mock('./api', () => ({
     bundle: 'Bank workshop',
     semantic_version: '0.1.0',
     generation_mode: 'reviewed',
-    review_state: 'active',
+    review_state: 'approved',
     chat_ready: true,
   }),
   startGeneration: mocks.startGeneration,
   getGeneration: mocks.getGeneration,
+  getGenerationTrace: mocks.getGenerationTrace,
   getGenerationGraph: mocks.getGenerationGraph,
   getGenerationConcept: mocks.getGenerationConcept,
   generationEventsUrl: (runId: string) => `/api/generation/runs/${runId}/events`,
   reviewGeneration: mocks.reviewGeneration,
   activateGeneration: mocks.activateGeneration,
+  getDefinitionRevision: vi.fn(),
+  getDefinitionGraph: vi.fn(),
+  getDefinitionObject: vi.fn(),
+  getDefinitionContext: vi.fn().mockResolvedValue({ version: '0.1.0', entities: [], dimensions: [], tables: [] }),
+  translateDefinition: vi.fn(),
+  createDefinitionRevision: vi.fn(),
+  addDefinition: vi.fn(),
+  reviewDefinitionRevision: vi.fn(),
+  activateDefinitionRevision: vi.fn(),
   postChat: mocks.postChat,
 }))
 
 vi.mock('./GraphView', async () => {
   const React = await import('react')
   return {
-    GraphView: React.forwardRef(({ graph }: { graph: { version: string } }, _ref) => <div data-testid="graph-view">{graph.version}</div>),
-    GraphLegend: () => <div>Graph legend</div>,
+    GraphView: React.forwardRef(({ graph, visibleIds }: { graph: { version: string }; visibleIds: Set<string> }, _ref) => <div data-testid="graph-view"><span>{graph.version}</span><span data-testid="visible-ids">{[...visibleIds].join(' ')}</span></div>),
+    GraphLegend: () => <div aria-label="Graph edge legend">Graph legend</div>,
   }
 })
 
 beforeEach(() => {
   eventSource = null
+  window.sessionStorage.clear()
   vi.stubGlobal('EventSource', MockEventSource)
 })
 
@@ -108,6 +149,31 @@ afterEach(() => {
 })
 
 describe('workspace navigation', () => {
+  it('filters canonical profile kinds with presets, checkboxes, search, and reset', async () => {
+    render(<App />)
+    expect(await screen.findByTestId('visible-ids')).toHaveTextContent('custom.note')
+    const legend = screen.getByLabelText('Graph edge legend')
+    expect(legend.closest('.canvas-wrap')).not.toBeNull()
+    expect(legend.closest('.discovery-rail')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Semantic' }))
+    expect(screen.getByTestId('visible-ids')).toHaveTextContent('entity.customer')
+    expect(screen.getByTestId('visible-ids')).toHaveTextContent('dimension.gender')
+    expect(screen.getByTestId('visible-ids')).not.toHaveTextContent('metric.count')
+    expect(screen.getByTestId('visible-ids')).not.toHaveTextContent('table.customers')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Relationship/ }))
+    expect(screen.getByTestId('visible-ids')).not.toHaveTextContent('relationship.account-customer')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search semantic objects' }), { target: { value: 'gender' } })
+    expect(screen.getByTestId('visible-ids')).toHaveTextContent('dimension.gender')
+    expect(screen.getByTestId('visible-ids')).not.toHaveTextContent('entity.customer')
+
+    fireEvent.click(screen.getByTitle('Reset view'))
+    expect(screen.getByTestId('visible-ids')).toHaveTextContent('custom.note')
+    expect(screen.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true')
+  })
+
   it('switches workspaces and collapses and expands the left rail', async () => {
     render(<App />)
 
@@ -125,6 +191,20 @@ describe('workspace navigation', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Expand sidebar' }))
     expect(screen.getByRole('navigation', { name: 'Agent setup steps' })).toBeInTheDocument()
+  })
+
+  it('collapses the right details rail without moving the graph legend', async () => {
+    render(<App />)
+    expect(await screen.findByTestId('visible-ids')).toHaveTextContent('custom.note')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse details panel' }))
+    const expand = screen.getByRole('button', { name: 'Expand details panel' })
+    expect(expand.closest('.right-panel-slot')).toHaveClass('collapsed')
+    expect(expand.closest('.app-shell')).toHaveClass('right-panel-collapsed')
+    expect(screen.getByLabelText('Graph edge legend').closest('.canvas-wrap')).not.toBeNull()
+
+    fireEvent.click(expand)
+    expect(screen.getByRole('button', { name: 'Collapse details panel' }).closest('.right-panel-slot')).not.toHaveClass('collapsed')
   })
 
   it('submits a governed database question and renders SQL, results, and evidence', async () => {
@@ -146,12 +226,20 @@ describe('workspace navigation', () => {
   it('streams generation, records approval, activates separately, and previews the candidate', async () => {
     render(<App />)
 
-    fireEvent.click(await screen.findByTitle('Open candidate builder'))
-    expect(screen.getByRole('heading', { name: /Build meaning/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Generate candidate' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('radio', { name: /Database only/i }))
-    fireEvent.click(screen.getByRole('button', { name: 'Generate candidate' }))
+    const liveTab = await screen.findByRole('tab', { name: /bank-workshop/i })
+    const generationTab = screen.getByRole('tab', { name: /Semantic generation/i })
+    expect(liveTab).toHaveAttribute('aria-selected', 'true')
+    expect(generationTab).toHaveAttribute('aria-selected', 'false')
+
+    fireEvent.click(generationTab)
+    expect(generationTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('heading', { name: /Generate semantics from zero/i })).toBeInTheDocument()
+    expect(screen.queryByTestId('graph-view')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Graph edge legend')).not.toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /Raw DuckDB smoke test/i })).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: 'Run full pipeline' }))
     await waitFor(() => expect(mocks.startGeneration).toHaveBeenCalledWith('database_only'))
+    expect(window.sessionStorage.getItem('cerebro.semanticGenerationRunId')).toBe('run-1')
     await waitFor(() => expect(eventSource).not.toBeNull())
 
     const progress = {
@@ -161,17 +249,17 @@ describe('workspace navigation', () => {
       details: { tables: 10, columns: 75, declared_relationships: 11, row_sampling: 'disabled', rows_read: 0, config_loaded: false },
     }
     act(() => eventSource?.emit('progress', progress))
-    expect((await screen.findAllByText(progress.summary)).length).toBeGreaterThan(1)
-    const showDetails = screen.getByRole('button', { name: 'Show detailed generation process' })
-    expect(showDetails).toHaveAttribute('aria-expanded', 'false')
-    fireEvent.click(showDetails)
-    const executionLog = screen.getByRole('region', { name: 'Detailed generation process' })
-    expect(within(executionLog).getByText('Scan catalog')).toBeInTheDocument()
-    expect(executionLog).toHaveTextContent(/tables\s*10/)
-    expect(executionLog).toHaveTextContent('rows read')
-    expect(executionLog).toHaveTextContent('Waiting for the previous step to finish.')
-    fireEvent.click(screen.getByRole('button', { name: 'Hide detailed generation process' }))
-    expect(screen.queryByRole('region', { name: 'Detailed generation process' })).not.toBeInTheDocument()
+    expect(await screen.findByText(progress.summary)).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /Semantic generation: 1 \/ 8 stages/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.queryByTestId('graph-view')).not.toBeInTheDocument()
+
+    fireEvent.click(liveTab)
+    expect(liveTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('graph-view')).toHaveTextContent('0.2.0')
+    fireEvent.click(generationTab)
+    expect(await screen.findByText(progress.summary)).toBeInTheDocument()
+    expect(screen.queryByTestId('graph-view')).not.toBeInTheDocument()
+    fireEvent.click(liveTab)
 
     const completed = {
       id: 'run-1', status: 'succeeded', created_at: '2026-09-03T00:00:00Z', updated_at: '2026-09-03T00:00:02Z',
@@ -184,6 +272,12 @@ describe('workspace navigation', () => {
       },
     }
     act(() => eventSource?.emit('complete', completed))
+    await waitFor(() => expect(mocks.getGenerationGraph).toHaveBeenCalledWith('run-1'))
+    const readyTab = screen.getByRole('tab', { name: /Semantic generation: Candidate ready/i })
+    expect(readyTab).toHaveAttribute('aria-selected', 'false')
+    fireEvent.click(readyTab)
+    expect(await screen.findByTestId('graph-view')).toHaveTextContent('0.1.0+candidate')
+
     const approved = {
       ...completed,
       candidate: {
@@ -194,16 +288,54 @@ describe('workspace navigation', () => {
     }
     mocks.getGeneration.mockResolvedValue(approved)
     fireEvent.change(await screen.findByRole('textbox', { name: 'Reviewer name' }), { target: { value: 'Data Owner' } })
+    fireEvent.click(liveTab)
+    fireEvent.click(readyTab)
+    expect(screen.getByRole('textbox', { name: 'Reviewer name' })).toHaveValue('Data Owner')
     fireEvent.click(screen.getByRole('checkbox', { name: /acknowledge/i }))
     fireEvent.click(screen.getByRole('button', { name: 'Record approve' }))
     await waitFor(() => expect(mocks.reviewGeneration).toHaveBeenCalledWith('run-1', expect.objectContaining({ reviewer: 'Data Owner', acknowledge_ai_risk: true })))
     fireEvent.click(await screen.findByRole('button', { name: 'Activate reviewed bundle' }))
     await waitFor(() => expect(mocks.activateGeneration).toHaveBeenCalledWith('run-1'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Preview candidate graph' }))
+    expect(liveTab).toHaveAttribute('aria-selected', 'false')
+    expect(readyTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('graph-view')).toHaveTextContent('0.1.0')
+  })
 
-    expect(await screen.findByText('Candidate preview')).toBeInTheDocument()
-    expect(screen.getByTestId('graph-view')).toHaveTextContent('0.1.0+candidate')
-    expect(mocks.getGenerationGraph).toHaveBeenCalledWith('run-1')
-    expect(screen.getAllByRole('button', { name: /Return to active graph/i }).length).toBe(2)
+  it('restores a running generation and its sanitized trace after refresh', async () => {
+    const restoredRun = {
+      id: 'run-restored', status: 'running', created_at: '2026-09-03T00:00:00Z', updated_at: '2026-09-03T00:00:01Z',
+      events: [{
+        sequence: 1, stage: 'business_semantics', status: 'started', summary: 'Building semantic inventory.',
+        command: 'cerebro generate', timestamp: '2026-09-03T00:00:01Z', details: { agent_id: 'semantic_inventory' },
+      }],
+      candidate: null, error: null, source_mode: 'database_only',
+    }
+    mocks.getGeneration.mockResolvedValue(restoredRun)
+    mocks.getGenerationTrace.mockResolvedValue({
+      run_id: 'run-restored',
+      steps: [{
+        stage: 'business_semantics', actor: 'agent', agent_id: 'semantic_inventory', status: 'running',
+        started_at: '2026-09-03T00:00:01Z', completed_at: null, summary: 'Building semantic inventory.',
+        command: 'cerebro generate', input: { catalog: { tables: [{ name: 'accounts' }] } }, output: null, error: null,
+      }],
+    })
+    window.sessionStorage.setItem('cerebro.semanticGenerationRunId', 'run-restored')
+
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: 'Semantic inventory' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Input payload')).toHaveTextContent('accounts')
+    expect(screen.queryByTestId('graph-view')).not.toBeInTheDocument()
+    await waitFor(() => expect(eventSource?.url).toBe('/api/generation/runs/run-restored/events'))
+  })
+
+  it('keeps smoke generation database-only', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('tab', { name: /Semantic generation/i }))
+    expect(screen.queryByText('Advanced source mode')).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: /Configured/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /Raw DuckDB smoke test/i })).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: 'Run full pipeline' }))
+    await waitFor(() => expect(mocks.startGeneration).toHaveBeenCalledWith('database_only'))
   })
 })

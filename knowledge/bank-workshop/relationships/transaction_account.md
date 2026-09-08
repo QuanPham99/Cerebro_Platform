@@ -1,31 +1,50 @@
 ---
-type: relationship
+type: Relationship
 id: relationship.transaction_account
-name: Transaction Account
+title: Transaction Account
 description: Declared join from transactions.account_id to accounts.account_id.
-status: active
-tags:
-- join
-- physical-fk
+status: stable
 links:
-- table.transactions
+- entity.account
+- entity.transaction
 - table.accounts
+- table.transactions
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
-  source: config/bank-source.yaml
-  database_constraint: false
+  source: docs/semantic-layer-definition.md
 cerebro:
+  kind: relationship
   classification: internal
   edge_type: physical_fk
+  semantic:
+    from: entity.transaction
+    to: entity.account
+  physical:
+    source:
+      table: table.transactions
+      column: account_id
+    target:
+      table: table.accounts
+      column: account_id
   source_table: table.transactions
   source_column: account_id
   target_table: table.accounts
   target_column: account_id
   cardinality: many-to-one
+  join_type:
+    default: left
+  validation:
+    target_unique: not_checked
+    source_fk_coverage: not_checked
+    fanout: not_checked
   warnings:
-  - Declared relationship; the source DuckDB does not define FK constraints.
+  - Declared relationship; source-row profiling is disabled.
 ---
 
 # Transaction Account
 
-Use an exact ID join with `many-to-one` cardinality.
+Use the declared `many-to-one` join.

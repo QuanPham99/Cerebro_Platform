@@ -1,32 +1,60 @@
 ---
-type: metric
+type: Metric
 id: metric.late-payment-rate
-name: Late payment rate
-description: Percentage of loan payment events flagged late.
-status: active
-aliases:
-- late payments by loan type
-- payment delinquency rate
-tags:
-- metric
-- banking
-links: &id001
+title: Late Payment Rate
+description: Percentage of loan-payment events flagged late.
+status: stable
+links:
+- dimension.loan-type
+- entity.loan-payment
 - table.loan_payments
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
   source: docs/semantic-layer-definition.md
 cerebro:
+  kind: metric
   classification: confidential
-  dependencies: *id001
-  formula: 100.0 * SUM(loan_payments.late_payment_flag) / NULLIF(COUNT(*), 0)
+  entity: entity.loan-payment
+  measure:
+    kind: ratio
+    numerator:
+      kind: aggregate
+      aggregation: count
+      source: null
+      predicates:
+      - source:
+          table: table.loan_payments
+          column: late_payment_flag
+        operator: eq
+        value: 1
+    denominator:
+      kind: aggregate
+      aggregation: count
+      source: null
+      predicates: []
+    scale: 100.0
+  dependencies:
+  - table.loan_payments
+  formula: 100 * SUM(CASE WHEN loan_payments.late_payment_flag = 1 THEN 1 ELSE 0 END)
+    / NULLIF(COUNT(*), 0)
   filters: []
-  grain: aggregate over loan payment events
+  grain:
+    type: aggregate
+    description: Requested compatible dimensions
+  compatible_dimensions:
+  - dimension.loan-type
+  time_dimension: null
+  relative_time_anchor: null
   warnings:
-  - Join loans only after preserving payment-event denominator.
+  - Preserve payment-event denominator before joining loans.
 ---
 
-# Late payment rate
+# Late Payment Rate
 
-Percentage of loan payment events flagged late.
+Percentage of loan-payment events flagged late.
 
-Formula: `100.0 * SUM(loan_payments.late_payment_flag) / NULLIF(COUNT(*), 0)`
+Formula: `100 * SUM(CASE WHEN loan_payments.late_payment_flag = 1 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)`

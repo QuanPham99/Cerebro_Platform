@@ -7,7 +7,7 @@ dist/
 node_modules/
 apps/web/node_modules/
 apps/web/dist/
+*.tsbuildinfo
 .env
 artifacts/
 knowledge/generated/
-

@@ -1,30 +1,27 @@
 ---
-type: table
+type: Table
 id: table.cards
-name: Cards
+title: Cards
 description: Cards issued to customers and linked to bank accounts.
-status: active
-aliases:
-- payment cards
-- debit cards
-- credit cards
-tags:
-- banking
-- cards
+status: stable
 links:
 - dataset.bank-workshop
-- relationship.card_customer
 - relationship.card_account
+- relationship.card_customer
 - relationship.card_transaction_card
-- concept.card-fraud
-- concept.active-customer
-- policy.sensitive-banking-data
+sources:
+- id: duckdb-catalog
+  resource: DuckDB information_schema
+  title: DuckDB catalog metadata
 provenance:
-  origin: human_reviewed
-  catalog: DuckDB information_schema
-  semantics: config/bank-source.yaml
+  origin: discovered
+  source: DuckDB information_schema
 cerebro:
+  kind: physical_table
   classification: internal
+  physical:
+    schema: main
+    table: cards
   schema: main
   grain: one row per issued bank card
   primary_key: card_id
@@ -70,6 +67,7 @@ cerebro:
     classification: internal
     provenance: discovered
   warnings: []
+resource: duckdb://bank/main/cards
 ---
 
 # Cards

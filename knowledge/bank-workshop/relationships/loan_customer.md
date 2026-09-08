@@ -1,31 +1,50 @@
 ---
-type: relationship
+type: Relationship
 id: relationship.loan_customer
-name: Loan Customer
+title: Loan Customer
 description: Declared join from loans.customer_id to customers.customer_id.
-status: active
-tags:
-- join
-- physical-fk
+status: stable
 links:
-- table.loans
+- entity.customer
+- entity.loan
 - table.customers
+- table.loans
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
-  source: config/bank-source.yaml
-  database_constraint: false
+  source: docs/semantic-layer-definition.md
 cerebro:
+  kind: relationship
   classification: internal
   edge_type: physical_fk
+  semantic:
+    from: entity.loan
+    to: entity.customer
+  physical:
+    source:
+      table: table.loans
+      column: customer_id
+    target:
+      table: table.customers
+      column: customer_id
   source_table: table.loans
   source_column: customer_id
   target_table: table.customers
   target_column: customer_id
   cardinality: many-to-one
+  join_type:
+    default: left
+  validation:
+    target_unique: not_checked
+    source_fk_coverage: not_checked
+    fanout: not_checked
   warnings:
-  - Declared relationship; the source DuckDB does not define FK constraints.
+  - Declared relationship; source-row profiling is disabled.
 ---
 
 # Loan Customer
 
-Use an exact ID join with `many-to-one` cardinality.
+Use the declared `many-to-one` join.

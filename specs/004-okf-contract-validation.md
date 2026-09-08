@@ -16,17 +16,17 @@ Publish a Google-compatible OKF bundle with a small validated Cerebro extension 
 
 ## Functional Requirements
 
-- FR-301: Publish `knowledge/bank-workshop` with index, datasets, tables, concepts, relationships, metrics, and policies folders.
+- FR-301: Publish `knowledge/bank-workshop` with index, datasets, tables, entities, dimensions, relationships, metrics, rules, and policies folders.
 - FR-302: Every document contains valid upstream OKF frontmatter and stable identifiers.
 - FR-303: Validate Cerebro fields for grain, mappings, cardinality, join columns, metric formulas/filters, classification, warnings, and provenance.
 - FR-304: Reject dangling links, missing endpoints, undeclared join columns, invalid cardinality, and unresolved metric dependencies.
-- FR-305: Include transaction volume, card-fraud rate, late-payment rate, and non-performing-loan rate metrics.
+- FR-305: Include transaction volume, account balance, customer count, card-fraud rate, late-payment rate, and non-performing-loan rate metrics.
 - FR-306: Encode positive transaction amounts, inflow/outflow categories, distinct transaction grains, MAX-date anchoring, and restricted synthetic PII policies.
 - FR-307: Expose validation through `cerebro validate`.
 
 ## Acceptance Criteria
 
-- AC-301: Golden bundle contains all 10 tables, 11 physical relationships, required concepts/rules, and four metrics.
+- AC-301: Golden bundle contains 10 tables, 10 entities, 11 dimensions, 6 metrics, 6 rules, 11 relationships, and 1 policy.
 - AC-302: Upstream and Cerebro validators pass the golden bundle.
 - AC-303: One invalid fixture exists for every rejection class in FR-304.
 - AC-304: Internal OKF links resolve relative to the bundle root.

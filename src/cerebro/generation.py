@@ -13,7 +13,7 @@ from typing import Any, Protocol
 import yaml
 
 from .bundle import BundleLoader, BundleValidator
-from .enrichment import GenerationProvider, SemanticEnricher, StageCallback
+from .enrichment import GenerationProvider, SemanticEnricher, StageCallback, TraceCallback
 from .llm import GenerationOutputError
 from .models import (
     CatalogSnapshot,
@@ -24,6 +24,7 @@ from .models import (
     ValidationIssue,
 )
 from .paths import DEFAULT_CONFIG, ROOT
+from .semantic.compiler import canonical_object_id, metric_formula, normalize_reference
 from .settings import ACTIVE_BUNDLE_POINTER
 from .source import DuckDBSource
 from .upstream import OKFDocument
@@ -62,7 +63,24 @@ def _slug(value: str) -> str:
 
 
 def _stable_id(prefix: str, raw: str) -> str:
-    return raw if raw.startswith(f"{prefix}.") else f"{prefix}.{_slug(raw)}"
+    return canonical_object_id(prefix, raw)
+
+
+def _sanitize_trace_payload(value: Any, key: str = "") -> Any:
+    sensitive_keys = {"api_key", "credentials", "database_path", "prompt", "raw_response", "source_rows"}
+    if key.lower() in sensitive_keys:
+        return None
+    if isinstance(value, dict):
+        return {
+            item_key: _sanitize_trace_payload(item_value, item_key)
+            for item_key, item_value in value.items()
+            if item_key.lower() not in sensitive_keys
+        }
+    if isinstance(value, list):
+        return [_sanitize_trace_payload(item) for item in value]
+    if isinstance(value, str) and (value.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", value)):
+        return "[omitted]"
+    return value
 
 
 def _normalize_table_targets(
@@ -150,7 +168,19 @@ def _candidate_relationships(snapshot: CatalogSnapshot, proposal: SemanticPropos
         ):
             raise ValueError(f"Relationship {candidate.id} references an unknown table or column")
         key = (candidate.source_table, candidate.source_column, candidate.target_table, candidate.target_column)
-        candidates.setdefault(key, (candidate, "ai_proposed"))
+        if key in candidates:
+            physical, origin = candidates[key]
+            candidates[key] = (
+                physical.model_copy(update={
+                    "source_entity": candidate.source_entity,
+                    "target_entity": candidate.target_entity,
+                    "description": candidate.description or physical.description,
+                    "evidence": sorted(set([*physical.evidence, *candidate.evidence])),
+                }),
+                origin,
+            )
+        else:
+            candidates[key] = (candidate, "ai_proposed")
     return [candidates[key] for key in sorted(candidates)]
 
 
@@ -185,6 +215,8 @@ def compile_candidate_bundle(
         "row_sampling": snapshot.row_sampling,
         "source_mode": snapshot.source_mode,
         "discovery_evidence": snapshot.discovery_evidence,
+        "okf_version": "0.2",
+        "semantic_profile_version": "0.1",
     }
     (root / "bundle.yaml").write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
     safe_snapshot = snapshot.model_dump(mode="json")
@@ -192,7 +224,7 @@ def compile_candidate_bundle(
     (root / "snapshot.json").write_text(
         json.dumps(safe_snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    _write_doc(root / "index.md", {"type": "index", "name": f"{snapshot.source_name} candidate"}, f"# {snapshot.source_name}\n\nGenerated candidate bundle `{run_id}`.")
+    _write_doc(root / "index.md", {"okf_version": "0.2"}, f"# {snapshot.source_name}\n\nGenerated candidate bundle `{run_id}`.")
 
     relationship_entries = _candidate_relationships(snapshot, proposal)
     table_links: dict[str, set[str]] = {table.name: {f"dataset.{_slug(snapshot.source_name)}"} for table in snapshot.tables}
@@ -277,6 +309,178 @@ def compile_candidate_bundle(
             if table_name in table_links:
                 table_links[table_name].add(object_id)
 
+    entity_ids = {_stable_id("entity", raw.id) for raw in proposal.business.entities}
+    dimension_ids = {_stable_id("dimension", raw.id) for raw in proposal.business.dimensions}
+    structured_metric_ids = {_stable_id("metric", raw.id) for raw in proposal.query.structured_measures}
+    rule_ids = {_stable_id("rule", raw.id) for raw in proposal.query.rules}
+    for raw in proposal.business.entities:
+        register_id(_stable_id("entity", raw.id), "entities")
+    for raw in proposal.business.dimensions:
+        register_id(_stable_id("dimension", raw.id), "dimensions")
+    for raw in proposal.query.structured_measures:
+        register_id(_stable_id("metric", raw.id), "metrics")
+    for raw in proposal.query.rules:
+        register_id(_stable_id("rule", raw.id), "rules")
+
+    def reference_index(prefix: str, values: list[Any]) -> dict[str, str]:
+        index: dict[str, str] = {}
+        for raw in values:
+            value = str(raw.id).strip()
+            supplied_prefix, separator, suffix = value.partition(".")
+            unprefixed = suffix if separator and supplied_prefix.lower() == prefix else value
+            canonical = _stable_id(prefix, value)
+            for alias in {value, unprefixed, _slug(unprefixed), canonical}:
+                index[alias] = canonical
+        return index
+
+    entity_id_by_raw = reference_index("entity", proposal.business.entities)
+    dimension_id_by_raw = reference_index("dimension", proposal.business.dimensions)
+    metric_id_by_raw = reference_index("metric", proposal.query.structured_measures)
+    rule_id_by_raw = reference_index("rule", proposal.query.rules)
+
+    def semantic_ref(value: str) -> str:
+        if value in entity_id_by_raw:
+            return entity_id_by_raw[value]
+        if value in dimension_id_by_raw:
+            return dimension_id_by_raw[value]
+        if value in metric_id_by_raw:
+            return metric_id_by_raw[value]
+        if value in rule_id_by_raw:
+            return rule_id_by_raw[value]
+        if value in table_names:
+            return normalize_reference("physical_table", value)
+        prefix, separator, _suffix = value.partition(".")
+        if separator:
+            kind_by_prefix = {
+                "entity": "entity",
+                "dimension": "dimension",
+                "metric": "metric",
+                "rule": "business_rule",
+            }
+            if prefix.lower() in kind_by_prefix:
+                return normalize_reference(kind_by_prefix[prefix.lower()], value)
+        return value
+
+    metrics_by_dimension: dict[str, set[str]] = {}
+    for raw in proposal.query.structured_measures:
+        metric_id = _stable_id("metric", raw.id)
+        for value in raw.compatible_dimensions:
+            dimension_id = normalize_reference("dimension", value)
+            metrics_by_dimension.setdefault(dimension_id, set()).add(metric_id)
+
+    entities: list[dict[str, Any]] = []
+    for raw in proposal.business.entities:
+        object_id = _stable_id("entity", raw.id)
+        table = normalize_reference("physical_table", raw.physical_mapping.table)
+        if table.removeprefix("table.") not in table_names:
+            semantic_issues.append(ValidationIssue(
+                code="invalid_entity_table", message=f"{object_id} references unknown table {table}",
+                path=f"entities/{object_id.split('.', 1)[1]}.md",
+            ))
+        else:
+            columns = {column.name for column in next(item for item in snapshot.tables if item.name == table.removeprefix("table." )).columns}
+            for key in raw.physical_mapping.key:
+                if key not in columns:
+                    semantic_issues.append(ValidationIssue(
+                        code="invalid_entity_key", message=f"{object_id} references unknown key {table}.{key}",
+                        path=f"entities/{object_id.split('.', 1)[1]}.md",
+                    ))
+        entities.append({
+            **raw.model_dump(mode="json"), "id": object_id,
+            "physical_mapping": {"table": table, "key": raw.physical_mapping.key},
+        })
+
+    dimensions: list[dict[str, Any]] = []
+    for raw in proposal.business.dimensions:
+        object_id = _stable_id("dimension", raw.id)
+        entity = normalize_reference("entity", raw.entity)
+        if entity not in entity_ids:
+            semantic_issues.append(ValidationIssue(
+                code="invalid_dimension_entity", message=f"{object_id} references unknown entity {entity}",
+                path=f"dimensions/{object_id.split('.', 1)[1]}.md",
+            ))
+        bindings = []
+        for binding in raw.physical_mappings:
+            table = normalize_reference("physical_table", binding.table)
+            table_name = table.removeprefix("table.")
+            columns = {column.name for item in snapshot.tables if item.name == table_name for column in item.columns}
+            if table_name not in table_names or binding.column not in columns:
+                semantic_issues.append(ValidationIssue(
+                    code="invalid_dimension_binding",
+                    message=f"{object_id} references unknown column {table}.{binding.column}",
+                    path=f"dimensions/{object_id.split('.', 1)[1]}.md",
+                ))
+            bindings.append({"table": table, "column": binding.column})
+        compatible_metrics = sorted(metrics_by_dimension.get(object_id, set()))
+        proposed_metrics = {normalize_reference("metric", value) for value in raw.compatible_metrics}
+        unconfirmed_metrics = sorted(proposed_metrics - set(compatible_metrics))
+        warnings = list(raw.warnings)
+        if unconfirmed_metrics:
+            warnings.append(
+                "Semantic linker omitted unconfirmed metric compatibility: "
+                + ", ".join(unconfirmed_metrics)
+                + "."
+            )
+        dimensions.append({
+            **raw.model_dump(mode="json"), "id": object_id, "entity": entity,
+            "physical_mappings": bindings, "compatible_metrics": compatible_metrics,
+            "warnings": warnings,
+        })
+
+    structured_metrics: list[dict[str, Any]] = []
+    for raw in proposal.query.structured_measures:
+        object_id = _stable_id("metric", raw.id)
+        entity = normalize_reference("entity", raw.entity)
+        dependencies = [normalize_reference("physical_table", value) for value in raw.dependencies]
+        compatible_dimensions = [normalize_reference("dimension", value) for value in raw.compatible_dimensions]
+        time_dimension = normalize_reference("dimension", raw.time_dimension) if raw.time_dimension else None
+        if entity not in entity_ids:
+            semantic_issues.append(ValidationIssue(code="invalid_metric_entity", message=f"{object_id} references unknown entity {entity}", path=f"metrics/{object_id.split('.', 1)[1]}.md"))
+        for target in dependencies:
+            if target.removeprefix("table.") not in table_names:
+                semantic_issues.append(ValidationIssue(code="invalid_metric_dependency_target", message=f"{object_id} references unknown table {target}", path=f"metrics/{object_id.split('.', 1)[1]}.md"))
+        for target in compatible_dimensions + ([time_dimension] if time_dimension else []):
+            if target not in dimension_ids:
+                semantic_issues.append(ValidationIssue(code="invalid_metric_dimension", message=f"{object_id} references unknown dimension {target}", path=f"metrics/{object_id.split('.', 1)[1]}.md"))
+        measure = raw.measure.model_dump(mode="json")
+        for term in ([measure] if measure["kind"] == "aggregate" else [measure["numerator"], measure["denominator"]]):
+            candidates = ([term.get("source")] if term.get("source") else []) + [item.get("source") for item in term.get("predicates", [])]
+            for binding in candidates:
+                if not binding:
+                    continue
+                binding["table"] = normalize_reference("physical_table", str(binding["table"]))
+                table_name = str(binding["table"]).removeprefix("table.")
+                columns = {column.name for item in snapshot.tables if item.name == table_name for column in item.columns}
+                if table_name not in table_names or binding["column"] not in columns:
+                    semantic_issues.append(ValidationIssue(code="invalid_metric_binding", message=f"{object_id} references unknown column {binding['table']}.{binding['column']}", path=f"metrics/{object_id.split('.', 1)[1]}.md"))
+        structured_metrics.append({
+            **raw.model_dump(mode="json"), "id": object_id, "entity": entity,
+            "dependencies": dependencies, "compatible_dimensions": compatible_dimensions,
+            "time_dimension": time_dimension, "measure": measure,
+        })
+
+    rules: list[dict[str, Any]] = []
+    all_semantic_ids = entity_ids | dimension_ids | structured_metric_ids | rule_ids | {f"table.{name}" for name in table_names}
+    for raw in proposal.query.rules:
+        object_id = _stable_id("rule", raw.id)
+        entity = normalize_reference("entity", raw.entity)
+        dependencies = [semantic_ref(value) for value in raw.dependencies]
+        if entity not in entity_ids:
+            semantic_issues.append(ValidationIssue(code="invalid_rule_entity", message=f"{object_id} references unknown entity {entity}", path=f"rules/{object_id.split('.', 1)[1]}.md"))
+        for target in dependencies:
+            if target not in all_semantic_ids:
+                semantic_issues.append(ValidationIssue(code="invalid_rule_dependency", message=f"{object_id} references unknown target {target}", path=f"rules/{object_id.split('.', 1)[1]}.md"))
+        rules.append({**raw.model_dump(mode="json"), "id": object_id, "entity": entity, "dependencies": dependencies})
+
+    for relationship, _origin in relationship_entries:
+        for field, value in (("source_entity", relationship.source_entity), ("target_entity", relationship.target_entity)):
+            if value and normalize_reference("entity", value) not in entity_ids:
+                semantic_issues.append(ValidationIssue(
+                    code="invalid_relationship_entity",
+                    message=f"relationship.{_slug(relationship.id)} references unknown {field} {value}",
+                    path=f"relationships/{_slug(relationship.id)}.md",
+                ))
+
     policy_tables = []
     for table in snapshot.tables:
         if any(column.classification in {"restricted", "confidential"} for column in table.columns):
@@ -288,18 +492,23 @@ def compile_candidate_bundle(
     if semantic_issues:
         raise CandidateValidationError(semantic_issues)
 
+    generated = {"by": f"{proposal.provider}/{proposal.model}", "at": now.isoformat()}
+
     dataset_id = f"dataset.{_slug(snapshot.source_name)}"
     _write_doc(
         root / "datasets" / f"{_slug(snapshot.source_name)}.md",
         {
-            "type": "dataset",
+            "type": "Dataset",
             "id": dataset_id,
             "name": snapshot.source_name.replace("-", " ").title(),
+            "title": snapshot.source_name.replace("-", " ").title(),
             "description": "Catalog-only semantic candidate generated without source-row access.",
-            "status": "active",
+            "status": "draft",
             "links": [f"table.{table.name}" for table in snapshot.tables],
+            "sources": [{"id": "duckdb-catalog", "resource": "DuckDB catalog", "title": "DuckDB catalog metadata"}],
+            "generated": generated,
             "provenance": {"origin": "discovered", "source": "DuckDB catalog", "source_fingerprint": source_fingerprint},
-            "cerebro": {"classification": "internal", "schema": snapshot.schema_name},
+            "cerebro": {"kind": "dataset", "classification": "internal", "schema": snapshot.schema_name},
         },
         f"# {snapshot.source_name}\n\nGenerated from catalog metadata only.",
     )
@@ -312,20 +521,25 @@ def compile_candidate_bundle(
         _write_doc(
             root / "tables" / f"{table.name}.md",
             {
-                "type": "table",
+                "type": "Table",
                 "id": f"table.{table.name}",
                 "name": table.name.replace("_", " ").title(),
+                "title": table.name.replace("_", " ").title(),
                 "description": description,
-                "status": "active",
+                "status": "draft",
                 "aliases": table.aliases,
                 "links": sorted(table_links[table.name]),
+                "sources": [{"id": "duckdb-catalog", "resource": "DuckDB catalog", "title": "DuckDB catalog metadata"}],
+                "generated": generated,
                 "provenance": {
                     "origin": "ai_proposed" if table.name in proposal.business.table_purposes else "discovered",
                     "catalog": table.provenance["catalog"].source,
                     "semantics": proposal.provider if table.name in proposal.business.table_purposes else None,
                 },
                 "cerebro": {
+                    "kind": "physical_table",
                     "classification": classification,
+                    "physical": {"schema": table.schema_name, "table": table.name},
                     "schema": table.schema_name,
                     "grain": proposal.query.grains.get(table.name, table.grain),
                     "primary_key": table.primary_key,
@@ -337,17 +551,30 @@ def compile_candidate_bundle(
         )
     for relationship, origin in relationship_entries:
         object_id = _stable_id("relationship", relationship.id)
+        relationship_links = {
+            f"table.{relationship.source_table}",
+            f"table.{relationship.target_table}",
+        }
+        if relationship.source_entity and relationship.target_entity:
+            relationship_links.update({
+                normalize_reference("entity", relationship.source_entity),
+                normalize_reference("entity", relationship.target_entity),
+            })
         _write_doc(
             root / "relationships" / f"{object_id.split('.', 1)[1]}.md",
             {
-                "type": "relationship",
+                "type": "Relationship",
                 "id": object_id,
                 "name": object_id.split(".", 1)[1].replace("-", " ").replace("_", " ").title(),
+                "title": object_id.split(".", 1)[1].replace("-", " ").replace("_", " ").title(),
                 "description": relationship.description or f"Join {relationship.source_table} to {relationship.target_table}.",
-                "status": "active",
-                "links": [f"table.{relationship.source_table}", f"table.{relationship.target_table}"],
+                "status": "draft",
+                "links": sorted(relationship_links),
+                "sources": [{"resource": relationship.evidence[0] if relationship.evidence else "DuckDB catalog"}],
+                "generated": generated,
                 "provenance": {"origin": origin, "source": proposal.provider if origin == "ai_proposed" else (relationship.evidence[0] if relationship.evidence else "declared manifest")},
                 "cerebro": {
+                    "kind": "relationship",
                     "classification": "internal",
                     "edge_type": "physical_fk",
                     "source_table": f"table.{relationship.source_table}",
@@ -355,9 +582,26 @@ def compile_candidate_bundle(
                     "target_table": f"table.{relationship.target_table}",
                     "target_column": relationship.target_column,
                     "cardinality": relationship.cardinality,
+                    "physical": {
+                        "source": {"table": f"table.{relationship.source_table}", "column": relationship.source_column},
+                        "target": {"table": f"table.{relationship.target_table}", "column": relationship.target_column},
+                    },
+                    **({"semantic": {
+                        "from": normalize_reference("entity", relationship.source_entity),
+                        "to": normalize_reference("entity", relationship.target_entity),
+                    }} if relationship.source_entity and relationship.target_entity else {}),
+                    **({"semantic_provenance": "ai_proposed"} if relationship.source_entity and origin != "ai_proposed" else {}),
+                    "join_type": {"default": "left"},
+                    "validation": {"target_unique": "not_checked", "source_fk_coverage": "not_checked", "fanout": "not_checked"},
                     "confidence": relationship.confidence,
                     "evidence": relationship.evidence,
-                    "warnings": ["AI-proposed relationship; review before activation."] if origin == "ai_proposed" else [],
+                    "warnings": (
+                        ["AI-proposed relationship; review before activation."]
+                        if origin == "ai_proposed"
+                        else ["AI-proposed semantic endpoints; physical relationship is declared."]
+                        if relationship.source_entity and relationship.target_entity
+                        else []
+                    ),
                 },
             },
             f"# {object_id}\n\n{relationship.description or 'Generated relationship candidate.'}",
@@ -370,7 +614,8 @@ def compile_candidate_bundle(
             root / "concepts" / f"{object_id.split('.', 1)[1]}.md",
             {
                 "type": "concept", "id": object_id, "name": name, "description": description,
-                "status": "active", "aliases": concept.get("aliases", []), "links": concept["links"],
+                "status": "draft", "aliases": concept.get("aliases", []), "links": concept["links"],
+                "generated": generated,
                 "provenance": {"origin": "ai_proposed", "source": proposal.provider},
                 "cerebro": {"classification": concept.get("classification", "internal"), "maps_to": concept["links"]},
             },
@@ -384,7 +629,8 @@ def compile_candidate_bundle(
             root / "metrics" / f"{object_id.split('.', 1)[1]}.md",
             {
                 "type": "metric", "id": object_id, "name": name, "description": description,
-                "status": "active", "links": metric["dependencies"],
+                "status": "draft", "links": metric["dependencies"],
+                "generated": generated,
                 "provenance": {"origin": "ai_proposed", "source": proposal.provider},
                 "cerebro": {
                     "classification": metric.get("classification", "internal"),
@@ -403,7 +649,8 @@ def compile_candidate_bundle(
             root / "policies" / f"{object_id.split('.', 1)[1]}.md",
             {
                 "type": "policy", "id": object_id, "name": name, "description": description,
-                "status": "active", "links": policy["applies_to"],
+                "status": "draft", "links": policy["applies_to"],
+                "generated": generated,
                 "provenance": {"origin": "ai_proposed", "source": proposal.provider},
                 "cerebro": {
                     "classification": policy["classification"],
@@ -420,15 +667,77 @@ def compile_candidate_bundle(
             {
                 "type": "policy", "id": "policy.generated-data-handling", "name": "Generated data handling",
                 "description": "Restricted data is blocked and confidential data requires aggregation.",
-                "status": "active", "links": policy_tables,
+                "status": "draft", "links": policy_tables,
+                "generated": generated,
                 "provenance": {"origin": "derived", "source": "catalog classifications"},
                 "cerebro": {"classification": "restricted", "applies_to": policy_tables, "warnings": ["Never expose raw restricted fields."]},
             },
             "# Generated data handling\n\nRestricted fields must never be returned to a model.",
         )
-    for folder in ("datasets", "tables", "relationships", "concepts", "metrics", "policies"):
+    for entity in entities:
+        object_id = str(entity["id"])
+        table = str(entity["physical_mapping"]["table"])
+        links = [table]
+        _write_doc(root / "entities" / f"{object_id.split('.', 1)[1]}.md", {
+            "type": "Entity", "id": object_id, "name": entity["name"], "title": entity["name"],
+            "description": entity["description"], "status": "draft", "aliases": entity.get("aliases", []),
+            "links": links, "generated": generated,
+            "provenance": {"origin": "ai_proposed", "source": proposal.provider},
+            "cerebro": {
+                "kind": "entity", "classification": entity["classification"],
+                "physical_mapping": entity["physical_mapping"], "grain": entity["grain"],
+                "warnings": entity.get("warnings", []),
+            },
+        }, f"# {entity['name']}\n\n{entity['description']}")
+    for dimension in dimensions:
+        object_id = str(dimension["id"])
+        links = sorted({dimension["entity"], *[item["table"] for item in dimension["physical_mappings"]], *dimension["compatible_metrics"]})
+        _write_doc(root / "dimensions" / f"{object_id.split('.', 1)[1]}.md", {
+            "type": "Dimension", "id": object_id, "name": dimension["name"], "title": dimension["name"],
+            "description": dimension["description"], "status": "draft", "links": links,
+            "generated": generated, "provenance": {"origin": "ai_proposed", "source": proposal.provider},
+            "cerebro": {
+                "kind": "dimension", "classification": dimension["classification"],
+                "entity": dimension["entity"], "physical_mappings": dimension["physical_mappings"],
+                "semantic_type": dimension["semantic_type"], "derivation": dimension.get("derivation"),
+                "compatible_metrics": dimension["compatible_metrics"], "warnings": dimension.get("warnings", []),
+            },
+        }, f"# {dimension['name']}\n\n{dimension['description']}")
+    for metric in structured_metrics:
+        object_id = str(metric["id"])
+        links = sorted({metric["entity"], *metric["dependencies"], *metric["compatible_dimensions"], *([metric["time_dimension"]] if metric.get("time_dimension") else [])})
+        formula = metric_formula(metric["measure"])
+        _write_doc(root / "metrics" / f"{object_id.split('.', 1)[1]}.md", {
+            "type": "Metric", "id": object_id, "name": metric["name"], "title": metric["name"],
+            "description": metric["description"], "status": "draft", "links": links,
+            "generated": generated, "provenance": {"origin": "ai_proposed", "source": proposal.provider},
+            "cerebro": {
+                "kind": "metric", "classification": metric["classification"], "entity": metric["entity"],
+                "measure": metric["measure"], "dependencies": metric["dependencies"],
+                "formula": formula, "filters": [], "grain": metric["grain"],
+                "compatible_dimensions": metric["compatible_dimensions"],
+                "time_dimension": metric.get("time_dimension"),
+                "relative_time_anchor": metric.get("relative_time_anchor"),
+                "warnings": metric.get("warnings", []),
+            },
+        }, f"# {metric['name']}\n\n{metric['description']}\n\nFormula: `{formula}`")
+    for rule in rules:
+        object_id = str(rule["id"])
+        links = sorted({rule["entity"], *rule["dependencies"]})
+        _write_doc(root / "rules" / f"{object_id.split('.', 1)[1]}.md", {
+            "type": "Business Rule", "id": object_id, "name": rule["name"], "title": rule["name"],
+            "description": rule["description"], "status": "draft", "links": links,
+            "generated": generated, "provenance": {"origin": "ai_proposed", "source": proposal.provider},
+            "cerebro": {
+                "kind": "business_rule", "classification": rule["classification"], "entity": rule["entity"],
+                "rule_kind": rule["rule_kind"], "output_type": rule["output_type"],
+                "dependencies": rule["dependencies"], "logic": rule["logic"], "grain": rule["grain"],
+                "warnings": rule.get("warnings", []),
+            },
+        }, f"# {rule['name']}\n\n{rule['description']}\n\n{rule['logic']}")
+    for folder in ("datasets", "tables", "relationships", "concepts", "entities", "dimensions", "metrics", "rules", "policies"):
         if (root / folder).is_dir():
-            _write_doc(root / folder / "index.md", {"type": "index", "name": folder.title()}, f"# {folder.title()}")
+            (root / folder / "index.md").write_text(f"# {folder.title()}\n", encoding="utf-8")
     report = BundleValidator().validate(BundleLoader().load(root))
     if not report.valid:
         raise CandidateValidationError(report.issues)
@@ -449,9 +758,11 @@ def run_generation_workflow(
     output: Path | str | None = None,
     provider: GenerationProvider | None = None,
     on_stage: StageCallback | None = None,
+    on_trace: TraceCallback | None = None,
     source_mode: str = "configured",
     database_schema: str | None = None,
     documentation_agent: DocumentationEnrichmentAgent | None = None,
+    include_query_semantics: bool = True,
 ) -> GenerationResult:
     if source_mode not in {"configured", "database_only"}:
         raise ValueError("source_mode must be configured or database_only")
@@ -463,7 +774,30 @@ def run_generation_workflow(
         if on_stage:
             on_stage(stage, status, summary, details or {})
 
+    def trace(
+        stage: str,
+        status: str,
+        input_payload: dict[str, Any] | None = None,
+        output_payload: dict[str, Any] | None = None,
+    ) -> None:
+        if on_trace:
+            on_trace(
+                stage,
+                status,
+                _sanitize_trace_payload(input_payload) if input_payload is not None else None,
+                _sanitize_trace_payload(output_payload) if output_payload is not None else None,
+            )
+
     try:
+        trace(
+            "source_check",
+            "started",
+            {
+                "source_mode": source_mode,
+                "schema": database_schema or "configured default",
+                "access": "read-only DuckDB",
+            },
+        )
         emit("source_check", "started", f"Checking the {source_mode.replace('_', '-')} read-only DuckDB source.")
         source = DuckDBSource(
             config_path,
@@ -471,10 +805,21 @@ def run_generation_workflow(
             source_mode=source_mode,  # type: ignore[arg-type]
             schema=database_schema,
         )
+        trace("source_check", "completed", output_payload={"reachable": True, "access": "read-only"})
         emit("source_check", "completed", "The DuckDB source is reachable.")
 
+        trace(
+            "catalog_scan",
+            "started",
+            {"source_mode": source_mode, "read": "catalog metadata only", "rows_read": 0},
+        )
         emit("catalog_scan", "started", "Reading tables, columns, native comments, and supported catalog constraints.")
         snapshot = source.scan()
+        trace(
+            "catalog_scan",
+            "completed",
+            output_payload=snapshot.model_dump(mode="json", exclude={"database_path"}),
+        )
         emit(
             "catalog_scan",
             "completed",
@@ -489,15 +834,41 @@ def run_generation_workflow(
             },
         )
 
-        proposal = SemanticEnricher(provider).enrich(snapshot, on_stage=emit)
+        proposal = SemanticEnricher(provider).enrich(
+            snapshot,
+            on_stage=emit,
+            on_trace=trace,
+            include_query_semantics=include_query_semantics,
+        )
         if documentation_agent is not None:
             if source_mode == "database_only":
                 raise ValueError("Documentation enrichment is disabled in database-only mode")
             proposal = documentation_agent.enrich(snapshot, proposal)
 
-        emit("compile_okf", "started", "Compiling discovered facts and semantic proposals into OKF documents.")
+        trace("compile_okf", "started", proposal.model_dump(mode="json"))
+        emit("compile_okf", "started", "Linking semantic proposals and compiling OKF documents.")
         candidate_path = compile_candidate_bundle(snapshot, proposal, output)
         compiled = BundleLoader().load(candidate_path)
+        compiled_counts: dict[str, int] = {}
+        for obj in compiled.objects:
+            compiled_counts[obj.profile_kind] = compiled_counts.get(obj.profile_kind, 0) + 1
+        compiled_summary = {
+            "name": compiled.name,
+            "version": compiled.version,
+            "counts": compiled_counts,
+            "object_ids": [obj.id for obj in compiled.objects],
+            "review_state": compiled.review_state,
+            "empty_categories": [
+                kind for kind in ("metric", "business_rule") if compiled_counts.get(kind, 0) == 0
+            ],
+            "linker_warnings": sorted({
+                str(warning)
+                for obj in compiled.objects
+                for warning in obj.cerebro.get("warnings", [])
+                if str(warning).startswith("Semantic linker ")
+            }),
+        }
+        trace("compile_okf", "completed", output_payload=compiled_summary)
         emit(
             "compile_okf",
             "completed",
@@ -505,16 +876,20 @@ def run_generation_workflow(
             {"objects": len(compiled.objects)},
         )
 
+        trace("validate_candidate", "started", compiled_summary)
         emit("validate_candidate", "started", "Validating OKF documents, links, joins, metrics, and provenance.")
         report = BundleValidator().validate(compiled)
         if not report.valid:
             raise ValueError("Generated candidate did not pass semantic contract validation")
+        validation_output = {"valid": True, "objects": report.document_count, "issues": []}
+        trace("validate_candidate", "completed", output_payload=validation_output)
         emit(
             "validate_candidate",
             "completed",
             f"Validated {report.document_count} semantic objects with no contract errors.",
             {"objects": report.document_count, "issues": 0},
         )
+        trace("candidate_ready", "completed", validation_output, compiled_summary)
         emit(
             "candidate_ready",
             "completed",
@@ -523,12 +898,19 @@ def run_generation_workflow(
         )
         return GenerationResult(candidate_path, compiled, proposal, snapshot)
     except CandidateValidationError as exc:
+        trace(current_stage, "failed", output_payload={"error": exc.public_message, **exc.details})
         emit(current_stage, "failed", exc.public_message, exc.details)
         raise
     except GenerationOutputError as exc:
+        trace(
+            current_stage,
+            "failed",
+            output_payload={"error": exc.public_message, "schema": exc.schema_name},
+        )
         emit(current_stage, "failed", exc.public_message, {"schema": exc.schema_name})
         raise
     except Exception:
+        trace(current_stage, "failed", output_payload={"error": "This stage failed. Inspect the server log for details."})
         emit(current_stage, "failed", "This stage failed. Inspect the server or CLI log for details.")
         raise
 
@@ -559,6 +941,29 @@ def bundle_digest(bundle_path: Path | str) -> str:
 
 def _review_payload(record: ReviewRecord) -> dict[str, Any]:
     return record.model_dump(mode="json")
+
+
+def _review_actor(reviewer: str) -> str:
+    return f"human:{_slug(reviewer)}"
+
+
+def _promote_reviewed_documents(root: Path, reviewer: str, reviewed_at: str) -> None:
+    verification = {"by": _review_actor(reviewer), "at": reviewed_at}
+    for path in sorted(root.rglob("*.md")):
+        if path.name in {"index.md", "log.md"}:
+            continue
+        document = OKFDocument.parse(path.read_text(encoding="utf-8"))
+        frontmatter = dict(document.frontmatter)
+        frontmatter["status"] = "stable"
+        verified = frontmatter.get("verified", [])
+        if isinstance(verified, dict):
+            verified = [verified]
+        if not isinstance(verified, list):
+            verified = []
+        if verification not in verified:
+            verified.append(verification)
+        frontmatter["verified"] = verified
+        path.write_text(OKFDocument(frontmatter=frontmatter, body=document.body).serialize(), encoding="utf-8")
 
 
 def review_bundle(
@@ -613,6 +1018,7 @@ def review_bundle(
     reviewed_digest: str | None = None
 
     if decision == "approve":
+        reviewed_at = datetime.now(timezone.utc).isoformat()
         reviewed_parent = Path(reviewed_root).resolve()
         reviewed_parent.mkdir(parents=True, exist_ok=True)
         reviewed_path = reviewed_parent / run_id
@@ -632,6 +1038,7 @@ def review_bundle(
             metadata = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
             metadata["review_state"] = "approved"
             manifest_path.write_text(yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")
+            _promote_reviewed_documents(temporary, reviewer, reviewed_at)
             approved = BundleLoader().load(temporary)
             approved_report = BundleValidator().validate(approved)
             if not approved_report.valid:
@@ -643,7 +1050,7 @@ def review_bundle(
                 reviewer=reviewer,
                 comment=comment,
                 acknowledge_ai_risk=True,
-                reviewed_at=datetime.now(timezone.utc).isoformat(),
+                reviewed_at=reviewed_at,
                 candidate_digest=candidate_digest,
                 reviewed_bundle=str(reviewed_path),
                 reviewed_digest=reviewed_digest,

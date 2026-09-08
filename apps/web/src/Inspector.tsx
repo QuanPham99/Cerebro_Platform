@@ -1,52 +1,187 @@
 import { AlertTriangle, Braces, Database, ExternalLink, ShieldCheck } from 'lucide-react'
+import { PROFILE_PRESENTATION } from './profilePresentation'
 import type { SemanticObject } from './types'
 
 function values(value: unknown): string[] {
-  if (!value) return []
-  return Array.isArray(value) ? value.map((item) => (typeof item === 'string' ? item : JSON.stringify(item))) : [String(value)]
+  if (value === undefined || value === null || value === '') return []
+  return Array.isArray(value) ? value.map(formatValue) : [formatValue(value)]
 }
 
-export function Inspector({ object, loading, onBuild = () => {}, sourceBase = '/knowledge' }: { object: SemanticObject | null; loading: boolean; onBuild?: () => void; sourceBase?: string | null }) {
-  const tabs = <div className="side-panel-tabs" role="tablist" aria-label="Semantic side panel"><button className="active" role="tab" aria-selected="true">Inspect</button><button onClick={onBuild} role="tab" aria-selected="false">Build</button></div>
-  if (loading) return <aside className="inspector">{tabs}<div className="skeleton wide" /><div className="skeleton" /><div className="skeleton tall" /></aside>
-  if (!object) {
-    return (
-      <aside className="inspector empty-inspector">
-        {tabs}
-        <Braces size={30} />
-        <h2>Select a semantic object</h2>
-        <p>Follow a concept through its tables, joins, metrics, and governance context.</p>
-      </aside>
-    )
-  }
+function formatValue(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (typeof value === 'object' && value !== null) return JSON.stringify(value)
+  return String(value)
+}
+
+function normalizeStatus(status: SemanticObject['status']) {
+  return status === 'active' ? 'stable' : status
+}
+
+function bindings(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return []
+  if (Array.isArray(value)) return value.flatMap(bindings)
+  const item = value as Record<string, unknown>
+  const current = item.table && item.column ? [`${String(item.table)}.${String(item.column)}`] : []
+  return [...current, ...Object.values(item).flatMap(bindings)]
+}
+
+function ValueList({ title, value }: { title: string; value: unknown }) {
+  const items = values(value)
+  if (items.length === 0) return null
+  return <section><h3>{title}</h3><ul>{items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section>
+}
+
+function Contract({ title, rows }: { title: string; rows: Array<[string, unknown]> }) {
+  const visible = rows.filter(([, value]) => values(value).length > 0)
+  if (visible.length === 0) return null
+  return <section><h3>{title}</h3><dl>{visible.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{values(value).join(', ')}</dd></div>)}</dl></section>
+}
+
+function ProfileContract({ object }: { object: SemanticObject }) {
   const c = object.cerebro || {}
-  const columns = Array.isArray(c.columns) ? (c.columns as Array<Record<string, unknown>>) : []
+  const kind = object.profile_kind
+  const physicalMapping = c.physical_mapping as Record<string, unknown> | undefined
+  const physical = c.physical as Record<string, unknown> | undefined
+  const semantic = c.semantic as Record<string, unknown> | undefined
+  const joinType = c.join_type as Record<string, unknown> | undefined
+  const validation = c.validation as Record<string, unknown> | undefined
+  const grain = c.grain as Record<string, unknown> | string | undefined
+
+  if (kind === 'entity') return <>
+    <Contract title="Entity contract" rows={[
+      ['Physical table', physicalMapping?.table],
+      ['Entity key', physicalMapping?.key],
+      ['Grain', typeof grain === 'object' ? grain.description : grain],
+      ['Grain key', typeof grain === 'object' ? grain.key : undefined],
+      ['Aliases', object.aliases],
+    ]} />
+  </>
+
+  if (kind === 'dimension') return <>
+    <Contract title="Dimension contract" rows={[
+      ['Owning entity', c.entity],
+      ['Data type', c.semantic_type],
+      ['Derivation', c.derivation],
+      ['Compatible metrics', c.compatible_metrics],
+    ]} />
+    <ValueList title="Physical bindings" value={(c.physical_mappings as unknown[] | undefined)?.map((item) => {
+      const binding = item as Record<string, unknown>
+      return `${String(binding.table)}.${String(binding.column)}`
+    })} />
+  </>
+
+  if (kind === 'metric') return <>
+    <Contract title="Metric contract" rows={[
+      ['Owning entity', c.entity],
+      ['Grain', typeof grain === 'object' ? grain.description : grain],
+      ['Compatible dimensions', c.compatible_dimensions],
+      ['Time dimension', c.time_dimension],
+      ['Relative time anchor', c.relative_time_anchor],
+    ]} />
+    {c.measure !== undefined && <section><h3>Aggregation or ratio</h3><pre>{JSON.stringify(c.measure, null, 2)}</pre></section>}
+    <ValueList title="Source fields" value={bindings(c.measure)} />
+    <ValueList title="Filters" value={c.filters} />
+    <ValueList title="Dependencies" value={c.dependencies} />
+  </>
+
+  if (kind === 'business_rule') return <>
+    <Contract title="Business rule contract" rows={[
+      ['Owning entity', c.entity],
+      ['Rule kind', c.rule_kind],
+      ['Output type', c.output_type],
+      ['Grain', typeof grain === 'object' ? grain.description : grain],
+      ['Classification', c.classification],
+    ]} />
+    <ValueList title="Dependencies" value={c.dependencies} />
+    <ValueList title="Constraints" value={c.logic ?? c.constraints} />
+  </>
+
+  if (kind === 'relationship') return <>
+    <Contract title="Relationship contract" rows={[
+      ['Semantic source', semantic?.from],
+      ['Semantic target', semantic?.to],
+      ['Physical source', physical?.source ?? (c.source_table && c.source_column ? `${String(c.source_table)}.${String(c.source_column)}` : undefined)],
+      ['Physical target', physical?.target ?? (c.target_table && c.target_column ? `${String(c.target_table)}.${String(c.target_column)}` : undefined)],
+      ['Cardinality', c.cardinality],
+      ['Join type', joinType?.default ?? c.join_type],
+      ['Target uniqueness', validation?.target_unique ?? c.target_unique],
+      ['Source coverage', validation?.source_fk_coverage ?? c.coverage],
+      ['Fanout risk', validation?.fanout ?? c.fanout_risk],
+      ['Confidence', c.confidence],
+    ]} />
+    <ValueList title="Evidence" value={c.evidence} />
+  </>
+
+  if (kind === 'physical_table') {
+    const columns = Array.isArray(c.columns) ? c.columns as Array<Record<string, unknown>> : []
+    return <>
+      <Contract title="Physical table contract" rows={[
+        ['Schema', c.schema ?? physical?.schema],
+        ['Grain', c.grain],
+        ['Primary key', c.primary_key],
+        ['Classification', c.classification],
+      ]} />
+      {columns.length > 0 && <section><h3><Braces size={14} /> Fields <span>{columns.length}</span></h3><div className="field-list">{columns.map((column) => <div className="field" key={String(column.name)}><code>{String(column.name)}</code><span>{String(column.data_type)}</span><em>{String(column.classification)}</em></div>)}</div></section>}
+    </>
+  }
+
+  if (kind === 'policy') return <>
+    <Contract title="Policy contract" rows={[
+      ['Rule', c.rule],
+      ['Scope', c.applies_to],
+      ['Confidence', c.confidence],
+    ]} />
+    <ValueList title="Evidence" value={c.evidence} />
+  </>
+
+  return <>
+    <Contract title={`${PROFILE_PRESENTATION[kind].label} contract`} rows={[
+      ['Grain', typeof grain === 'object' ? grain.description : grain],
+      ['Classification', c.classification],
+    ]} />
+    <ValueList title="Semantic mappings" value={c.maps_to} />
+    <ValueList title="Dependencies" value={c.dependencies} />
+  </>
+}
+
+function MetadataList({ value, empty }: { value: unknown; empty: string }) {
+  const items = values(value)
+  if (items.length === 0) return <p className="metadata-empty">{empty}</p>
+  return <ul>{items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>
+}
+
+export function Inspector({ object, loading, onBuild = () => {}, onDefine = () => {}, canDefine = false, sourceBase = '/knowledge' }: { object: SemanticObject | null; loading: boolean; onBuild?: () => void; onDefine?: () => void; canDefine?: boolean; sourceBase?: string | null }) {
+  const tabs = <div className="side-panel-tabs" role="tablist" aria-label="Semantic side panel"><button className="active" role="tab" aria-selected="true">Inspect</button><button onClick={onBuild} role="tab" aria-selected="false">Build</button><button onClick={onDefine} role="tab" aria-selected="false" disabled={!canDefine} title={canDefine ? 'Add a metric or business rule' : 'Activate an approved graph to define semantics'}>Define</button></div>
+  if (loading) return <aside className="inspector">{tabs}<div className="skeleton wide" /><div className="skeleton" /><div className="skeleton tall" /></aside>
+  if (!object) return <aside className="inspector empty-inspector">{tabs}<Braces size={30} /><h2>Select a semantic object</h2><p>Follow a semantic object through physical bindings, governed relationships, metrics, rules, and policy.</p></aside>
+
+  const c = object.cerebro || {}
+  const generated = object.generated ?? null
+  const verified = object.verified ? (Array.isArray(object.verified) ? object.verified : [object.verified]) : []
+  const sourceHref = sourceBase ? `${sourceBase}/${object.path.split('/').map(encodeURIComponent).join('/')}` : null
+
   return (
     <aside className="inspector" aria-live="polite">
       {tabs}
-      <div className="inspector-kicker"><span className={`type-dot ${object.type}`} />{object.type}</div>
+      <div className="inspector-kicker"><span className={`type-dot ${object.profile_kind}`} />{PROFILE_PRESENTATION[object.profile_kind].label}<em>{PROFILE_PRESENTATION[object.profile_kind].layer}</em></div>
       <h2>{object.name}</h2>
       <code>{object.id}</code>
       <p className="definition">{object.description}</p>
 
-      {Boolean(c.grain) && <section><h3><Database size={14} /> Grain</h3><p>{String(c.grain)}</p></section>}
-      {columns.length > 0 && (
-        <section>
-          <h3><Braces size={14} /> Fields <span>{columns.length}</span></h3>
-          <div className="field-list">
-            {columns.map((column) => <div className="field" key={String(column.name)}><code>{String(column.name)}</code><span>{String(column.data_type)}</span><em>{String(column.classification)}</em></div>)}
-          </div>
-        </section>
-      )}
+      <ProfileContract object={object} />
       {values(c.formula).length > 0 && <section><h3>Formula</h3><pre>{String(c.formula)}</pre></section>}
-      {object.type === 'relationship' && <section><h3>Relationship contract</h3><dl><div><dt>Source</dt><dd>{String(c.source_table)}.{String(c.source_column)}</dd></div><div><dt>Target</dt><dd>{String(c.target_table)}.{String(c.target_column)}</dd></div><div><dt>Cardinality</dt><dd>{String(c.cardinality)}</dd></div><div><dt>Confidence</dt><dd>{String(c.confidence)}</dd></div></dl>{values(c.evidence).length > 0 && <ul>{values(c.evidence).map((item) => <li key={item}>{item}</li>)}</ul>}</section>}
-      {object.type === 'policy' && <section><h3>Policy contract</h3><dl><div><dt>Rule</dt><dd>{String(c.rule || 'Not specified')}</dd></div>{c.confidence !== undefined && <div><dt>Confidence</dt><dd>{String(c.confidence)}</dd></div>}</dl>{values(c.evidence).length > 0 && <><h4>Evidence</h4><ul>{values(c.evidence).map((item) => <li key={item}>{item}</li>)}</ul></>}</section>}
-      {values(c.maps_to).length > 0 && <section><h3>Semantic mappings</h3><ul>{values(c.maps_to).map((item) => <li key={item}>{item}</li>)}</ul></section>}
-      {values(c.dependencies).length > 0 && <section><h3>Dependencies</h3><ul>{values(c.dependencies).map((item) => <li key={item}>{item}</li>)}</ul></section>}
-      {values(c.applies_to).length > 0 && <section><h3>Applies to</h3><ul>{values(c.applies_to).map((item) => <li key={item}>{item}</li>)}</ul></section>}
-      {values(c.warnings).length > 0 && <section className="warning"><h3><AlertTriangle size={14} /> Query guidance</h3><ul>{values(c.warnings).map((item) => <li key={item}>{item}</li>)}</ul></section>}
-      <section><h3><ShieldCheck size={14} /> Governance</h3><dl><div><dt>Classification</dt><dd>{String(c.classification || 'internal')}</dd></div><div><dt>Status</dt><dd>{object.status}</dd></div><div><dt>Provenance</dt><dd>{String(object.provenance.origin || 'declared')}</dd></div></dl></section>
-      {sourceBase && <a className="source-link" href={`${sourceBase}/${object.path.split('/').map(encodeURIComponent).join('/')}`}><ExternalLink size={14} /> Open OKF source</a>}
+      <ValueList title="Warnings" value={c.warnings} />
+
+      <section><h3><ShieldCheck size={14} /> Governance and provenance</h3><dl>
+        <div><dt>Status</dt><dd>{normalizeStatus(object.status)}</dd></div>
+        <div><dt>Classification</dt><dd>{String(c.classification || object.classification || 'internal')}</dd></div>
+        <div><dt>Raw OKF type</dt><dd>{object.type}</dd></div>
+        <div><dt>Provenance</dt><dd>{String(object.provenance.origin || 'declared')}</dd></div>
+      </dl></section>
+      <section><h3>Sources</h3><MetadataList value={object.sources} empty="No source records." /></section>
+      <section><h3>Generated metadata</h3><MetadataList value={generated} empty="Not generated." /></section>
+      <section><h3>Verification records</h3><MetadataList value={verified} empty="No verification records." /></section>
+      {sourceHref && <a className="source-link" href={sourceHref}><ExternalLink size={14} /> Open OKF source</a>}
     </aside>
   )
 }

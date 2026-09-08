@@ -9,7 +9,7 @@ from pathlib import Path
 from .bundle import BundleLoader, BundleValidator
 from .chat import ChatOrchestrator
 from .enrichment import provider_from_environment
-from .evaluation import run_evaluation
+from .evaluation import run_evaluation, summarize_evaluation
 from .generation import activate_bundle, review_bundle, run_generation_workflow
 from .models import ChatRequest
 from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG
@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     activate.add_argument("--bundle", type=Path, required=True)
     validate = commands.add_parser("validate", help="Validate upstream OKF and Cerebro contracts")
     validate.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
-    evaluate = commands.add_parser("evaluate", help="Run the ten golden retrieval questions")
+    evaluate = commands.add_parser("evaluate", help="Run the 30 semantic grounding questions")
     evaluate.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
     serve = commands.add_parser("serve", help="Serve HTTP, MCP, and built web UI")
     serve.add_argument("--host", default="127.0.0.1")
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps({
                 "output": str(result.output), "version": result.bundle.version, "objects": len(result.bundle.objects),
-                "relationships": sum(item.type == "relationship" for item in result.bundle.objects),
+                "relationships": sum(item.profile_kind == "relationship" for item in result.bundle.objects),
                 "generation_mode": result.proposal.generation_mode,
                 "provider": result.proposal.provider,
                 "model": result.proposal.model,
@@ -115,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{'PASS' if result['passed'] else 'FAIL'} {result['id']}: {result['question']}")
                 if result["missing"]:
                     print(f"  missing: {', '.join(result['missing'])}")
+            summary = summarize_evaluation(results)
+            print(f"SUMMARY {summary['cases']['passed']}/{summary['cases']['total']} cases; join-path accuracy {summary['join_path_accuracy']:.1%}")
             return 0 if all(item["passed"] for item in results) else 1
         elif args.command == "serve":
             import uvicorn

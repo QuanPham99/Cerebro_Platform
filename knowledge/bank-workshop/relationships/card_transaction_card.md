@@ -1,31 +1,50 @@
 ---
-type: relationship
+type: Relationship
 id: relationship.card_transaction_card
-name: Card Transaction Card
+title: Card Transaction Card
 description: Declared join from card_transactions.card_id to cards.card_id.
-status: active
-tags:
-- join
-- physical-fk
+status: stable
 links:
+- entity.card
+- entity.card-transaction
 - table.card_transactions
 - table.cards
+sources:
+- id: semantic-definition
+  resource: docs/semantic-layer-definition.md
+  title: Cerebro semantic-layer definition
 provenance:
   origin: human_reviewed
-  source: config/bank-source.yaml
-  database_constraint: false
+  source: docs/semantic-layer-definition.md
 cerebro:
+  kind: relationship
   classification: internal
   edge_type: physical_fk
+  semantic:
+    from: entity.card-transaction
+    to: entity.card
+  physical:
+    source:
+      table: table.card_transactions
+      column: card_id
+    target:
+      table: table.cards
+      column: card_id
   source_table: table.card_transactions
   source_column: card_id
   target_table: table.cards
   target_column: card_id
   cardinality: many-to-one
+  join_type:
+    default: left
+  validation:
+    target_unique: not_checked
+    source_fk_coverage: not_checked
+    fanout: not_checked
   warnings:
-  - Declared relationship; the source DuckDB does not define FK constraints.
+  - Declared relationship; source-row profiling is disabled.
 ---
 
 # Card Transaction Card
 
-Use an exact ID join with `many-to-one` cardinality.
+Use the declared `many-to-one` join.

@@ -41,17 +41,20 @@ class SQLGuardrail:
         self.columns: dict[str, dict[str, str]] = {}
         self.approved_joins: set[frozenset[str]] = set()
         for obj in bundle.objects:
-            if obj.type == "table":
+            if obj.profile_kind == "physical_table":
                 table = obj.id.removeprefix("table.")
                 self.columns[table] = {
                     str(column.get("name")): str(column.get("classification", "internal"))
                     for column in obj.cerebro.get("columns", [])
                 }
-            elif obj.type == "relationship":
-                source = str(obj.cerebro.get("source_table", "")).removeprefix("table.")
-                target = str(obj.cerebro.get("target_table", "")).removeprefix("table.")
-                source_column = str(obj.cerebro.get("source_column", ""))
-                target_column = str(obj.cerebro.get("target_column", ""))
+            elif obj.profile_kind == "relationship":
+                physical = obj.cerebro.get("physical", {})
+                physical_source = physical.get("source", {}) if isinstance(physical, dict) else {}
+                physical_target = physical.get("target", {}) if isinstance(physical, dict) else {}
+                source = str(obj.cerebro.get("source_table") or physical_source.get("table") or "").removeprefix("table.")
+                target = str(obj.cerebro.get("target_table") or physical_target.get("table") or "").removeprefix("table.")
+                source_column = str(obj.cerebro.get("source_column") or physical_source.get("column") or "")
+                target_column = str(obj.cerebro.get("target_column") or physical_target.get("column") or "")
                 if source and target and source_column and target_column:
                     self.approved_joins.add(frozenset({f"{source}.{source_column}", f"{target}.{target_column}"}))
 

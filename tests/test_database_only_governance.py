@@ -11,7 +11,7 @@ import duckdb
 import cerebro.generation as generation
 import cerebro.source as source_module
 from cerebro.enrichment import GenerationProvider
-from cerebro.evaluation import compare_relationship_oracle
+from cerebro.evaluation import compare_relationship_oracle, compare_semantic_oracle
 from cerebro.api import create_app, create_mcp_server
 from cerebro.bundle import load_validated_bundle
 from cerebro.cli import build_parser, main
@@ -192,6 +192,12 @@ def test_review_is_idempotent_conflict_safe_and_activation_checks_digest(
     assert record.reviewed_bundle == str((reviewed_root / candidate.name).resolve())
     assert json.loads((Path(record.reviewed_bundle) / "approval.json").read_text())["reviewer"] == "Data Owner"
     assert "ai_proposed" in (Path(record.reviewed_bundle) / "tables" / "accounts.md").read_text()
+    reviewed = load_validated_bundle(Path(record.reviewed_bundle))
+    assert {item.status for item in reviewed.objects} == {"stable"}
+    assert all(
+        any(entry["by"] == "human:data-owner" for entry in item.verified)
+        for item in reviewed.objects
+    )
     with pytest.raises(ReviewConflictError):
         review_bundle(
             candidate,
@@ -263,6 +269,24 @@ def test_database_only_http_review_and_activation_swap(
             assert run["status"] == "succeeded", run
             assert run["source_mode"] == "database_only"
             assert run["candidate"]["discovery_evidence"]["rows_read"] == 0
+
+            trace = await client.get(f"/api/generation/runs/{run_id}/trace")
+            assert trace.status_code == 200
+            trace_payload = trace.json()
+            assert trace_payload["run_id"] == run_id
+            assert [step["stage"] for step in trace_payload["steps"]] == [
+                "source_check",
+                "catalog_scan",
+                "business_semantics",
+                "relationship_semantics",
+                "query_semantics",
+                "compile_okf",
+                "validate_candidate",
+                "candidate_ready",
+            ]
+            serialized_trace = json.dumps(trace_payload)
+            assert str(bank_database) not in serialized_trace
+            assert "database_path" not in serialized_trace
 
             snapshot = await client.get(f"/api/generation/runs/{run_id}/snapshot")
             assert snapshot.status_code == 200
@@ -359,6 +383,10 @@ def test_checked_in_semantics_are_a_post_generation_oracle_only(bank_database: P
     assert report["recall"] == 0.0
     assert len(report["missing"]) == 11
     assert report["invented"] == []
+    semantic_report = compare_semantic_oracle(output)
+    assert semantic_report["precision"] == 0.0
+    assert semantic_report["recall"] == 0.0
+    assert semantic_report["matched"] == 0
 
 
 def test_cli_source_mode_review_and_activation(
