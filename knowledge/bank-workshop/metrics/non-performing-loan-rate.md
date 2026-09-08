@@ -21,6 +21,7 @@ cerebro:
   dependencies: *id001
   formula: 100.0 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN
     1 ELSE 0 END) / NULLIF(COUNT(*), 0)
+  metric_result_type: decimal
   filters: []
   grain: aggregate over originated loans
   warnings:

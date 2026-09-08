@@ -20,6 +20,7 @@ cerebro:
   classification: confidential
   dependencies: *id001
   formula: SUM(transactions.amount)
+  metric_result_type: decimal
   filters: []
   grain: requested dimensions over account transaction events
   warnings:

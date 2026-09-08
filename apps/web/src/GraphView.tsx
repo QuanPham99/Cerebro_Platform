@@ -11,6 +11,8 @@ interface GraphViewProps {
   graph: GraphResponse
   visibleIds: Set<string>
   selectedId: string | null
+  /** Objects the agent actually grounded its last answer in. */
+  usedIds?: Set<string>
   onSelect: (id: string) => void
 }
 
@@ -76,7 +78,7 @@ export function GraphLegend() {
 }
 
 export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphView(
-  { graph, visibleIds, selectedId, onSelect },
+  { graph, visibleIds, selectedId, usedIds, onSelect },
   ref,
 ) {
   const host = useRef<HTMLDivElement>(null)
@@ -212,13 +214,23 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
     const cy = core.current
     if (!cy) return
     cy.elements().removeClass('focused dimmed')
-    if (!selectedId || !cy.getElementById(selectedId).length) return
-    const selected = cy.getElementById(selectedId)
-    const pathway = selected.closedNeighborhood()
+    if (selectedId && cy.getElementById(selectedId).length) {
+      const selected = cy.getElementById(selectedId)
+      const pathway = selected.closedNeighborhood()
+      cy.elements().not(pathway).addClass('dimmed')
+      pathway.addClass('focused')
+      selected.select()
+      return
+    }
+    // With nothing selected, the agent's own grounding drives the focus, so an
+    // answer shows which part of the knowledge it actually stood on.
+    if (!usedIds || usedIds.size === 0) return
+    const grounded = cy.nodes().filter((node) => usedIds.has(node.id()))
+    if (grounded.length === 0) return
+    const pathway = grounded.union(grounded.edgesWith(grounded))
     cy.elements().not(pathway).addClass('dimmed')
     pathway.addClass('focused')
-    selected.select()
-  }, [selectedId])
+  }, [selectedId, usedIds])
 
   return <div ref={host} className="graph-host" aria-label="Semantic knowledge graph canvas" />
 })

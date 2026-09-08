@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Box, Filter, Focus, Network, RefreshCw, Search, Sparkles, X } from 'lucide-react'
+import { Box, Filter, Focus, MessageSquare, Network, RefreshCw, Search, Sparkles, X } from 'lucide-react'
 import { getBundle, getConcept, getGraph } from './api'
+import { ChatPanel, usedObjectIds } from './ChatPanel'
+import { getAgentStatus } from './chatApi'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
-import type { BundleInfo, GraphResponse, NodeType, SemanticObject } from './types'
+import type { AgentResponse, BundleInfo, GraphResponse, NodeType, SemanticObject } from './types'
 
 export default function App() {
   const [graph, setGraph] = useState<GraphResponse | null>(null)
@@ -15,6 +17,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selected, setSelected] = useState<SemanticObject | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
+  const [agentReady, setAgentReady] = useState(false)
+  const [chatOpen, setChatOpen] = useState(false)
+  const [usedIds, setUsedIds] = useState<Set<string>>(new Set())
   const graphHandle = useRef<GraphHandle>(null)
 
   const load = useCallback(() => {
@@ -27,8 +32,23 @@ export default function App() {
   }, [])
 
   useEffect(load, [load])
+  useEffect(() => {
+    const controller = new AbortController()
+    getAgentStatus(controller.signal)
+      .then((status) => setAgentReady(status === 'ready'))
+      .catch(() => setAgentReady(false))
+    return () => controller.abort()
+  }, [])
+  // An answer's grounding drives the graph focus, so selecting a node by hand
+  // must take precedence: the two focus sources would otherwise fight.
+  const onTurn = useCallback((response: AgentResponse | null) => {
+    setSelectedId(null)
+    setSelected(null)
+    setUsedIds(usedObjectIds(response))
+  }, [])
 
   const select = useCallback((id: string) => {
+    setUsedIds(new Set())
     setSelectedId(id)
     setInspectorLoading(true)
     getConcept(id).then(setSelected).catch((reason: Error) => setError(reason.message)).finally(() => setInspectorLoading(false))
@@ -51,6 +71,7 @@ export default function App() {
     setTypes(new Set(nodeTypes))
     setSelectedId(null)
     setSelected(null)
+    setUsedIds(new Set())
     graphHandle.current?.reset()
   }
 
@@ -64,7 +85,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand"><div className="brand-mark"><Network size={19} /></div><div><strong>Cerebro</strong><span>Semantic constellation</span></div></div>
         <div className="bundle-chip"><i />{bundle?.name}<code>v{bundle?.version}</code></div>
-        <div className="top-actions"><span>{visibleIds.size} / {graph.nodes.length} objects</span><button title="Fit graph" onClick={() => graphHandle.current?.fit()}><Focus size={17} /></button><button title="Reset view" onClick={reset}><RefreshCw size={17} /></button></div>
+        <div className="top-actions"><span>{visibleIds.size} / {graph.nodes.length} objects</span>{agentReady && <button className={chatOpen ? 'active' : ''} title="Ask the data" onClick={() => setChatOpen((open) => !open)}><MessageSquare size={17} /></button>}<button title="Fit graph" onClick={() => graphHandle.current?.fit()}><Focus size={17} /></button><button title="Reset view" onClick={reset}><RefreshCw size={17} /></button></div>
       </header>
 
       <aside className="discovery-rail">
@@ -81,8 +102,9 @@ export default function App() {
 
       <section className="canvas-wrap">
         <div className="canvas-label"><span>Bank workshop</span><small>Drag to pan · Scroll to zoom · Select to trace</small></div>
-        <GraphView ref={graphHandle} graph={graph} visibleIds={visibleIds} selectedId={selectedId} onSelect={select} />
-        <div className="layer-caption"><span>Physical structures</span><i /><span>Business meaning</span><i /><span>Governed metrics</span></div>
+        <GraphView ref={graphHandle} graph={graph} visibleIds={visibleIds} selectedId={selectedId} usedIds={usedIds} onSelect={select} />
+        {!chatOpen && <div className="layer-caption"><span>Physical structures</span><i /><span>Business meaning</span><i /><span>Governed metrics</span></div>}
+        {chatOpen && <ChatPanel onClose={() => setChatOpen(false)} onTurn={onTurn} />}
       </section>
 
       <Inspector object={selected} loading={inspectorLoading} />
