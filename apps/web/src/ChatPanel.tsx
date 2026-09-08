@@ -30,6 +30,10 @@ const FAULT_KINDS: Array<{ codes: string[]; text: string }> = [
     text: 'The model did not answer. Nothing was generated, so nothing was checked; ask again.',
   },
   {
+    codes: ['unparsable_generation_outcome', 'unparsable_fallback_ir'],
+    text: 'The model replied in a shape this contract cannot read, twice. Nothing was generated; ask again.',
+  },
+  {
     codes: [
       'deadline_exceeded',
       'budget_exceeded',

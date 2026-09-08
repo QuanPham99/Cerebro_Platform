@@ -7,7 +7,7 @@ from decimal import Decimal
 import httpx
 import pytest
 import text2sql_factories as factories
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from cerebro.hosted_provider import (
     CassetteProvider,
@@ -183,8 +183,6 @@ def test_schema_decode_failure_is_not_a_transport_fault():
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
         )
-
-    from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
         _gateway(handler).generate(
@@ -602,3 +600,78 @@ def test_prose_only_content_still_fails_as_a_semantic_decode_error():
 
     with pytest.raises(ValidationError):
         _gateway(handler).generate("provider_probe", "{}", TypeAdapter(ProviderProbe))
+
+
+# --- an undecodable reply is retryable transport, not a dead request --------
+
+
+def test_undecodable_reply_uses_the_remaining_transport_attempt():
+    """One badly formatted reply must not kill a request that still has an attempt.
+
+    Re-sending the identical prompt is not semantic repair: no violation is fed
+    back and the model gets no chance to argue. It is exactly what the transport
+    allowance exists for, and leaving it unused meant a single malformed reply
+    ended the request.
+    """
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(len(seen) + 1)
+        if len(seen) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "Sure! Here is the answer."}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                },
+            )
+        return _ok_response(request)
+
+    generation = _gateway(handler).generate(
+        "text2sql_outcome", "{}", TypeAdapter(IRGenerationOutcome)
+    )
+    assert len(seen) == 2
+    assert [item.outcome for item in generation.transport_attempts] == [
+        "rejected",
+        "accepted",
+    ]
+    assert generation.transport_attempts[0].error_code == "undecodable_reply"
+
+
+def test_every_reply_undecodable_still_raises_a_validation_error():
+    """Exhausting the allowance must report a decoding fault, not a transport one."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "I cannot produce that."}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            },
+        )
+
+    with pytest.raises(ValidationError):
+        _gateway(handler).generate(
+            "text2sql_outcome", "{}", TypeAdapter(IRGenerationOutcome)
+        )
+
+
+def test_a_single_attempt_budget_does_not_retry_an_undecodable_reply():
+    """The allowance is a ceiling, so one permitted attempt means one request."""
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(len(seen) + 1)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "not json"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    with pytest.raises(ValidationError):
+        _gateway(handler, max_attempts=1).generate(
+            "text2sql_outcome", "{}", TypeAdapter(IRGenerationOutcome)
+        )
+    assert len(seen) == 1

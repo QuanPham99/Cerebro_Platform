@@ -152,6 +152,7 @@ class OrganizerModelGateway:
         *,
         transport: httpx.BaseTransport | None = None,
         backoff_seconds: float = 0.5,
+        max_attempts: int = MAX_TRANSPORT_ATTEMPTS_PER_SEMANTIC_CALL,
         timeout_ms: int = PROVIDER_TIMEOUT_MS_PER_ATTEMPT,
     ) -> OrganizerModelGateway:
         base_url = _configured(environ, "CEREBRO_BASE_URL", "CEREBRO_LLM_BASE_URL")
@@ -209,6 +210,7 @@ class OrganizerModelGateway:
             model_revision=revision,
             client=client,
             backoff_seconds=backoff_seconds,
+            max_attempts=max_attempts,
             schema_mechanism=mechanism,
             timeout_ms=timeout_ms,
         )
@@ -313,10 +315,33 @@ class OrganizerModelGateway:
                     f"provider rejected the request with status {response.status_code}"
                 )
 
-            attempts.append(
-                self._attempt(ordinal, started, response.status_code, None, "accepted")
-            )
-            return self._decode(response, output_adapter, tuple(attempts))
+            # A reply that arrives but does not decode is worth one more ask.
+            # Re-sending the identical prompt is not semantic repair: no
+            # violation is fed back, so the model is not being coached. Leaving
+            # the remaining allowance unused meant one malformed reply ended the
+            # whole request.
+            try:
+                decoded = self._decode(
+                    response,
+                    output_adapter,
+                    (
+                        *attempts,
+                        self._attempt(
+                            ordinal, started, response.status_code, None, "accepted"
+                        ),
+                    ),
+                )
+            except ValidationError:
+                attempts.append(
+                    self._attempt(
+                        ordinal, started, response.status_code, "undecodable_reply"
+                    )
+                )
+                if ordinal >= self._max_attempts:
+                    raise
+                self._sleep_before_retry(ordinal)
+                continue
+            return decoded
 
         raise ProviderUnavailable(
             f"provider unavailable after {len(attempts)} transport attempts"

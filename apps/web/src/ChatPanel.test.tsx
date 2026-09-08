@@ -136,6 +136,17 @@ describe('ChatPanel', () => {
     expect(screen.getByText('provider_unavailable')).toBeInTheDocument()
   })
 
+  it('does not blame the gates when the reply could not be read', async () => {
+    await ask({
+      ...checkFailed,
+      violations: [
+        { code: 'unparsable_generation_outcome', stage: 'default_ir', subject_ids: [] },
+      ],
+    })
+    expect(screen.queryByText(/did not pass the gates/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/shape this contract cannot read/i)).toBeInTheDocument()
+  })
+
   it('separates a budget exhaustion from a rejected query', async () => {
     await ask({
       ...checkFailed,
