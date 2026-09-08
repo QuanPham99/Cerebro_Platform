@@ -501,3 +501,63 @@ def test_relative_time_anchor_is_a_scalar_subquery_not_a_bare_aggregate(snapshot
     assert not re.search(
         r"(?<!select )max\(", where_clause.replace("(select max(", "(")
     )
+
+
+def test_count_star_needs_no_argument_and_compiles(snapshot):
+    """`How many X by Y` is answered by COUNT(*), so zero arguments is legal.
+
+    Requiring one argument rejected the natural form of every counting question
+    and made the model look wrong for emitting standard SQL.
+    """
+    from cerebro import models
+    from cerebro.selfcheck import ExpressionTypeRegistry, validate_ir
+
+    assert ExpressionTypeRegistry().function_signature("count") == (0, 1)
+
+    ir = models.RelationalQueryIR(
+        outcome="ir",
+        ir_version="008.ir.v1",
+        root_node_id="aggregate_accounts",
+        nodes=(
+            models.ScanNode(
+                kind="scan", node_id="scan_accounts", table_id="table.accounts"
+            ),
+            models.AggregateNode(
+                kind="aggregate",
+                node_id="aggregate_accounts",
+                input_id="scan_accounts",
+                group_by=(
+                    models.NamedExpression(
+                        alias="status",
+                        expression=models.ColumnExpression(
+                            kind="column",
+                            ref=models.ColumnRef(
+                                table_id="table.accounts", column="status"
+                            ),
+                        ),
+                    ),
+                ),
+                measures=(
+                    models.NamedExpression(
+                        alias="account_count",
+                        expression=models.FunctionExpression(
+                            kind="function", function="count", arguments=()
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    question = factories.canonical_question("How many accounts are there by status")
+    result = validate_ir(ir, snapshot, question, "default_ir")
+    assert result.validated_ir is not None, factories.codes(result.violations)
+
+    compiled = DialectCompiler("duckdb").compile(
+        factories.validated_ir(ir=ir, snapshot=snapshot, question=question),
+        snapshot,
+        question,
+        100,
+    )
+    assert "COUNT(*)" in compiled.sql.upper()
+    # A row count derives from no column, so it discloses nothing.
+    assert compiled.parameters == ()

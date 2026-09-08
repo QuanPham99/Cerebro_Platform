@@ -678,6 +678,10 @@ class DialectCompiler:
             for argument in expression.arguments
         ]
         if name in _AGGREGATE_BUILDERS:
+            if not arguments:
+                # Only `count` reaches here with no argument; the type registry
+                # rejects every other aggregate without one.
+                return exp.Count(this=exp.Star())
             return _AGGREGATE_BUILDERS[name](this=arguments[0])
         if name == "coalesce":
             return exp.Coalesce(this=arguments[0], expressions=arguments[1:])

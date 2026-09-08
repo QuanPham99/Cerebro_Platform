@@ -146,6 +146,11 @@ class ExpressionTypeRegistry:
             return 1, 100
         if function == "nullif":
             return 2, 2
+        if function == "count":
+            # `COUNT(*)` is the natural answer to a counting question and takes
+            # no column. Requiring one argument rejected standard SQL and made
+            # the model look wrong for producing it.
+            return 0, 1
         return 1, 1
 
     def function_result(
