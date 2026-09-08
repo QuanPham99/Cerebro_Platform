@@ -122,6 +122,29 @@ describe('ChatPanel', () => {
     expect(screen.getByText('missing_minimum_group_size')).toBeInTheDocument()
   })
 
+  it('does not blame the gates when the model never answered', async () => {
+    // A flaky transport read as a policy decision sends the reader looking for
+    // a rule that does not exist.
+    await ask({
+      ...checkFailed,
+      violations: [
+        { code: 'provider_unavailable', stage: 'provider_transport', subject_ids: [] },
+      ],
+    })
+    expect(screen.queryByText(/did not pass the gates/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/model did not answer/i)).toBeInTheDocument()
+    expect(screen.getByText('provider_unavailable')).toBeInTheDocument()
+  })
+
+  it('separates a budget exhaustion from a rejected query', async () => {
+    await ask({
+      ...checkFailed,
+      violations: [{ code: 'deadline_exceeded', stage: 'execution', subject_ids: [] }],
+    })
+    expect(screen.queryByText(/did not pass the gates/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/ran out of its budget/i)).toBeInTheDocument()
+  })
+
   it('reports grounded objects and relationships for the graph highlight', () => {
     expect(usedObjectIds(ok)).toEqual(
       new Set([

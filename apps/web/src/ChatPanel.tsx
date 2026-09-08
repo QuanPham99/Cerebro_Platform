@@ -16,6 +16,35 @@ export interface Turn {
 
 const SENSITIVE = new Set(['confidential', 'restricted'])
 
+/**
+ * Faults that happen before or outside query checking. Order matters: the first
+ * matching kind wins, so the most specific cause is the one reported.
+ */
+const FAULT_KINDS: Array<{ codes: string[]; text: string }> = [
+  {
+    codes: ['provider_configuration_error', 'egress_blocked'],
+    text: 'The model gateway is not configured for this server.',
+  },
+  {
+    codes: ['provider_unavailable', 'provider_rejected'],
+    text: 'The model did not answer. Nothing was generated, so nothing was checked; ask again.',
+  },
+  {
+    codes: [
+      'deadline_exceeded',
+      'budget_exceeded',
+      'semantic_call_budget_exceeded',
+      'token_budget_exceeded',
+      'cost_budget_exceeded',
+    ],
+    text: 'The request ran out of its budget before finishing.',
+  },
+  {
+    codes: ['execution_timeout', 'explain_timeout'],
+    text: 'The query was valid but the engine exceeded its time limit.',
+  },
+]
+
 const REFUSAL_TEXT: Record<string, string> = {
   missing_grounding: 'No authorized object in the bundle answers this.',
   policy_disallowed: 'A governance policy forbids returning this shape of answer.',
@@ -80,10 +109,19 @@ function Answer({ response }: { response: AgentResponse }) {
   }
 
   if (response.status === 'check_failed') {
+    // A transport or budget fault is not a rejected query: nothing was
+    // generated, so blaming the gates would misread a flaky model as a policy
+    // decision and send the reader looking for a rule that does not exist.
+    const codes = new Set(response.violations.map((item) => item.code))
+    const fault = FAULT_KINDS.find((kind) => kind.codes.some((code) => codes.has(code)))
     return (
       <div className="chat-answer">
-        <p className="chat-failed"><ShieldAlert size={13} /> The generated query did not pass the gates.</p>
-        <p className="chat-detail">{response.violations.map((v) => <code key={v.code + v.stage}>{v.code}</code>)}</p>
+        <p className="chat-failed">
+          <ShieldAlert size={13} /> {fault ? fault.text : 'The generated query did not pass the gates.'}
+        </p>
+        <p className="chat-detail">
+          {response.violations.map((v) => <code key={v.code + v.stage}>{v.code}</code>)}
+        </p>
         {footer}
       </div>
     )
