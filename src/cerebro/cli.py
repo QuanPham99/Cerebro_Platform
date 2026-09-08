@@ -111,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="Serve HTTP, MCP, and built web UI")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8000, type=int)
+    serve.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
+    serve.add_argument(
+        "--authorization-scope",
+        type=Path,
+        help="Enable the chat agent under this trusted scope; omit to serve grounding only",
+    )
+    serve.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
     return parser
 
 
@@ -259,6 +266,52 @@ def _run_baseline(args) -> int:
     return 0
 
 
+def _run_serve(args) -> int:
+    """Serve the UI, the grounding API, MCP, and optionally the chat agent.
+
+    The agent is opt-in. Without `--authorization-scope` this is exactly the
+    grounding-only server it has always been, so forgetting a flag cannot
+    accidentally expose query execution.
+    """
+    import uvicorn
+
+    from .agent_api import attach_agent
+    from .api import create_app
+    from .paths import ROOT
+
+    app = create_app(args.bundle)
+    runtime = None
+    if args.authorization_scope is not None:
+        scope = load_authorization_scope(args.authorization_scope)
+        # Built here, not on the first request: a missing credential or database
+        # should stop the server rather than turn every chat message into a 500.
+        runtime = build_agent(
+            args.database, "organizer", scope, bundle_path=args.bundle
+        )
+        attach_agent(app, runtime)
+
+    built = (ROOT / "apps" / "web" / "dist").exists()
+    base = f"http://{args.host}:{args.port}"
+    print(
+        f"web UI   {base}/"
+        if built
+        else "web UI   not built (cd apps/web && npm install && npm run build)"
+    )
+    print(f"HTTP API {base}/api/health")
+    print(f"MCP      {base}/mcp")
+    if runtime is None:
+        print("agent    disabled (pass --authorization-scope to enable the chat)")
+    else:
+        print(f"agent    {base}/api/agent/ask")
+        print("         this endpoint has no authentication; keep the host loopback")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    finally:
+        if runtime is not None:
+            runtime.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -305,23 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "baseline":
             return _run_baseline(args)
         elif args.command == "serve":
-            import uvicorn
-
-            from .paths import ROOT
-
-            # One process serves the UI, the HTTP API, and MCP. Say which of
-            # those are actually available before binding the port, so a missing
-            # UI build is visible immediately instead of as a 503 later.
-            built = (ROOT / "apps" / "web" / "dist").exists()
-            base = f"http://{args.host}:{args.port}"
-            print(
-                f"web UI   {base}/"
-                if built
-                else "web UI   not built (cd apps/web && npm install && npm run build)"
-            )
-            print(f"HTTP API {base}/api/health")
-            print(f"MCP      {base}/mcp")
-            uvicorn.run("cerebro.api:app", host=args.host, port=args.port)
+            return _run_serve(args)
         return 0
     except (
         CommandConfigurationError,

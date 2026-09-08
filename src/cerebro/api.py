@@ -89,12 +89,17 @@ def create_app(bundle_path: Path | str = DEFAULT_BUNDLE) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict:
+        # The agent surface is attached from outside this module, so its state is
+        # read rather than assumed: this file never gains an execution route.
+        from .agent_api import agent_status
+
         return {
             "status": "ok",
             "bundle": bundle.name,
             "version": bundle.version,
             "objects": len(bundle.objects),
             "web_ui": "built" if web_dist.exists() else "not_built",
+            "agent": agent_status(getattr(app.state, "agent_runtime", None)),
         }
 
     @app.get("/api/bundles/active")
