@@ -31,7 +31,8 @@ def test_duckdb_source_contract_and_counts(bank_source_config):
         source.sample_rows(first)
 
 
-def test_missing_source_is_actionable(tmp_path: Path):
+def test_missing_source_is_actionable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CEREBRO_DATABASE_PATH", raising=False)
     config = tmp_path / "source.yaml"
     config.write_text("name: missing\nversion: 1\ndatabase_path: /does/not/exist.duckdb\n")
     with pytest.raises(FileNotFoundError, match="DuckDB source not found"):

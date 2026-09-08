@@ -5,11 +5,11 @@ import {
   Box,
   Check,
   ChevronsUpDown,
-  CircleDot,
   Clock,
   Database,
   Filter,
   Focus,
+  ListChecks,
   Network,
   PanelLeftClose,
   PanelLeftOpen,
@@ -20,21 +20,18 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
-  Table2,
   Terminal,
   Waypoints,
   X,
 } from 'lucide-react'
 import { activateGeneration, generationEventsUrl, getBundle, getConcept, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationConcept, getGenerationGraph, getGenerationTrace, getGoldenBundle, getGoldenGraph, getGoldenObject, getGraph, getRuntimeStatus, postChat, reviewGeneration, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
-import { ChatPanel, usedObjectIds } from './ChatPanel'
-import { getAgentStatus } from './chatApi'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
-import type { AgentResponse, BundleInfo, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
+import type { BundleInfo, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
 
 type Workspace = 'semantic' | 'text-to-sql'
 const GENERATION_RUN_STORAGE_KEY = 'cerebro.semanticGenerationRunId'
@@ -147,7 +144,7 @@ function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
       ready: Boolean(runtime?.llm_configured),
     },
     { label: 'Query connection', detail: runtime?.database_reachable ? `DuckDB · ${runtime.database_schema}` : 'Set database path', ready: Boolean(runtime?.database_reachable) },
-    { label: 'Guardrails & evals', detail: 'Read-only policy active', ready: true },
+    { label: 'Prototype access', detail: 'All metadata available · database read-only', ready: true },
   ]
   const readyCount = setupSteps.filter((step) => step.ready).length
   const nextIndex = setupSteps.findIndex((step) => !step.ready)
@@ -168,27 +165,130 @@ function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
   )
 }
 
-const agents = [
-  { name: 'Query planner', note: 'Intent · grain · filters', icon: Waypoints, tone: 'cyan' },
-  { name: 'Knowledge retrieval', note: 'OKF · joins · policy', icon: Network, tone: 'violet' },
-  { name: 'SQL generation', note: 'Dialect-aware SQL', icon: Database, tone: 'amber' },
-  { name: 'Validation', note: 'Safety · cost · quality', icon: ShieldCheck, tone: 'rose' },
-] as const
-
 type ConversationEntry =
   | { role: 'user'; content: string }
   | { role: 'assistant'; response: ChatResponse }
 
-const exampleQuestions = [
-  'How many customers are there by gender?',
-  'What percentage of card transactions are fraud?',
-  'Explain the approved joins for transaction amount by branch.',
+/**
+ * Difficulty-tiered evaluation prompts for the bank-workshop OKF bundle. Each
+ * tier increases how many entities/joins, business rules, and semantic
+ * ambiguity a correct answer must resolve, so a level-by-level run surfaces
+ * where retrieval, the semantic profile, or the agent itself breaks down.
+ */
+const PRESET_QUESTION_LEVELS: { level: string; questions: string[] }[] = [
+  {
+    level: 'Onboarding Questions',
+    questions: [
+      'What business domain does this database describe?',
+      'What tables are available in this database, what does each table\'s schema look like, and how are the tables related to each other?',
+      'What are the core entities in this bank dataset and how are they related?',
+      'What metrics and business rules are available for analysis?',
+      'What time range does the transaction data cover?',
+      'What sensitive or restricted data policies apply to this database?',
+    ],
+  },
+  {
+    level: 'Simple Questions',
+    questions: [
+      'What tables are available to query?',
+      'How many customers are there by gender?',
+      'What is the total number of active accounts?',
+      'What is the average account balance?',
+      'How many branches does the bank have?',
+    ],
+  },
+  {
+    level: 'Intermediate Questions',
+    questions: [
+      'What percentage of card transactions are fraud?',
+      'What is the transaction volume by transaction channel?',
+      'How many customers are classified as active under the active-customer rule?',
+      'What is the late payment rate by loan type?',
+      'Show total card transaction volume by merchant category.',
+    ],
+  },
+  {
+    level: 'Hard Questions',
+    questions: [
+      'Explain the approved joins for transaction amount by branch.',
+      'Which branches have the highest fraud exposure, and what drives that metric?',
+      'List customers who qualify as high-value multichannel customers along with their net cash flow.',
+      'What is the non-performing loan rate by branch, and which employees own those risk portfolios?',
+      'Compare fraud exposure to card fraud rate for each branch — which branches are outliers?',
+    ],
+  },
+  {
+    level: 'Really Hard Questions',
+    questions: [
+      'Which delinquent customers submitted support tickets, and were those tickets prioritized under the delinquent-customer support-priority rule?',
+      'Rank employees by the combined non-performing-loan and late-payment risk of the loans they oversee.',
+      'For customers who are both high-value multichannel and had a fraudulent card transaction, what is their combined loan repayment total?',
+      'Explain how customer net cash flow is computed and which restricted or confidential columns it excludes under the sensitive banking data policy.',
+      'Show me our best customers.',
+    ],
+  },
 ]
 
-function AgentSetupWorkspace({ runtime }: { runtime: RuntimeStatus | null }) {
+function PresetQuestions({ onSelect, disabled }: { onSelect: (question: string) => void; disabled: boolean }) {
+  return (
+    <aside className="preset-panel" aria-label="Preset test questions">
+      <div className="preset-panel-heading">
+        <div><ListChecks size={14} /><span>Preset test questions</span></div>
+        <p>Click a question to send it immediately — use these to probe the OKF, the semantic layer, and the agent's answer quality across rising difficulty.</p>
+      </div>
+      <div className="preset-levels">
+        {PRESET_QUESTION_LEVELS.map((group) => (
+          <section className="preset-level" key={group.level} aria-label={group.level}>
+            <header><strong>{group.level}</strong><span>{group.questions.length}</span></header>
+            <div className="preset-level-questions">
+              {group.questions.map((question) => (
+                <button type="button" key={question} disabled={disabled} onClick={() => onSelect(question)}>{question}</button>
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+    </aside>
+  )
+}
+
+const PENDING_STAGES: { after: number; label: string }[] = [
+  { after: 0, label: 'Retrieving semantic grounding' },
+  { after: 2, label: 'Planning query intent' },
+  { after: 6, label: 'Generating governed SQL' },
+  { after: 14, label: 'Validating & executing query' },
+  { after: 20, label: 'Synthesizing the answer' },
+]
+const PENDING_EXPECTED_SECONDS = 24
+
+function QueryProgress({ elapsed }: { elapsed: number }) {
+  const stage = [...PENDING_STAGES].reverse().find((entry) => elapsed >= entry.after) ?? PENDING_STAGES[0]
+  const percent = Math.min(94, (elapsed / PENDING_EXPECTED_SECONDS) * 100)
+  return (
+    <article className="chat-message assistant pending">
+      <span>Cerebro</span>
+      <div className="query-progress">
+        <p><Clock size={13} /> {stage.label}…</p>
+        <div className="progress-bar" role="progressbar" aria-valuenow={Math.round(percent)} aria-valuemin={0} aria-valuemax={100}>
+          <div className="progress-bar-fill" style={{ width: `${percent}%` }} />
+        </div>
+        <small>{elapsed.toFixed(1)}s elapsed{elapsed > PENDING_EXPECTED_SECONDS ? ' · this one is taking longer than usual' : ''}</small>
+      </div>
+    </article>
+  )
+}
+
+function AgentSetupWorkspace({
+  runtime,
+  onEvidence,
+}: {
+  runtime: RuntimeStatus | null
+  onEvidence: (ids: Set<string>) => void
+}) {
   const [entries, setEntries] = useState<ConversationEntry[]>([])
   const [input, setInput] = useState('')
   const [pending, setPending] = useState(false)
+  const [pendingElapsed, setPendingElapsed] = useState(0)
   const [conversationId, setConversationId] = useState<string>()
   const transcriptRef = useRef<HTMLDivElement>(null)
 
@@ -196,9 +296,15 @@ function AgentSetupWorkspace({ runtime }: { runtime: RuntimeStatus | null }) {
     if (transcriptRef.current) transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
   }, [entries, pending])
 
-  const submit = async (event: FormEvent) => {
-    event.preventDefault()
-    const message = input.trim()
+  useEffect(() => {
+    if (!pending) return
+    setPendingElapsed(0)
+    const start = Date.now()
+    const timer = window.setInterval(() => setPendingElapsed((Date.now() - start) / 1000), 200)
+    return () => window.clearInterval(timer)
+  }, [pending])
+
+  const sendMessage = async (message: string) => {
     if (!message || pending) return
     const previous = entries
     setEntries([...previous, { role: 'user', content: message }])
@@ -211,6 +317,7 @@ function AgentSetupWorkspace({ runtime }: { runtime: RuntimeStatus | null }) {
       const response = await postChat({ message, conversation_id: conversationId, history })
       setConversationId(response.conversation_id)
       setEntries((current) => [...current, { role: 'assistant', response }])
+      onEvidence(new Set(response.evidence_ids))
     } catch (reason) {
       const messageText = reason instanceof Error ? reason.message : 'Chat request failed'
       setEntries((current) => [...current, {
@@ -221,35 +328,40 @@ function AgentSetupWorkspace({ runtime }: { runtime: RuntimeStatus | null }) {
           semantic_version: runtime?.semantic_version || 'unknown', evidence_ids: [], warnings: [], trace: [],
         },
       }])
+      onEvidence(new Set())
     } finally {
       setPending(false)
     }
   }
 
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    void sendMessage(input.trim())
+  }
+
   return (
     <section className="agent-workspace">
       <header className="agent-intro">
-        <div><span className="eyebrow"><CircleDot size={11} /> Governed database chat</span><h1>Turn governed meaning<br />into trusted queries.</h1></div>
-        <p>Every question is grounded in the active OKF bundle. Only validated, read-only SQL can reach DuckDB.</p>
+        <h1>Your Curiosity - Reliable Answer</h1>
+        <div className="runtime-summary" aria-label="Runtime status">
+          <span className={runtime?.llm_configured ? 'ready' : 'blocked'}><Bot size={13} /> {runtime?.model || 'Model not configured'}</span>
+          <span className={runtime?.database_reachable ? 'ready' : 'blocked'}><Database size={13} /> {runtime?.database_reachable ? 'DuckDB read-only' : 'Database unavailable'}</span>
+          <span className="ready"><ShieldCheck size={13} /> {runtime?.query_row_limit || 100} row cap</span>
+        </div>
       </header>
-      <div className="runtime-summary" aria-label="Runtime status">
-        <span className={runtime?.llm_configured ? 'ready' : 'blocked'}><Bot size={13} /> {runtime?.model || 'Model not configured'}</span>
-        <span className={runtime?.database_reachable ? 'ready' : 'blocked'}><Database size={13} /> {runtime?.database_reachable ? 'DuckDB read-only' : 'Database unavailable'}</span>
-        <span className="ready"><ShieldCheck size={13} /> {runtime?.query_row_limit || 100} row cap · {runtime?.query_timeout_seconds || 10}s</span>
-      </div>
 
       <div className="chat-shell">
-        <section className="chat-panel" aria-label="Database conversation">
+        <section className="chat-panel" aria-label="Cerebro Agent">
           <div className="chat-heading">
-            <div><Bot size={16} /><span>Database conversation</span></div>
+            <div><Bot size={16} /><span>Cerebro Agent</span></div>
             {entries.length > 0 && <button onClick={() => { setEntries([]); setConversationId(undefined) }}>Clear chat</button>}
           </div>
           <div className="chat-transcript" ref={transcriptRef} aria-live="polite">
             {entries.length === 0 && <div className="chat-empty">
               <span><Sparkles size={20} /></span>
-              <h2>Ask the bank workshop database</h2>
-              <p>Answers disclose the generated SQL, the OKF evidence used, and every safety decision.</p>
-              <div>{exampleQuestions.map((question) => <button key={question} onClick={() => setInput(question)}>{question}</button>)}</div>
+              <h2>Ask Cerebro</h2>
+              <p>Explore the live database schema and every object in the active semantic bundle.</p>
+              <p className="chat-empty-hint">Pick a question from the preset panel on the right to get started.</p>
             </div>}
             {entries.map((entry, index) => entry.role === 'user' ? (
               <article className="chat-message user" key={index}><span>You</span><p>{entry.content}</p></article>
@@ -263,7 +375,7 @@ function AgentSetupWorkspace({ runtime }: { runtime: RuntimeStatus | null }) {
                 {entry.response.trace.length > 0 && <details className="chat-detail"><summary><Waypoints size={13} /> Agent trace</summary><ol className="trace-list">{entry.response.trace.map((item, traceIndex) => <li className={item.status} key={`${item.agent}-${traceIndex}`}><strong>{item.agent.replaceAll('_', ' ')}</strong><span>{item.summary}</span></li>)}</ol></details>}
               </article>
             ))}
-            {pending && <article className="chat-message assistant pending"><span>Cerebro</span><p><Clock size={13} /> Planning, grounding, and validating…</p></article>}
+            {pending && <QueryProgress elapsed={pendingElapsed} />}
           </div>
           <form className="chat-composer" onSubmit={submit}>
             <label><span className="sr-only">Ask about the database</span><textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Ask a question about the database…" rows={2} /></label>
@@ -271,23 +383,7 @@ function AgentSetupWorkspace({ runtime }: { runtime: RuntimeStatus | null }) {
           </form>
         </section>
 
-        <aside className="runtime-panel">
-          <div className="runtime-panel-heading"><Table2 size={15} /><span>Execution contract</span></div>
-          <dl>
-            <div><dt>Bundle</dt><dd>{runtime?.bundle || 'Loading'}</dd></div>
-            <div><dt>Version</dt><dd>{runtime?.semantic_version || '—'}</dd></div>
-            <div><dt>Mode</dt><dd>{runtime?.generation_mode || '—'}</dd></div>
-            <div><dt>Response</dt><dd>{runtime?.response_mode || '—'}</dd></div>
-          </dl>
-          <p><ShieldCheck size={14} /> Restricted fields and database writes are blocked before execution.</p>
-          <details className="topology-panel compact">
-            <summary>Five-agent topology</summary>
-            <div className="specialist-grid">
-              <article className="agent-card violet"><strong>Orchestrator</strong><small>Lifecycle · final answer</small></article>
-              {agents.map(({ name, note, tone }) => <article key={name} className={`agent-card ${tone}`}><strong>{name}</strong><small>{note}</small></article>)}
-            </div>
-          </details>
-        </aside>
+        <PresetQuestions onSelect={sendMessage} disabled={pending} />
       </div>
     </section>
   )
@@ -324,7 +420,6 @@ export default function App() {
   const [workspace, setWorkspace] = useState<Workspace>('semantic')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false)
-  const [agentReady, setAgentReady] = useState(false)
   const [usedIds, setUsedIds] = useState<Set<string>>(new Set())
   const graphHandle = useRef<GraphHandle>(null)
 
@@ -345,19 +440,10 @@ export default function App() {
   }, [])
 
   useEffect(load, [load])
-  useEffect(() => {
-    const controller = new AbortController()
-    getAgentStatus(controller.signal)
-      .then((status) => setAgentReady(status === 'ready'))
-      .catch(() => setAgentReady(false))
-    return () => controller.abort()
-  }, [])
-  // An answer's grounding drives the graph focus, so selecting a node by hand
-  // must take precedence: the two focus sources would otherwise fight.
-  const onTurn = useCallback((response: AgentResponse | null) => {
+  const onChatEvidence = useCallback((ids: Set<string>) => {
     setSelectedId(null)
     setSelected(null)
-    setUsedIds(usedObjectIds(response))
+    setUsedIds(ids)
   }, [])
 
   const refreshGenerationTrace = useCallback((runId: string) => {
@@ -730,9 +816,7 @@ export default function App() {
                 onActivate={activateCandidate}
               /> : <DefinitionComposer runtime={runtime} revision={definitionRevision} onRevision={registerDefinitionRevision} onGraphChange={showDefinitionGraph} onActivated={refreshAfterDefinitionActivation} onInspect={() => setSidePanel('inspect')} onBuild={openGeneration} />}
         </div>
-      </> : agentReady
-        ? <section className="agent-workspace strict-agent-workspace"><ChatPanel onClose={() => setWorkspace('semantic')} onTurn={onTurn} /></section>
-        : <AgentSetupWorkspace runtime={runtime} />}
+      </> : <AgentSetupWorkspace runtime={runtime} onEvidence={onChatEvidence} />}
 
       {error && <div className="toast">{error}<button onClick={() => setError('')}><X size={14} /></button></div>}
     </main>

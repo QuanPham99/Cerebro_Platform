@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from datetime import date, datetime
@@ -20,6 +21,7 @@ from .models import (
     QueryPlan,
     SQLProposal,
     SemanticBundle,
+    SemanticObject,
 )
 from .retrieval import SemanticRetriever
 from .settings import Settings
@@ -183,6 +185,35 @@ class DuckDBQueryExecutor:
             timer.cancel()
             connection.close()
 
+    def table_schemas(self) -> list[list[Any]]:
+        """Return every live catalog schema without reading source rows."""
+        connection = duckdb.connect(
+            str(self.database_path),
+            read_only=True,
+            config={"enable_external_access": "false"},
+        )
+        try:
+            catalog_rows = connection.execute(
+                "SELECT table_schema, table_name, column_name, data_type, is_nullable "
+                "FROM information_schema.columns "
+                "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+                "ORDER BY table_schema, table_name, ordinal_position"
+            ).fetchall()
+        finally:
+            connection.close()
+
+        columns_by_table: dict[tuple[str, str], list[str]] = {}
+        for schema_name, table_name, column_name, data_type, is_nullable in catalog_rows:
+            table_key = (str(schema_name), str(table_name))
+            nullability = "NULL" if str(is_nullable).upper() == "YES" else "NOT NULL"
+            columns_by_table.setdefault(table_key, []).append(
+                f"{column_name} {data_type} {nullability}"
+            )
+        return [
+            [schema, table, "\n".join(columns_by_table[(schema, table)])]
+            for schema, table in sorted(columns_by_table)
+        ]
+
     @staticmethod
     def _json_value(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -209,6 +240,43 @@ class ChatOrchestrator:
 
     def chat(self, request: ChatRequest) -> ChatResponse:
         conversation_id = request.conversation_id or str(uuid.uuid4())
+        if self._is_metadata_exploration_question(request.message):
+            rows, table_count = self._exploration_inventory()
+            evidence_ids = sorted(obj.id for obj in self.bundle.objects)
+            return ChatResponse(
+                conversation_id=conversation_id,
+                status="answered",
+                answer=(
+                    f"{len(rows)} metadata objects are available to explore, including "
+                    f"{table_count} live DuckDB table schemas and every object in the active "
+                    "semantic bundle."
+                ),
+                columns=["kind", "id", "name", "details"],
+                rows=rows,
+                row_count=len(rows),
+                semantic_version=self.bundle.version,
+                evidence_ids=evidence_ids,
+                trace=[
+                    AgentTrace(
+                        agent="catalog_inspection",
+                        status="completed",
+                        summary=(
+                            f"Read {table_count} live table schemas from DuckDB information_schema; "
+                            "source rows were not accessed"
+                        ),
+                    ),
+                    AgentTrace(
+                        agent="semantic_inventory",
+                        status="completed",
+                        summary=f"Exposed all {len(self.bundle.objects)} active semantic objects",
+                    ),
+                    AgentTrace(
+                        agent="orchestrator",
+                        status="completed",
+                        summary="Returned unrestricted metadata exploration without a model call",
+                    ),
+                ],
+            )
         grounding = self.retriever.grounding(request.message)
         evidence_ids = [item.id for item in grounding.ranking_evidence]
         trace: list[AgentTrace] = [
@@ -227,6 +295,14 @@ class ChatOrchestrator:
             )
         history = [{"role": message.role, "content": message.content} for message in request.history[-10:]]
         context = grounding.model_dump(mode="json")
+        inventory_rows, live_table_count = self._exploration_inventory()
+        context["available_metadata"] = {
+            "live_table_schema_count": live_table_count,
+            "objects": [
+                dict(zip(("kind", "id", "name", "details"), row, strict=True))
+                for row in inventory_rows
+            ],
+        }
         plan = self.provider.generate(
             "query_plan",
             "Plan this DuckDB question using only the supplied semantic grounding. Ask for clarification "
@@ -339,3 +415,86 @@ class ChatOrchestrator:
             warnings=grounding.warnings,
             trace=trace,
         )
+
+    def _exploration_inventory(self) -> tuple[list[list[Any]], int]:
+        live_schemas = self.executor.table_schemas()
+        live_by_table = {
+            (str(row[0]), str(row[1])): str(row[2]) for row in live_schemas
+        }
+        rows: list[list[Any]] = []
+
+        for obj in sorted(self.bundle.objects, key=lambda item: (item.profile_kind, item.id)):
+            details = obj.description
+            if obj.profile_kind == "physical_table":
+                physical = obj.cerebro.get("physical", {})
+                schema = str(
+                    physical.get("schema") if isinstance(physical, dict) else ""
+                ) or self.guardrail.schema
+                table = str(
+                    physical.get("table") if isinstance(physical, dict) else ""
+                ) or obj.id.removeprefix("table.")
+                details = live_by_table.pop(
+                    (schema, table), self._declared_table_schema(obj)
+                )
+            elif obj.cerebro:
+                semantic_contract = json.dumps(
+                    obj.cerebro, indent=2, sort_keys=True, default=str
+                )
+                details = f"{details}\n\n{semantic_contract}" if details else semantic_contract
+            rows.append(
+                [obj.profile_kind, obj.id, obj.title or obj.name, details]
+            )
+
+        for (schema, table), schema_details in sorted(live_by_table.items()):
+            rows.append(
+                [
+                    "physical_table",
+                    f"database.{schema}.{table}",
+                    table,
+                    schema_details,
+                ]
+            )
+        return rows, len(live_schemas)
+
+    @staticmethod
+    def _declared_table_schema(obj: SemanticObject) -> str:
+        columns = obj.cerebro.get("columns", [])
+        lines = []
+        for column in columns if isinstance(columns, list) else []:
+            if not isinstance(column, dict):
+                continue
+            nullability = "NULL" if column.get("nullable", True) else "NOT NULL"
+            lines.append(
+                f"{column.get('name', 'unknown')} {column.get('data_type', 'UNKNOWN')} {nullability}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_metadata_exploration_question(question: str) -> bool:
+        words = set(re.findall(r"[a-z0-9]+", question.lower()))
+        metadata_words = {
+            "business",
+            "dataset",
+            "datasets",
+            "metadata",
+            "metric",
+            "metrics",
+            "object",
+            "objects",
+            "rule",
+            "rules",
+            "schema",
+            "schemas",
+            "table",
+            "tables",
+        }
+        asks_what_can_be_queried = {"what", "query"} <= words and bool(
+            words & {"can", "available", "avialable"}
+        )
+        asks_for_catalog = bool(words & metadata_words) and bool(
+            words & {"available", "avialable", "can", "explore", "list", "show"}
+        )
+        asks_for_all_schemas = bool(words & {"schema", "schemas"}) and bool(
+            words & {"all", "show", "list"}
+        )
+        return asks_what_can_be_queried or asks_for_catalog or asks_for_all_schemas

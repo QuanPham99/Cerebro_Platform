@@ -88,6 +88,19 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
             blocked_chat = await client.post("/api/chat", json={"message": "customer count", "history": []})
             assert blocked_chat.status_code == 200
             assert blocked_chat.json()["status"] == "blocked"
+            schema_chat = await client.post(
+                "/api/chat",
+                json={"message": "What tables are avialable to query?", "history": []},
+            )
+            assert schema_chat.status_code == 200
+            assert schema_chat.json()["status"] == "answered"
+            assert schema_chat.json()["row_count"] == 64
+            assert {row[1] for row in schema_chat.json()["rows"]} >= {
+                "table.accounts",
+                "table.customers",
+                "table.transactions",
+                "dataset.bank-workshop",
+            }
             assert len((await client.get("/api/graph")).json()["nodes"]) == 64
             assert (await client.get("/api/concepts/table.accounts")).status_code == 200
             assert (await client.get("/api/concepts/missing")).status_code == 404
