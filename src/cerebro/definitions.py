@@ -185,6 +185,12 @@ def _definition_frontmatter(
         common["generated"] = generated
     if payload.kind == "metric":
         metric = definition
+        metric_result_type = (
+            "integer"
+            if metric.measure.kind == "aggregate"
+            and metric.measure.aggregation in {"count", "count_distinct"}
+            else "decimal"
+        )
         links = sorted(set([metric.entity, *metric.dependencies, *metric.compatible_dimensions] + ([metric.time_dimension] if metric.time_dimension else [])))
         frontmatter = {
             **common,
@@ -197,6 +203,7 @@ def _definition_frontmatter(
                 "measure": metric.measure.model_dump(mode="json"),
                 "dependencies": metric.dependencies,
                 "formula": metric_formula(metric.measure.model_dump(mode="json")),
+                "metric_result_type": metric_result_type,
                 "filters": [],
                 "grain": metric.grain.model_dump(mode="json"),
                 "compatible_dimensions": metric.compatible_dimensions,

@@ -8,6 +8,8 @@ These specifications are the contract for implementation. Production code must t
 
 ## Delivery sequence
 
+### Phase 1 — semantic layer (delivered)
+
 1. [001 — Google OKF baseline](001-google-okf-baseline.md)
 2. [002 — Bank source discovery](002-bank-source-discovery.md)
 3. [003 — Semantic enrichment](003-semantic-enrichment.md)
@@ -15,10 +17,29 @@ These specifications are the contract for implementation. Production code must t
 5. [005 — Semantic retrieval and MCP](005-semantic-retrieval-mcp.md)
 6. [006 — Knowledge graph UI](006-knowledge-graph-ui.md)
 7. [007 — End-to-end demo](007-end-to-end-demo.md)
-8. [008 — OKF agents and governed database chat](008-okf-agents-and-governed-chat.md)
-9. [009 — Generation observability UI](009-generation-observability-ui.md)
-10. [010 — Database-only generation, review, and activation](010-database-only-review-activation.md)
-11. [011 — Cerebro Semantic Profile v0.1](011-semantic-profile-v0.1.md)
+8. [011 — Cerebro Semantic Profile v0.1](011-semantic-profile-v0.1.md)
+9. [012 — OKF agents and governed database chat](012-okf-agents-and-governed-chat.md)
+10. [013 — Generation observability UI](013-generation-observability-ui.md)
+11. [014 — Database-only generation, review, and activation](014-database-only-review-activation.md)
+
+### Phase 2 — grounded query agents
+
+8. [008 — Text-to-SQL agent](008-text-to-sql-agent.md)
+9. [009 — Insight and report agent](009-insight-report-agent.md)
+10. [010 — Verified corpus and adaptation](010-verified-corpus-and-adaptation.md)
+
+Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
+
+## Phase 2 scope change
+
+Phase 1 declared text-to-SQL execution out of scope. Phase 2 brings generation and read-only execution in, under these bounds:
+
+- Query execution here is demo glue, not the Governed Query Executor described in the README. Identity, authorization, audit logging, and cost accounting remain out of scope.
+- Generation runs against a hosted provider using an organizer-supplied key, read from the environment and never committed. Because inference is remote, prompt content is bounded by construction: no source row, no `restricted` value, and no non-aggregated `confidential` value is ever sent. This extends the boundary spec 003 set for enrichment.
+- The test suite runs with no key and no network, replaying recorded provider responses.
+- Every check that gates execution is deterministic and runs without a model.
+- A governed metric formula is embedded verbatim, verified by AST comparison, never rewritten by a model.
+- Reports may not contain a number absent from the query result or a derived fact.
 
 ## Shared constraints
 

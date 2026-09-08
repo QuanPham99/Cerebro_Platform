@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 import re
 from typing import Any
@@ -44,27 +46,36 @@ class BundleLoader:
             try:
                 objects.append(SemanticObject.model_validate(frontmatter))
             except ValidationError as exc:
-                raise BundleLoadError(f"{path}: invalid Cerebro extension: {exc}") from exc
+                raise BundleLoadError(
+                    f"{path}: invalid Cerebro extension: {exc}"
+                ) from exc
         manifest = root_path / "bundle.yaml"
         if not manifest.exists():
             raise BundleLoadError(f"Missing bundle manifest: {manifest}")
         import yaml
 
-        metadata = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-        return SemanticBundle(
-            name=str(metadata.get("name", root_path.name)),
-            version=str(metadata.get("version", "0.0.0")),
-            root=str(root_path),
-            objects=objects,
-            generation_mode=str(metadata.get("generation_mode", "fallback")),
-            review_state=str(metadata.get("review_state", "active")),
-            provider=metadata.get("provider"),
-            model=metadata.get("model"),
-            source_mode=metadata.get("source_mode", "configured"),
-            discovery_evidence=metadata.get("discovery_evidence", {}),
-            okf_version=okf_version or metadata.get("okf_version"),
-            semantic_profile_version=metadata.get("semantic_profile_version"),
-        )
+        raw_metadata = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        if not isinstance(raw_metadata, Mapping):
+            raise BundleLoadError("bundle manifest must be a mapping")
+        metadata = deepcopy(dict(raw_metadata))
+        try:
+            return SemanticBundle(
+                name=str(metadata.get("name", root_path.name)),
+                version=str(metadata.get("version", "0.0.0")),
+                root=str(root_path),
+                objects=objects,
+                generation_mode=str(metadata.get("generation_mode", "fallback")),
+                review_state=str(metadata.get("review_state", "active")),
+                provider=metadata.get("provider"),
+                model=metadata.get("model"),
+                source_mode=metadata.get("source_mode", "configured"),
+                discovery_evidence=metadata.get("discovery_evidence", {}),
+                okf_version=okf_version or metadata.get("okf_version"),
+                semantic_profile_version=metadata.get("semantic_profile_version"),
+                manifest_metadata=metadata,
+            )
+        except ValidationError as exc:
+            raise BundleLoadError("bundle manifest metadata is invalid") from exc
 
 
 class BundleValidator:
@@ -73,7 +84,13 @@ class BundleValidator:
         by_id: dict[str, SemanticObject] = {}
         for obj in bundle.objects:
             if obj.id in by_id:
-                issues.append(ValidationIssue(code="duplicate_id", message=f"Duplicate ID: {obj.id}", path=obj.path))
+                issues.append(
+                    ValidationIssue(
+                        code="duplicate_id",
+                        message=f"Duplicate ID: {obj.id}",
+                        path=obj.path,
+                    )
+                )
             by_id[obj.id] = obj
         tables = {obj.id: obj for obj in bundle.objects if obj.profile_kind == "physical_table"}
         table_columns = {
@@ -96,6 +113,14 @@ class BundleValidator:
                 self._validate_concept(obj, by_id, issues)
             if obj.profile_kind == "metric" and not obj.cerebro.get("measure"):
                 self._validate_metric(obj, by_id, issues)
+            if obj.profile_kind == "metric" and obj.cerebro.get("metric_result_type") not in {
+                "string", "integer", "decimal", "boolean", "date", "timestamp"
+            }:
+                issues.append(ValidationIssue(
+                    code="invalid_metric_result_type",
+                    message=f"{obj.id} must declare a governed metric result type",
+                    path=obj.path,
+                ))
             if obj.profile_kind == "policy":
                 self._validate_policy(obj, by_id, table_columns, issues)
             issues.extend(validate_profile_object(obj, by_id, tables, table_columns))
@@ -165,7 +190,13 @@ class BundleValidator:
             else str(raw_cardinality)
         )
         if source not in tables or target not in tables:
-            issues.append(ValidationIssue(code="missing_endpoint", message=f"{obj.id} has missing relationship endpoint", path=obj.path))
+            issues.append(
+                ValidationIssue(
+                    code="missing_endpoint",
+                    message=f"{obj.id} has missing relationship endpoint",
+                    path=obj.path,
+                )
+            )
         if cardinality not in ALLOWED_CARDINALITIES:
             issues.append(ValidationIssue(code="invalid_cardinality", message=f"{obj.id} has invalid cardinality {cardinality}", path=obj.path))
         for table_id, field, binding in (
@@ -174,7 +205,13 @@ class BundleValidator:
         ):
             column = str(spec.get(field) or binding.get("column") or "")
             if table_id in table_columns and column not in table_columns[table_id]:
-                issues.append(ValidationIssue(code="undeclared_join_column", message=f"{obj.id} references missing {table_id}.{column}", path=obj.path))
+                issues.append(
+                    ValidationIssue(
+                        code="undeclared_join_column",
+                        message=f"{obj.id} references missing {table_id}.{column}",
+                        path=obj.path,
+                    )
+                )
 
     @classmethod
     def _validate_metric(
@@ -207,7 +244,13 @@ class BundleValidator:
                 )
         filters = obj.cerebro.get("filters", [])
         if not isinstance(filters, list):
-            issues.append(ValidationIssue(code="invalid_metric_filter", message=f"{obj.id} filters must be a list", path=obj.path))
+            issues.append(
+                ValidationIssue(
+                    code="invalid_metric_filter",
+                    message=f"{obj.id} filters must be a list",
+                    path=obj.path,
+                )
+            )
         if not obj.cerebro.get("formula"):
             issues.append(ValidationIssue(code="invalid_metric_formula", message=f"{obj.id} has no formula", path=obj.path))
         formula_tables = {f"table.{name}" for name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", str(obj.cerebro.get("formula", "")))}

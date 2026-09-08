@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import duckdb
@@ -9,12 +11,30 @@ import yaml
 from cerebro.bundle import load_validated_bundle
 from cerebro.paths import DEFAULT_BUNDLE, DEFAULT_CONFIG
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 
 @pytest.fixture(autouse=True)
 def disable_live_llm_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep local .env credentials from turning unit tests into live API calls."""
     monkeypatch.setenv("CEREBRO_LLM_API_KEY", "")
     monkeypatch.setenv("OPENAI_API_KEY", "")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def offline_network_guard():
+    """Optionally block IPv4/IPv6 egress for the entire test suite."""
+    if os.environ.get("CEREBRO_TEST_NO_NETWORK") != "1":
+        yield
+        return
+
+    from cerebro.hosted_provider import install_offline_network_guard
+
+    restore = install_offline_network_guard()
+    try:
+        yield
+    finally:
+        restore()
 
 
 @pytest.fixture()

@@ -45,6 +45,7 @@ cerebro:
   - table.loans
   formula: 100 * SUM(CASE WHEN loans.status IN ('Defaulted', 'Written Off') THEN 1
     ELSE 0 END) / NULLIF(COUNT(*), 0)
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

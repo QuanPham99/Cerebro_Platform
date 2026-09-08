@@ -1,0 +1,18 @@
+# The supported capability set for the offline deterministic reference.
+#
+# `zero-row` carries no sentence-final period. Under the `008.literal-span.v1`
+# scanner the only token break characters are an ASCII space and one of
+# `,;()[]{}?!`, so a trailing `.` would fuse into the numeral and neither `0`
+# nor `0.` would resolve as one governed token. The explicit `0` literal the
+# case exists to prove is preserved; only the punctuation is dropped.
+questions:
+  - id: metric-fidelity
+    question: What is the card fraud rate by card type?
+  - id: two-hop-join
+    question: What is transaction volume by branch?
+  - id: relative-time
+    question: What is monthly transaction growth over the last 24 months of available data?
+  - id: bounded-disclosure
+    question: Which five customers have the highest annual income?
+  - id: zero-row
+    question: List card transaction IDs with amount below 0

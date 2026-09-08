@@ -30,6 +30,7 @@ cerebro:
   dependencies:
   - table.accounts
   formula: AVG(accounts.balance)
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

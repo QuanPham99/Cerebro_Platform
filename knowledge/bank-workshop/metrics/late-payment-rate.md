@@ -41,6 +41,7 @@ cerebro:
   - table.loan_payments
   formula: 100 * SUM(CASE WHEN loan_payments.late_payment_flag = 1 THEN 1 ELSE 0 END)
     / NULLIF(COUNT(*), 0)
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

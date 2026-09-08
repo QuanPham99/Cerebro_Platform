@@ -32,6 +32,7 @@ cerebro:
   dependencies:
   - table.transactions
   formula: SUM(transactions.amount)
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

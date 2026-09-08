@@ -27,12 +27,14 @@ import {
 } from 'lucide-react'
 import { activateGeneration, generationEventsUrl, getBundle, getConcept, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationConcept, getGenerationGraph, getGenerationTrace, getGoldenBundle, getGoldenGraph, getGoldenObject, getGraph, getRuntimeStatus, postChat, reviewGeneration, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
+import { ChatPanel, usedObjectIds } from './ChatPanel'
+import { getAgentStatus } from './chatApi'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
-import type { BundleInfo, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
+import type { AgentResponse, BundleInfo, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
 
 type Workspace = 'semantic' | 'text-to-sql'
 const GENERATION_RUN_STORAGE_KEY = 'cerebro.semanticGenerationRunId'
@@ -322,6 +324,8 @@ export default function App() {
   const [workspace, setWorkspace] = useState<Workspace>('semantic')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false)
+  const [agentReady, setAgentReady] = useState(false)
+  const [usedIds, setUsedIds] = useState<Set<string>>(new Set())
   const graphHandle = useRef<GraphHandle>(null)
 
   useEffect(() => {
@@ -341,6 +345,20 @@ export default function App() {
   }, [])
 
   useEffect(load, [load])
+  useEffect(() => {
+    const controller = new AbortController()
+    getAgentStatus(controller.signal)
+      .then((status) => setAgentReady(status === 'ready'))
+      .catch(() => setAgentReady(false))
+    return () => controller.abort()
+  }, [])
+  // An answer's grounding drives the graph focus, so selecting a node by hand
+  // must take precedence: the two focus sources would otherwise fight.
+  const onTurn = useCallback((response: AgentResponse | null) => {
+    setSelectedId(null)
+    setSelected(null)
+    setUsedIds(usedObjectIds(response))
+  }, [])
 
   const refreshGenerationTrace = useCallback((runId: string) => {
     return getGenerationTrace(runId).then((nextTrace) => {
@@ -579,6 +597,7 @@ export default function App() {
         : showCandidateGraph ? candidateGraph : null
 
   const select = useCallback((id: string) => {
+    setUsedIds(new Set())
     setSelectedId(id)
     setSidePanel('inspect')
     setInspectorLoading(true)
@@ -620,6 +639,7 @@ export default function App() {
     setTypes(new Set(nodeTypes))
     setSelectedId(null)
     setSelected(null)
+    setUsedIds(new Set())
     graphHandle.current?.reset()
   }
 
@@ -669,7 +689,7 @@ export default function App() {
       {workspace === 'semantic' ? <>
         {displayedGraph ? <section className="canvas-wrap">
           <div className="canvas-label"><span>{graphMode === 'golden' ? 'Bank workshop · Golden' : graphMode === 'candidate' ? 'Candidate build' : graphMode === 'definition' ? 'Definition draft' : 'Activated graph'}</span><small>{graphMode === 'candidate' || graphMode === 'definition' ? 'Validated preview · not active' : 'Drag to pan · Scroll to zoom · Select to trace'}</small></div>
-          <GraphView ref={graphHandle} graph={displayedGraph} visibleIds={visibleIds} selectedId={selectedId} onSelect={select} />
+          <GraphView ref={graphHandle} graph={displayedGraph} visibleIds={visibleIds} selectedId={selectedId} usedIds={usedIds} onSelect={select} />
           <div className="layer-caption"><span>Physical structures</span><i /><span>Business meaning</span><i /><span>Governed metrics</span></div>
           <GraphLegend />
         </section> : <GenerationWorkspace run={generationRun} trace={generationTrace} selectedStage={selectedGenerationStage} />}
@@ -710,7 +730,9 @@ export default function App() {
                 onActivate={activateCandidate}
               /> : <DefinitionComposer runtime={runtime} revision={definitionRevision} onRevision={registerDefinitionRevision} onGraphChange={showDefinitionGraph} onActivated={refreshAfterDefinitionActivation} onInspect={() => setSidePanel('inspect')} onBuild={openGeneration} />}
         </div>
-      </> : <AgentSetupWorkspace runtime={runtime} />}
+      </> : agentReady
+        ? <section className="agent-workspace strict-agent-workspace"><ChatPanel onClose={() => setWorkspace('semantic')} onTurn={onTurn} /></section>
+        : <AgentSetupWorkspace runtime={runtime} />}
 
       {error && <div className="toast">{error}<button onClick={() => setError('')}><X size={14} /></button></div>}
     </main>

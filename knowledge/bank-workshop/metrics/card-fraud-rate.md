@@ -42,6 +42,7 @@ cerebro:
   - table.card_transactions
   formula: 100 * SUM(CASE WHEN card_transactions.is_fraud = 1 THEN 1 ELSE 0 END) /
     NULLIF(COUNT(*), 0)
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

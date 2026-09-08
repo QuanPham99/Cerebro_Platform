@@ -42,6 +42,7 @@ cerebro:
   formula: SUM(loan_payments.amount_paid) FROM customers JOIN loans ON customers.customer_id
     = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id
     JOIN branches ON loans.branch_id = branches.branch_id
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

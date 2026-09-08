@@ -44,6 +44,7 @@ cerebro:
     JOIN accounts ON customers.customer_id = accounts.customer_id JOIN transactions
     ON accounts.account_id = transactions.account_id JOIN branches ON accounts.branch_id
     = branches.branch_id
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

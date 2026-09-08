@@ -43,6 +43,7 @@ cerebro:
     ON customers.customer_id = support_tickets.customer_id JOIN loans ON customers.customer_id
     = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id
     WHERE loan_payments.late_payment_flag = 1
+  metric_result_type: integer
   filters: []
   grain:
     type: aggregate

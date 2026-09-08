@@ -46,6 +46,7 @@ cerebro:
     ELSE 0 END) FROM branches JOIN accounts ON branches.branch_id = accounts.branch_id
     JOIN cards ON accounts.account_id = cards.account_id JOIN card_transactions ON
     cards.card_id = card_transactions.card_id
+  metric_result_type: decimal
   filters: []
   grain:
     type: aggregate

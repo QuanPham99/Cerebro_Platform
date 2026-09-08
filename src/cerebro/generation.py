@@ -632,10 +632,11 @@ def compile_candidate_bundle(
                 "status": "draft", "links": metric["dependencies"],
                 "generated": generated,
                 "provenance": {"origin": "ai_proposed", "source": proposal.provider},
-                "cerebro": {
-                    "classification": metric.get("classification", "internal"),
-                    "dependencies": metric["dependencies"], "formula": metric["formula"],
-                    "filters": metric.get("filters", []), "grain": metric.get("grain", "aggregate"),
+                    "cerebro": {
+                        "classification": metric.get("classification", "internal"),
+                        "dependencies": metric["dependencies"], "formula": metric["formula"],
+                        "metric_result_type": "decimal",
+                        "filters": metric.get("filters", []), "grain": metric.get("grain", "aggregate"),
                     "warnings": metric.get("warnings", []),
                 },
             },
@@ -703,18 +704,25 @@ def compile_candidate_bundle(
                 "compatible_metrics": dimension["compatible_metrics"], "warnings": dimension.get("warnings", []),
             },
         }, f"# {dimension['name']}\n\n{dimension['description']}")
-    for metric in structured_metrics:
-        object_id = str(metric["id"])
-        links = sorted({metric["entity"], *metric["dependencies"], *metric["compatible_dimensions"], *([metric["time_dimension"]] if metric.get("time_dimension") else [])})
-        formula = metric_formula(metric["measure"])
-        _write_doc(root / "metrics" / f"{object_id.split('.', 1)[1]}.md", {
+        for metric in structured_metrics:
+            object_id = str(metric["id"])
+            links = sorted({metric["entity"], *metric["dependencies"], *metric["compatible_dimensions"], *([metric["time_dimension"]] if metric.get("time_dimension") else [])})
+            formula = metric_formula(metric["measure"])
+            metric_result_type = (
+                "integer"
+                if metric["measure"]["kind"] == "aggregate"
+                and metric["measure"]["aggregation"] in {"count", "count_distinct"}
+                else "decimal"
+            )
+            _write_doc(root / "metrics" / f"{object_id.split('.', 1)[1]}.md", {
             "type": "Metric", "id": object_id, "name": metric["name"], "title": metric["name"],
             "description": metric["description"], "status": "draft", "links": links,
             "generated": generated, "provenance": {"origin": "ai_proposed", "source": proposal.provider},
             "cerebro": {
                 "kind": "metric", "classification": metric["classification"], "entity": metric["entity"],
-                "measure": metric["measure"], "dependencies": metric["dependencies"],
-                "formula": formula, "filters": [], "grain": metric["grain"],
+                    "measure": metric["measure"], "dependencies": metric["dependencies"],
+                    "formula": formula, "metric_result_type": metric_result_type,
+                    "filters": [], "grain": metric["grain"],
                 "compatible_dimensions": metric["compatible_dimensions"],
                 "time_dimension": metric.get("time_dimension"),
                 "relative_time_anchor": metric.get("relative_time_anchor"),

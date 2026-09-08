@@ -9,5 +9,21 @@ apps/web/node_modules/
 apps/web/dist/
 *.tsbuildinfo
 .env
+# The organizer credential file, under either spelling. It is read from disk and
+# must never become a tracked object.
+env
 artifacts/
 knowledge/generated/
+
+# Phase 2: source data and materialized database
+archive/
+data/
+*.duckdb
+*.duckdb.wal
+
+# Phase 2: local model artifacts
+models/
+adapters/
+
+# Owner-supplied source CSVs, symlinked locally for materialization.
+database

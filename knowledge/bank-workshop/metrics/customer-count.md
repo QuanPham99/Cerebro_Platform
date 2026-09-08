@@ -30,6 +30,7 @@ cerebro:
   dependencies:
   - table.customers
   formula: COUNT(DISTINCT customers.customer_id)
+  metric_result_type: integer
   filters: []
   grain:
     type: aggregate

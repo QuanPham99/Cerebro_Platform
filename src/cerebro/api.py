@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
 
@@ -166,10 +166,21 @@ def create_app(
         allow_headers=["*"],
     )
 
+    web_dist = ROOT / "apps" / "web" / "dist"
+
     @app.get("/api/health")
     async def health() -> dict:
+        from .agent_api import agent_status
+
         current = runtime["bundle"]
-        return {"status": "ok", "bundle": current.name, "version": current.version, "objects": len(current.objects)}
+        return {
+            "status": "ok",
+            "bundle": current.name,
+            "version": current.version,
+            "objects": len(current.objects),
+            "web_ui": "built" if web_dist.exists() else "not_built",
+            "agent": agent_status(getattr(app.state, "agent_runtime", None)),
+        }
 
     @app.get("/api/runtime/status")
     async def runtime_status() -> dict:
@@ -269,7 +280,9 @@ def create_app(
     async def get_concept(concept_id: str) -> SemanticObject:
         obj = runtime["retriever"].by_id.get(concept_id)
         if obj is None:
-            raise HTTPException(status_code=404, detail={"code": "unknown_concept", "id": concept_id})
+            raise HTTPException(
+                status_code=404, detail={"code": "unknown_concept", "id": concept_id}
+            )
         return obj
 
     @app.get("/api/search")
@@ -278,7 +291,11 @@ def create_app(
         types: str | None = None,
         limit: int = Query(default=10, ge=1, le=50),
     ) -> dict:
-        requested = {item.strip() for item in types.split(",") if item.strip()} if types else None
+        requested = (
+            {item.strip() for item in types.split(",") if item.strip()}
+            if types
+            else None
+        )
         if requested:
             allowed = {
                 "dataset", "table", "physical_table", "concept", "legacy_concept",
@@ -286,7 +303,10 @@ def create_app(
             }
             unknown = requested - allowed
             if unknown:
-                raise HTTPException(status_code=422, detail={"code": "unknown_types", "types": sorted(unknown)})
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "unknown_types", "types": sorted(unknown)},
+                )
         return {
             "query": q,
             "retrieval_mode": "lexical_graph",
@@ -527,14 +547,47 @@ def create_app(
     async def knowledge_document(document_path: str) -> Response:
         bundle_root = Path(runtime["bundle"].root).resolve()
         requested = (bundle_root / document_path).resolve()
-        if bundle_root not in requested.parents or not requested.is_file() or requested.suffix != ".md":
+        if (
+            bundle_root not in requested.parents
+            or not requested.is_file()
+            or requested.suffix != ".md"
+        ):
             raise HTTPException(status_code=404, detail={"code": "unknown_document"})
         return Response(requested.read_text(encoding="utf-8"), media_type="text/markdown; charset=utf-8")
 
+    @app.api_route("/api/{unknown_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def unknown_api_route(unknown_path: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "unknown_api_route", "path": f"/api/{unknown_path}"},
+        )
+
     app.mount("/mcp", mcp_app)
-    web_dist = ROOT / "apps" / "web" / "dist"
     if web_dist.exists():
+        @app.get("/", include_in_schema=False)
+        async def built_web_ui() -> Response:
+            return Response(
+                (web_dist / "index.html").read_text(encoding="utf-8"),
+                media_type="text/html; charset=utf-8",
+            )
+
         app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
+    else:
+        # An unbuilt UI used to answer a bare 404, which reads like a broken
+        # server. Say what is missing and exactly how to supply it.
+        @app.get("/")
+        async def web_ui_not_built() -> JSONResponse:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "web_ui_not_built",
+                    "message": "The API and MCP server are running; the web UI bundle is absent.",
+                    "build_command": "cd apps/web && npm install && npm run build",
+                    "api_docs": "/docs",
+                    "health": "/api/health",
+                },
+            )
+
     return app
 
 

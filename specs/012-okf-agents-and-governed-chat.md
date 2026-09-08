@@ -1,4 +1,4 @@
-# 008 — OKF Agents and Governed Database Chat
+# 012 — OKF Agents and Governed Database Chat
 
 ## Goal
 
