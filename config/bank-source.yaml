@@ -1,6 +1,6 @@
 name: bank-workshop
 version: 0.1.0
-database_path: /home/kwan/Documents/Code_Beavers_Txt2Sql_WS/data/workshop.duckdb
+database_path: data/workshop.duckdb
 csv_provenance_path: /home/kwan/Documents/Code_Beavers_Txt2Sql_WS/dataset
 schema_reference_path: /home/kwan/Documents/Code_Beavers_Txt2Sql_WS/schemas/BANK_DATASET_SCHEMA.md
 schema: main

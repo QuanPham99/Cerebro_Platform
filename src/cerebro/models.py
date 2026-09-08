@@ -162,3 +162,11 @@ class GroundingResponse(BaseModel):
     classifications: list[str]
     provenance: list[dict[str, Any]]
     ranking_evidence: list[RankedResult]
+
+
+# Executable query contracts are separate from advisory Phase 1 metadata.
+from .query_models import (  # noqa: E402,F401
+    SQLGenerationRequest, SQLGenerationResponse, OkResponse, CheckFailedResponse,
+    RefusedResponse, QueryResult, CheckViolation, RelationalQueryIR,
+    AuthorizationScope, GroundingSnapshot,
+)

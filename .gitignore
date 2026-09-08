@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .venv/
@@ -21,3 +22,6 @@ data/
 models/
 adapters/
 
+# Local credentials and uploaded source CSVs: never commit these.
+env
+database/
