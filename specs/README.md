@@ -30,6 +30,10 @@ These specifications are the contract for implementation. Production code must t
 
 Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 
+### Post-launch fixes
+
+1. [015 — Chat grounding and SQL-validator precision fixes](015-chat-grounding-and-validator-precision-fixes.md)
+
 ## Phase 2 scope change
 
 Phase 1 declared text-to-SQL execution out of scope. Phase 2 brings generation and read-only execution in, under these bounds:

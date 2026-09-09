@@ -305,7 +305,7 @@ class SemanticRetriever:
         limits = {
             "metric": 1,
             "dimension": 1,
-            "business_rule": 1,
+            "business_rule": 3,
             "entity": 1,
             "physical_table": 1,
             "relationship": 1,
@@ -351,10 +351,19 @@ class SemanticRetriever:
             score > 0 for score, _, _ in candidates.get("metric", [])
         ):
             requested_kinds.add("entity")
+        # A business rule whose name is strongly covered by the question (score >= 1.0 means
+        # every one of the rule's own name terms — or the whole query — was matched, not just an
+        # incidental shared word like "fraud" appearing in an unrelated rule name) must never be
+        # suppressed by the coarse rule_intent/requested_kinds keyword gates below — those gates
+        # exist only to pull business_rule in when it has no strong direct evidence of its own,
+        # not to hide one that does.
+        _STRONG_MATCH = 1.0
+        rule_has_direct_match = any(score >= _STRONG_MATCH for score, _, _ in candidates.get("business_rule", []))
         for kind, values in candidates.items():
             if requested_kinds and kind not in requested_kinds and kind != "legacy_concept":
-                continue
-            if kind == "business_rule" and not rule_intent:
+                if not (kind == "business_rule" and rule_has_direct_match):
+                    continue
+            if kind == "business_rule" and not rule_intent and not rule_has_direct_match:
                 continue
             if kind == "relationship" and not explicit_relationship:
                 continue
@@ -363,7 +372,11 @@ class SemanticRetriever:
             if kind == "physical_table" and not requested_kinds and not explicit_table and semantic_candidates:
                 continue
             values.sort(key=lambda item: (-item[0], item[1]))
-            seeds.extend(item.id for _, _, item in values[:limits.get(kind, 0)])
+            # Beyond the top-ranked candidate, only admit additional same-kind objects that have
+            # genuine name-term overlap with the question — otherwise a raised cap would let in
+            # same-kind noise that merely rode along in the top-10 search results.
+            take = values[:1] + [item for item in values[1:limits.get(kind, 0)] if item[0] >= _STRONG_MATCH]
+            seeds.extend(item.id for _, _, item in take)
         if not seeds and ranked:
             seeds.append(ranked[0].id)
 

@@ -42,6 +42,36 @@ def test_retrieval_fusion_graph_and_embedding_fallback():
     )
 
 
+def test_grounding_includes_a_second_business_rule_when_it_genuinely_matches():
+    # Regression for spec 015: a rule the question genuinely names (positive lexical/vector
+    # name-term overlap) must not be excluded merely because a different kind's object claimed
+    # the sole requested_kinds slot for this question.
+    retriever = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE))
+    grounding = retriever.grounding(
+        "List customers who qualify as high-value multichannel customers along with their net cash flow."
+    )
+    rule_ids = {rule["id"] for rule in grounding.rules}
+    assert "rule.high-value-multichannel-customer" in rule_ids
+    # Same-kind candidates that score zero for this question must not ride along just because the
+    # cap was raised.
+    assert rule_ids == {"rule.high-value-multichannel-customer"}
+
+
+def test_grounding_rules_stay_empty_and_unbloated_for_unrelated_questions():
+    retriever = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE))
+    assert retriever.grounding("How many customers are there by gender?").rules == []
+    # A rule that merely shares one incidental word with the question (e.g. "fraud" in both
+    # "fraud rate by card type" and the unrelated rule.branch-fraud-escalation) must not be
+    # pulled in — only a strong, name-covering match earns the bypass.
+    fraud_by_card = retriever.grounding("fraud rate by card type")
+    assert fraud_by_card.rules == []
+    total_selected = sum(len(items) for items in (
+        fraud_by_card.entities, fraud_by_card.dimensions, fraud_by_card.metrics,
+        fraud_by_card.rules, fraud_by_card.tables, fraud_by_card.joins, fraud_by_card.concepts,
+    ))
+    assert total_selected <= 10
+
+
 def test_graph_edges_are_canonical_and_directional():
     graph = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE)).graph()
     edges = {(edge.source, edge.target, edge.type, edge.label) for edge in graph.edges}

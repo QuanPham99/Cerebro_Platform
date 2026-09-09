@@ -54,6 +54,29 @@ def test_sql_guardrail_allows_aggregates_and_blocks_sensitive_or_writes():
         guardrail.validate("SELECT a.account_id, c.gender FROM accounts a JOIN customers c ON a.account_id = c.customer_id")
 
 
+def test_sql_guardrail_allows_order_by_referencing_a_select_alias():
+    # Regression for spec 015: a window-function column aliased in the SELECT list and referenced
+    # by that alias in ORDER BY must validate, matching the real query the agent generated for
+    # "Which branches have the highest fraud exposure, and what drives that metric?".
+    guardrail = SQLGuardrail(load_validated_bundle(DEFAULT_BUNDLE))
+    sql = (
+        "SELECT b.branch_name, ct.merchant_category, c.card_type, "
+        "SUM(CASE WHEN ct.is_fraud = 1 THEN ct.amount ELSE 0 END) AS fraud_exposure, "
+        "SUM(SUM(CASE WHEN ct.is_fraud = 1 THEN ct.amount ELSE 0 END)) OVER (PARTITION BY b.branch_name) AS branch_fraud_exposure "
+        'FROM "main"."branches" AS b '
+        'JOIN "main"."accounts" AS a ON b.branch_id = a.branch_id '
+        'JOIN "main"."cards" AS c ON a.account_id = c.account_id '
+        'JOIN "main"."card_transactions" AS ct ON c.card_id = ct.card_id '
+        "GROUP BY b.branch_name, ct.merchant_category, c.card_type "
+        "ORDER BY branch_fraud_exposure DESC, fraud_exposure DESC"
+    )
+    validated = guardrail.validate(sql)
+    assert "ORDER BY branch_fraud_exposure" in validated
+    # A genuinely unresolvable bare reference is still rejected.
+    with pytest.raises(SQLSafetyError, match="approved catalog"):
+        guardrail.validate("SELECT COUNT(*) AS total FROM customers ORDER BY not_a_real_alias")
+
+
 def test_chat_runs_validated_read_only_query(bank_database: Path):
     bundle = load_validated_bundle(DEFAULT_BUNDLE)
     provider = ChatProvider()

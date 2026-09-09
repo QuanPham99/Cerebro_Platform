@@ -71,6 +71,11 @@ class SQLGuardrail:
         if any(not isinstance(star.parent, exp.Count) for star in tree.find_all(exp.Star)):
             raise SQLSafetyError("SELECT * is blocked; request explicit columns")
         cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+        output_aliases = {
+            projection.alias_or_name
+            for projection in tree.selects
+            if isinstance(projection, exp.Alias)
+        }
         aliases: dict[str, str] = {}
         used_tables: set[str] = set()
         for table in tree.find_all(exp.Table):
@@ -124,10 +129,14 @@ class SQLGuardrail:
                 if column.name in self.columns[table]
             }
             if not classifications:
-                # Derived aliases from an inner SELECT are allowed only when qualified by a CTE.
-                if column.table not in cte_names:
-                    raise SQLSafetyError(f"Column is not in the approved catalog: {column.sql()}")
-                continue
+                # Derived aliases from an inner SELECT are allowed when qualified by a CTE, or
+                # when they reference an alias defined in this SELECT's own output list (e.g. an
+                # ORDER BY/HAVING referring to a computed column by its SELECT AS name).
+                if column.table in cte_names:
+                    continue
+                if not column.table and column.name in output_aliases and self._inside_output_reference(column):
+                    continue
+                raise SQLSafetyError(f"Column is not in the approved catalog: {column.sql()}")
             if "restricted" in classifications:
                 raise SQLSafetyError(f"Restricted column is blocked: {column.sql()}")
             if "confidential" in classifications and not self._inside_aggregate(column):
@@ -153,6 +162,15 @@ class SQLGuardrail:
         current: exp.Expression | None = column.parent
         while current is not None and not isinstance(current, exp.Select):
             if isinstance(current, exp.AggFunc):
+                return True
+            current = current.parent
+        return False
+
+    @staticmethod
+    def _inside_output_reference(column: exp.Column) -> bool:
+        current: exp.Expression | None = column.parent
+        while current is not None and not isinstance(current, exp.Select):
+            if isinstance(current, (exp.Order, exp.Having)):
                 return True
             current = current.parent
         return False
