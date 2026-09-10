@@ -26,10 +26,11 @@ def test_dockerfile_is_locked_multi_stage_non_root_runtime():
     assert "uv sync --frozen --no-dev --extra ai --no-install-project" in dockerfile
     assert "USER 10001:10001" in dockerfile
     assert "ENTRYPOINT [\"/usr/bin/tini\", \"--\"]" in dockerfile
-    assert "--host\", \"0.0.0.0\", \"--port\", \"8000\"" in dockerfile
+    assert "--host 0.0.0.0 --port ${PORT}" in dockerfile
+    assert "ENV PORT=8000" in dockerfile
     assert "EXPOSE 8000" in dockerfile
     assert "STOPSIGNAL SIGTERM" in dockerfile
-    assert "/api/health/ready" in dockerfile
+    assert "/health" in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert "org.opencontainers.image.version" in dockerfile
     assert "COPY --chown=10001:10001 data/workshop.duckdb /data/workshop.duckdb" in dockerfile

@@ -267,12 +267,10 @@ say "Walk through the checklist in docs/deployment-greennode-agent-runtime.md §
 step "Point the app at the image you just pushed: ${REGISTRY_IMAGE}"
 pause "Press Enter once you're on the app-creation screen"
 
-ask AR_PORT "Listening port the console expects (Enter if it's the default 8000):"
-if [[ -n "$AR_PORT" && "$AR_PORT" != "8000" ]]; then
-  warn "Console expects port ${AR_PORT}, but the Dockerfile CMD/HEALTHCHECK are hardcoded to 8000."
-  warn "Stop and update the Dockerfile to use \${PORT:-8000} before deploying, then rebuild (stage 1)."
-  SKIPPED+=("Dockerfile CMD/HEALTHCHECK port mismatch: console wants ${AR_PORT}, image is fixed to 8000")
-fi
+note "GreenNode Agent Runtime hardcodes its own health probe to GET /health on port 8080 —"
+note "this is not console-configurable. Set env var PORT=8080 in the console (the image reads"
+note "\$PORT, defaulting to 8000 for the separate vServer/Compose path — see Dockerfile)."
+step "Set env var PORT=8080."
 
 step "Set env vars from deploy/cerebro.env.example: CEREBRO_LLM_API_KEY, CEREBRO_LLM_MODEL, CEREBRO_LLM_BASE_URL."
 if confirm "Also enabling the Basic Auth fallback (CEREBRO_BASIC_AUTH_USER/_PASSWORD)?"; then
@@ -281,7 +279,7 @@ if confirm "Also enabling the Basic Auth fallback (CEREBRO_BASIC_AUTH_USER/_PASS
   note "remember the password you entered in the console — it isn't captured here."
 fi
 
-step "Point the health check at GET /api/health/ready."
+step "Point the health check at GET /health, port 8080 (GreenNode's own fixed requirement)."
 step "Confirm whether persistent volumes exist (not needed — DB and bundle are baked in)."
 step "Attach a custom domain / TLS if you want one."
 step "Check whether Agent Runtime provides its own gateway/access-control auth."

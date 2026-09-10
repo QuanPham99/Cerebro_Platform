@@ -85,6 +85,7 @@ def test_disabled_by_default_allows_every_route(tmp_path: Path, monkeypatch):
     app = make_app(tmp_path, monkeypatch)
 
     assert request(app, "/").status_code == 200
+    assert request(app, "/health").status_code == 200
     assert request(app, "/api/health").status_code == 200
     assert request(app, "/api/health/ready").status_code in {200, 503}
 
@@ -118,5 +119,6 @@ def test_enabled_accepts_correct_credentials_on_static_and_mcp_routes(tmp_path: 
 def test_health_endpoints_stay_unauthenticated_even_when_enabled(tmp_path: Path, monkeypatch):
     app = make_app(tmp_path, monkeypatch, basic_auth_user="ops", basic_auth_password="s3cret")
 
+    assert request(app, "/health").status_code == 200
     assert request(app, "/api/health").status_code == 200
     assert request(app, "/api/health/ready").status_code in {200, 503}

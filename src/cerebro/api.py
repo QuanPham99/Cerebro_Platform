@@ -204,7 +204,7 @@ def create_app(
         # probe (Docker, GreenNode Agent Runtime) hit these unauthenticated — they
         # carry no secrets (already-redacted status only), so they stay open even
         # when Basic Auth is enabled for every other route.
-        unauthenticated_paths = {"/api/health", "/api/health/ready"}
+        unauthenticated_paths = {"/health", "/api/health", "/api/health/ready"}
 
         @app.middleware("http")
         async def enforce_basic_auth(request: Request, call_next):
@@ -237,6 +237,14 @@ def create_app(
     )
 
     web_dist = Path(web_dist_path) if web_dist_path is not None else ROOT / "apps" / "web" / "dist"
+
+    @app.get("/health")
+    async def platform_health() -> dict:
+        # GreenNode Agent Runtime hardcodes its liveness probe to GET /health — this is
+        # deliberately dependency-free (never checks the bundle/database/LLM) so a transient
+        # backend issue can't make the platform kill and restart an otherwise-healthy process.
+        # Use /api/health/ready for a real readiness contract.
+        return {"status": "ok"}
 
     @app.get("/api/health")
     async def health() -> dict:

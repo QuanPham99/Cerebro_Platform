@@ -45,7 +45,23 @@ docker stop cerebro-verify
 ```
 
 Expect `"status": "ready"` with no `/data` bind mount at all — the database is already inside the
-image. Then run the full test suite and the updated image smoke test:
+image.
+
+Also verify the exact GreenNode-facing contract (port `8080`, path `/health`) before pushing, since
+the console's own health probe is fixed to these and not configurable — this is the single most
+likely cause of an Agent Runtime app stuck "creating" indefinitely:
+
+```bash
+docker run --rm -d --name cerebro-verify-8080 -p 127.0.0.1:8080:8080 \
+  --env PORT=8080 \
+  --env CEREBRO_LLM_API_KEY=<your key> \
+  --env CEREBRO_LLM_MODEL=<your model> \
+  cerebro:local
+curl -sf http://127.0.0.1:8080/health
+docker stop cerebro-verify-8080
+```
+
+Then run the full test suite and the updated image smoke test:
 
 ```bash
 uv run --frozen --extra ai --extra dev python -m pytest -q
@@ -79,10 +95,10 @@ answer differs from the current assumption:
 
 | Item | Current assumption | If different |
 |---|---|---|
-| Image reference | Pulls `vcr.vngcloud.vn/111480-abp114537/cerebro:<tag>` directly, tag- or digest-based | Adjust the tag/digest used at deploy time |
-| Listening port | Fixed `8000` (image `EXPOSE 8000`) | If Agent Runtime requires a platform `$PORT`, change the Dockerfile `CMD`/`HEALTHCHECK` to `${PORT:-8000}` and re-verify (spec 016 already flagged an "AgentBase port-8080" quirk worth checking here) |
-| Env var / secret injection | Console fields or a secrets manager, mapping every var in `deploy/cerebro.env.example` (`CEREBRO_LLM_API_KEY`, `CEREBRO_LLM_MODEL`, `CEREBRO_LLM_BASE_URL`, optionally `CEREBRO_BASIC_AUTH_USER`/`_PASSWORD`) | Follow whatever mechanism the console provides; never bake secrets into the image |
-| Health check | Points at `GET /api/health/ready` on the chosen port | Configure per the console's probe format |
+| Image reference | Pulls `vcr.vngcloud.vn/111480-abp114537/cerebro:<tag>` directly, tag-based | Adjust the tag used at deploy time |
+| Listening port | **Confirmed fixed at `8080`, not console-configurable.** GreenNode's own platform health probe always targets port 8080 — confirmed via the console error `Health check failed. Please make sure your application listen to /health at port 8080.` | Set env var `PORT=8080` in the console. The image's `CMD`/`HEALTHCHECK` now read `$PORT`, defaulting to `8000` only for the separate vServer/Compose path — see `Dockerfile`. |
+| Health check | **Confirmed fixed at `GET /health`, not console-configurable.** | The app now exposes a dedicated, dependency-free `/health` route (`src/cerebro/api.py`), distinct from the deeper `/api/health/ready` readiness contract used for local/manual verification. Point the console's health check at `GET /health`. |
+| Env var / secret injection | Console fields or a secrets manager, mapping every var in `deploy/cerebro.env.example` (`CEREBRO_LLM_API_KEY`, `CEREBRO_LLM_MODEL`, `CEREBRO_LLM_BASE_URL`, optionally `CEREBRO_BASIC_AUTH_USER`/`_PASSWORD`) plus `PORT=8080` | Follow whatever mechanism the console provides; never bake secrets into the image |
 | Persistent volumes | Assumed unavailable — `knowledge/generated`/`reviewed`/`artifacts` are ephemeral, reset on every redeploy | If volumes exist and matter, consider mounting them (out of scope for this iteration) |
 | Domain / TLS | Assumed platform-terminated (own subdomain or attachable custom domain) | Attach a custom domain if desired |
 | Gateway / access control | Unknown whether Agent Runtime provides one | If yes, prefer it; keep the Basic Auth fallback (§4 above, off by default) as a safety net regardless |

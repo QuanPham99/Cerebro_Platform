@@ -24,7 +24,7 @@ RUN uv sync --frozen --no-dev --extra ai --no-install-project
 FROM python:3.12-slim-bookworm AS runtime
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates tini \
+    && apt-get install --yes --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 cerebro \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /app --shell /usr/sbin/nologin cerebro
@@ -60,9 +60,14 @@ LABEL org.opencontainers.image.title="Cerebro Semantic Layer" \
       org.opencontainers.image.revision="$BUILD_REVISION"
 
 USER 10001:10001
+# Default port is 8000 (used by the vServer/Compose+Caddy deployment path, see
+# deploy/compose.production.yaml and deploy/Caddyfile, both fixed to 8000). GreenNode
+# Agent Runtime instead requires the app on 8080 with a bare GET /health — set PORT=8080
+# via the console's env vars for that target; see docs/deployment-greennode-agent-runtime.md.
+ENV PORT=8000
 EXPOSE 8000
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4).read()"]
+    CMD ["sh", "-c", "curl -sf http://127.0.0.1:${PORT}/health || exit 1"]
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "-m", "cerebro.cli", "serve", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "exec python -m cerebro.cli serve --host 0.0.0.0 --port ${PORT}"]
