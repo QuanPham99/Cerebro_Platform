@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowLeft, Check, Clock, Database, Eye, Network, Play, Rocket, ShieldCheck, Terminal, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Check, Clock, Database, Eye, GitBranch, Network, Play, ShieldCheck, Terminal, X } from 'lucide-react'
 import type { GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GenerationTraceStep, RuntimeStatus } from './types'
 
 export const generationStages: Array<{ id: GenerationStage; short: string; label: string; actor: string }> = [
@@ -161,14 +161,11 @@ export function GenerationPanel({
   onReviewDraftChange,
   onSelectStage,
   onStart,
-  onInspect,
-  onDefine,
-  canDefine,
   onShowCandidate,
   onShowTrace,
   onReturnActive,
   onReview,
-  onActivate,
+  onOpenVersions,
 }: {
   runtime: RuntimeStatus | null
   run: GenerationRun | null
@@ -183,14 +180,11 @@ export function GenerationPanel({
   onReviewDraftChange: (draft: GenerationReviewDraft) => void
   onSelectStage: (stage: GenerationStage) => void
   onStart: (sourceMode: 'configured' | 'database_only') => void
-  onInspect: () => void
-  onDefine: () => void
-  canDefine: boolean
   onShowCandidate: () => void
   onShowTrace: () => void
   onReturnActive: () => void
   onReview: (payload: { decision: 'approve' | 'reject'; reviewer: string; comment: string; acknowledge_ai_risk: boolean }) => void
-  onActivate: () => void
+  onOpenVersions: () => void
 }) {
   const running = starting || run?.status === 'queued' || run?.status === 'running'
   const canStart = Boolean(runtime?.database_reachable) && !running && !actioning
@@ -199,12 +193,6 @@ export function GenerationPanel({
 
   return (
     <aside className="generation-panel" aria-label="Candidate generation">
-      <div className="side-panel-tabs" role="tablist" aria-label="Semantic side panel">
-        <button onClick={onInspect} role="tab" aria-selected="false" disabled={!run?.candidate}>Inspect</button>
-        <button className="active" role="tab" aria-selected="true">Build</button>
-        <button onClick={onDefine} role="tab" aria-selected="false" disabled={!canDefine}>Define</button>
-      </div>
-
       <header className="generation-heading">
         <span className="inspector-kicker"><Network size={12} /> Pipeline control</span>
         <h2>Raw catalog in.<br />Governed candidate out.</h2>
@@ -271,10 +259,10 @@ export function GenerationPanel({
                   </div>
                   <label>Comment<textarea aria-label="Review comment" value={reviewDraft.comment} onChange={(event) => onReviewDraftChange({ ...reviewDraft, comment: event.target.value })} required={reviewDraft.decision === 'reject'} /></label>
                   {reviewDraft.decision === 'approve' && <label className="risk-check"><input type="checkbox" checked={reviewDraft.acknowledged} onChange={(event) => onReviewDraftChange({ ...reviewDraft, acknowledged: event.target.checked })} /> I acknowledge that AI-proposed semantics require human judgment.</label>}
-                  <button className="review-submit" disabled={actioning || !reviewDraft.reviewer.trim() || (reviewDraft.decision === 'approve' && !reviewDraft.acknowledged) || (reviewDraft.decision === 'reject' && !reviewDraft.comment.trim())} type="submit"><ShieldCheck size={13} /> Record {reviewDraft.decision}</button>
+                  <button className="review-submit" disabled={actioning || !reviewDraft.reviewer.trim() || (reviewDraft.decision === 'approve' && !reviewDraft.acknowledged) || (reviewDraft.decision === 'reject' && !reviewDraft.comment.trim())} type="submit"><ShieldCheck size={13} /> {reviewDraft.decision === 'approve' ? 'Approve and save version' : 'Record rejection'}</button>
                 </form>
               )}
-              {run.candidate.review_state === 'approved' && <div className="review-result approved"><strong>Approved by {run.candidate.review_record?.reviewer}</strong><small>Approval does not activate the bundle.</small><button disabled={actioning} onClick={onActivate}><Rocket size={13} /> Activate reviewed bundle</button></div>}
+              {run.candidate.review_state === 'approved' && <div className="review-result approved"><strong>Saved by {run.candidate.review_record?.reviewer}</strong><small>This immutable version is available without changing the workspace default.</small><button disabled={actioning} onClick={onOpenVersions}><GitBranch size={13} /> Open saved versions</button></div>}
               {run.candidate.review_state === 'rejected' && <div className="review-result rejected"><strong>Candidate rejected</strong><small>{run.candidate.review_record?.comment}</small></div>}
             </section>
           </article>

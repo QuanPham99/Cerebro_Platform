@@ -24,14 +24,15 @@ import {
   Waypoints,
   X,
 } from 'lucide-react'
-import { activateGeneration, generationEventsUrl, getBundle, getConcept, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationConcept, getGenerationGraph, getGenerationTrace, getGoldenBundle, getGoldenGraph, getGoldenObject, getGraph, getRuntimeStatus, postChat, reviewGeneration, startGeneration } from './api'
+import { generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, setDefaultBundle, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
-import type { BundleInfo, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
+import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
+import { VersionLibrary } from './VersionLibrary'
 
 type Workspace = 'semantic' | 'text-to-sql'
 const GENERATION_RUN_STORAGE_KEY = 'cerebro.semanticGenerationRunId'
@@ -391,11 +392,15 @@ function AgentSetupWorkspace({
 
 export default function App() {
   const [graph, setGraph] = useState<GraphResponse | null>(null)
-  const [goldenGraph, setGoldenGraph] = useState<GraphResponse | null>(null)
   const [definitionGraph, setDefinitionGraph] = useState<GraphResponse | null>(null)
   const [candidateGraph, setCandidateGraph] = useState<GraphResponse | null>(null)
+  const [versionGraph, setVersionGraph] = useState<GraphResponse | null>(null)
   const [bundle, setBundle] = useState<BundleInfo | null>(null)
-  const [goldenBundle, setGoldenBundle] = useState<BundleInfo | null>(null)
+  const [versionCatalog, setVersionCatalog] = useState<BundleVersionCatalog | null>(null)
+  const [selectedVersion, setSelectedVersion] = useState<BundleVersionSummary | null>(null)
+  const [versionFocusId, setVersionFocusId] = useState<string | null>(null)
+  const [versionLoading, setVersionLoading] = useState(true)
+  const [versionError, setVersionError] = useState('')
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
@@ -403,8 +408,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selected, setSelected] = useState<SemanticObject | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
-  const [sidePanel, setSidePanel] = useState<'inspect' | 'build' | 'define'>('inspect')
-  const [graphMode, setGraphMode] = useState<'golden' | 'active' | 'candidate' | 'definition'>('golden')
+  const [sidePanel, setSidePanel] = useState<'inspect' | 'define'>('inspect')
+  const [graphMode, setGraphMode] = useState<'active' | 'candidate' | 'definition' | 'version'>('active')
+  const [semanticTab, setSemanticTab] = useState<'default' | 'versions' | 'generation'>('default')
   const [generationRun, setGenerationRun] = useState<GenerationRun | null>(null)
   const [generationEvents, setGenerationEvents] = useState<GenerationEvent[]>([])
   const [generationTrace, setGenerationTrace] = useState<GenerationTrace | null>(null)
@@ -428,16 +434,29 @@ export default function App() {
     return () => window.clearTimeout(resizeAfterTransition)
   }, [rightPanelCollapsed, sidebarCollapsed])
 
+  const refreshVersions = useCallback((signal?: AbortSignal) => {
+    setVersionLoading(true)
+    setVersionError('')
+    return getBundleVersions(signal)
+      .then((catalog) => { setVersionCatalog(catalog); return catalog })
+      .catch((reason: Error) => {
+        if (reason.name !== 'AbortError') setVersionError(reason.message || 'Could not load saved graph versions.')
+        throw reason
+      })
+      .finally(() => setVersionLoading(false))
+  }, [])
+
   const load = useCallback(() => {
     const controller = new AbortController()
     setError('')
-    Promise.all([getGraph(controller.signal), getBundle(controller.signal), getGoldenGraph(controller.signal), getGoldenBundle(controller.signal), getRuntimeStatus(controller.signal)])
-      .then(([nextGraph, nextBundle, nextGoldenGraph, nextGoldenBundle, nextRuntime]) => {
-        setGraph(nextGraph); setBundle(nextBundle); setGoldenGraph(nextGoldenGraph); setGoldenBundle(nextGoldenBundle); setRuntime(nextRuntime)
+    Promise.all([getGraph(controller.signal), getBundle(controller.signal), getRuntimeStatus(controller.signal)])
+      .then(([nextGraph, nextBundle, nextRuntime]) => {
+        setGraph(nextGraph); setBundle(nextBundle); setRuntime(nextRuntime)
       })
       .catch((reason: Error) => { if (reason.name !== 'AbortError') setError(reason.message) })
+    void refreshVersions(controller.signal).catch(() => undefined)
     return () => controller.abort()
-  }, [])
+  }, [refreshVersions])
 
   useEffect(load, [load])
   const onChatEvidence = useCallback((ids: Set<string>) => {
@@ -463,8 +482,8 @@ export default function App() {
         setGenerationEvents(restoredRun.events)
         setGenerationTrace(restoredTrace)
         setSelectedGenerationStage(restoredTrace.steps.at(-1)?.stage || restoredRun.events.at(-1)?.stage || 'source_check')
+        setSemanticTab('generation')
         setGraphMode('candidate')
-        setSidePanel('build')
         if (restoredRun.status === 'succeeded' && restoredRun.candidate) {
           getGenerationGraph(restoredRun.id, controller.signal)
             .then((nextGraph) => { setCandidateGraph(nextGraph); setGenerationSurface('graph') })
@@ -522,7 +541,7 @@ export default function App() {
   }, [generationRun?.id, generationRun?.status, refreshGenerationTrace])
 
   const startCandidate = async (sourceMode: 'configured' | 'database_only') => {
-    setSidePanel('build')
+    setSemanticTab('generation')
     setGenerationStarting(true)
     setGenerationError('')
     window.sessionStorage.removeItem(GENERATION_RUN_STORAGE_KEY)
@@ -553,8 +572,27 @@ export default function App() {
     setGenerationActioning(true)
     setGenerationError('')
     try {
-      await reviewGeneration(generationRun.id, payload)
-      setGenerationRun(await getGeneration(generationRun.id))
+      const reviewRecord = await reviewGeneration(generationRun.id, payload)
+      setGenerationRun((current) => current?.id === generationRun.id && current.candidate
+        ? {
+            ...current,
+            candidate: {
+              ...current.candidate,
+              review_state: reviewRecord.decision === 'approve' ? 'approved' : 'rejected',
+              review_record: reviewRecord,
+            },
+          }
+        : current)
+      if (payload.decision === 'approve') {
+        window.sessionStorage.removeItem(GENERATION_RUN_STORAGE_KEY)
+        try { await refreshVersions() } catch { /* the library renders its retryable error */ }
+        setVersionFocusId(generationRun.id)
+        setVersionGraph(null)
+        setSelectedVersion(null)
+        setSemanticTab('versions')
+        setSelectedId(null)
+        setSelected(null)
+      }
     } catch (reason) {
       setGenerationError(reason instanceof Error ? reason.message : 'Could not record the review decision.')
     } finally {
@@ -562,25 +600,36 @@ export default function App() {
     }
   }
 
-  const activateCandidate = async () => {
-    if (!generationRun?.candidate) return
+  const selectWorkspaceDefault = async (version: BundleVersionSummary) => {
     setGenerationActioning(true)
-    setGenerationError('')
+    setVersionError('')
+    let committed = false
     try {
-      await activateGeneration(generationRun.id)
-      const [nextGraph, nextBundle, nextRuntime, nextRun] = await Promise.all([
-        getGraph(), getBundle(), getRuntimeStatus(), getGeneration(generationRun.id),
-      ])
+      await setDefaultBundle(version.id)
+      committed = true
+      const [nextGraph, nextBundle, nextRuntime] = await Promise.all([getGraph(), getBundle(), getRuntimeStatus()])
       setGraph(nextGraph)
       setBundle(nextBundle)
       setRuntime(nextRuntime)
-      setGenerationRun(nextRun)
+      setVersionCatalog((current) => current ? {
+        ...current,
+        default_id: version.id,
+        versions: current.versions.map((item) => ({ ...item, is_default: item.id === version.id })),
+      } : current)
+      setSemanticTab('default')
       setGraphMode('active')
       setSidePanel('inspect')
+      setVersionGraph(null)
+      setSelectedVersion(null)
+      setDefinitionRevision(null)
+      setDefinitionGraph(null)
+      window.sessionStorage.removeItem(DEFINITION_REVISION_STORAGE_KEY)
       setSelectedId(null)
       setSelected(null)
+      void refreshVersions().catch(() => undefined)
     } catch (reason) {
-      setGenerationError(reason instanceof Error ? reason.message : 'Could not activate the reviewed bundle.')
+      const detail = reason instanceof Error ? reason.message : 'The workspace could not reload.'
+      setVersionError(committed ? `Default changed, but the workspace could not reload: ${detail}` : detail)
     } finally {
       setGenerationActioning(false)
     }
@@ -607,15 +656,51 @@ export default function App() {
     }
   }
 
-  const refreshAfterDefinitionActivation = async () => {
+  const showSavedVersions = async (focusId: string | null = null) => {
+    setVersionFocusId(focusId)
+    setVersionGraph(null)
+    setSelectedVersion(null)
+    setSelectedId(null)
+    setSelected(null)
+    setSemanticTab('versions')
+    setGraphMode('version')
+    setSidePanel('inspect')
+    try { await refreshVersions() } catch { /* the library renders its retryable error */ }
+  }
+
+  const definitionApproved = (revisionId: string) => {
+    setDefinitionRevision(null)
+    setDefinitionGraph(null)
+    window.sessionStorage.removeItem(DEFINITION_REVISION_STORAGE_KEY)
+    void showSavedVersions(revisionId)
+  }
+
+  const definitionReviewed = (revisionId: string, decision: 'approve' | 'reject') => {
+    if (decision === 'approve') {
+      definitionApproved(revisionId)
+      return
+    }
+    setDefinitionRevision(null)
+    setDefinitionGraph(null)
+    window.sessionStorage.removeItem(DEFINITION_REVISION_STORAGE_KEY)
+    setGraphMode(selectedVersion ? 'version' : 'active')
+    setSidePanel('inspect')
+  }
+
+  const previewSavedVersion = async (version: BundleVersionSummary) => {
+    setVersionError('')
     try {
-      const [nextGraph, nextBundle, nextRuntime] = await Promise.all([getGraph(), getBundle(), getRuntimeStatus()])
-      setGraph(nextGraph); setBundle(nextBundle); setRuntime(nextRuntime)
-      setGraphMode('active'); setSidePanel('inspect'); setSelectedId(null); setSelected(null)
-      setDefinitionRevision(null); setDefinitionGraph(null)
-      window.sessionStorage.removeItem(DEFINITION_REVISION_STORAGE_KEY)
+      const nextGraph = await getBundleVersionGraph(version.id)
+      setVersionGraph(nextGraph)
+      setSelectedVersion(version)
+      setVersionFocusId(version.id)
+      setSemanticTab('versions')
+      setGraphMode('version')
+      setSidePanel('inspect')
+      setSelectedId(null)
+      setSelected(null)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not reload the activated definition revision.')
+      setVersionError(reason instanceof Error ? reason.message : 'Could not preview this graph version.')
     }
   }
 
@@ -635,67 +720,53 @@ export default function App() {
   }
 
   const returnToActive = () => {
+    setSemanticTab('default')
     setGraphMode('active')
     setSidePanel('inspect')
     setSelectedId(null)
     setSelected(null)
   }
 
-  const returnToGolden = () => {
-    setGraphMode('golden')
-    setSidePanel('inspect')
-    setSelectedId(null)
-    setSelected(null)
-  }
-
   const openDefinitions = () => {
-    setGraphMode(definitionGraph ? 'definition' : 'active')
+    if (definitionGraph && definitionRevision) {
+      const base = versionCatalog?.versions.find((version) => version.id === definitionRevision.base_bundle_id)
+      setSemanticTab(base && !base.is_default ? 'versions' : 'default')
+      setGraphMode('definition')
+    }
     setSidePanel('define')
-    setSelectedId(null)
-    setSelected(null)
   }
 
   const openGeneration = () => {
+    setSemanticTab('generation')
     setGraphMode('candidate')
-    setSidePanel('build')
     setSelectedId(null)
     setSelected(null)
     if (generationRun?.candidate && !candidateGraph) void previewCandidate()
   }
 
-  const openGeneratedWorkspace = () => {
-    if (definitionGraph && definitionRevision) {
-      setGraphMode('definition'); setSidePanel('define')
-    } else if (bundle && goldenBundle && bundle.version !== goldenBundle.version) {
-      setGraphMode('active'); setSidePanel('inspect')
-    } else {
-      openGeneration()
-    }
-  }
-
-  const showCandidateGraph = graphMode === 'candidate' && generationSurface === 'graph' && Boolean(candidateGraph)
-  const displayedGraph = graphMode === 'golden'
-    ? goldenGraph
-    : graphMode === 'active'
+  const showCandidateGraph = semanticTab === 'generation' && graphMode === 'candidate' && generationSurface === 'graph' && Boolean(candidateGraph)
+  const showVersionLibrary = semanticTab === 'versions' && !versionGraph && graphMode !== 'definition'
+  const displayedGraph = graphMode === 'definition' && definitionGraph
+    ? definitionGraph
+    : semanticTab === 'default'
       ? graph
-      : graphMode === 'definition'
-        ? definitionGraph
+      : semanticTab === 'versions'
+        ? versionGraph
         : showCandidateGraph ? candidateGraph : null
 
   const select = useCallback((id: string) => {
     setUsedIds(new Set())
     setSelectedId(id)
+    if (semanticTab === 'generation') return
     setSidePanel('inspect')
     setInspectorLoading(true)
-    const request = graphMode === 'golden'
-      ? getGoldenObject(id)
+    const request = graphMode === 'version' && selectedVersion
+      ? getBundleVersionObject(selectedVersion.id, id)
       : graphMode === 'definition' && definitionRevision
         ? getDefinitionObject(definitionRevision.id, id)
-        : graphMode === 'candidate' && candidateGraph && generationRun
-          ? getGenerationConcept(generationRun.id, id)
-          : getConcept(id)
+        : getConcept(id)
     request.then(setSelected).catch((reason: Error) => setError(reason.message)).finally(() => setInspectorLoading(false))
-  }, [candidateGraph, definitionRevision, generationRun, graphMode])
+  }, [definitionRevision, graphMode, selectedVersion, semanticTab])
 
   const visibleIds = useMemo(() => {
     if (!displayedGraph) return new Set<string>()
@@ -729,29 +800,42 @@ export default function App() {
     graphHandle.current?.reset()
   }
 
-  if (error && (!graph || !goldenGraph)) {
+  const defaultVersion = versionCatalog?.versions.find((version) => version.is_default) || null
+  const definitionBaseVersion = definitionRevision?.base_bundle_id
+    ? versionCatalog?.versions.find((version) => version.id === definitionRevision.base_bundle_id) || null
+    : graphMode === 'version' && selectedVersion
+      ? selectedVersion
+      : defaultVersion
+
+  if (error && !graph) {
     return <main className="state-page"><Network size={44} /><h1>Constellation unavailable</h1><p>{error}</p><button onClick={load}><RefreshCw size={16} /> Try again</button></main>
   }
-  if (!graph || !goldenGraph) return <main className="state-page loading"><Sparkles size={40} /><h1>Mapping semantic space…</h1><p>Loading the reviewed OKF bundle.</p></main>
+  if (!graph) return <main className="state-page loading"><Sparkles size={40} /><h1>Mapping semantic space…</h1><p>Loading the reviewed OKF bundle.</p></main>
 
   return (
-    <main className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${workspace === 'semantic' && rightPanelCollapsed ? 'right-panel-collapsed' : ''}`}>
+    <main className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${workspace === 'semantic' && rightPanelCollapsed && !showVersionLibrary ? 'right-panel-collapsed' : ''}`}>
       <header className="topbar">
         <div className="brand-zone">
           <WorkspaceMenu active={workspace} collapsed={sidebarCollapsed} onCollapse={() => setSidebarCollapsed((current) => !current)} onSelect={setWorkspace} />
         </div>
         {workspace === 'semantic'
           ? <nav className="bundle-tabs" role="tablist" aria-label="Semantic versions">
-              <button type="button" className={`semantic-version-tab live ${graphMode === 'golden' ? 'active' : ''}`} role="tab" aria-selected={graphMode === 'golden'} onClick={returnToGolden}>
-                <span className="version-tab-copy"><strong>{goldenBundle?.name || 'bank-workshop'}</strong><small>Golden graph</small></span>
-                <span className="version-tab-status"><i className="live-status" aria-hidden="true" /><code>v{goldenBundle?.version || '0.2.0'}</code></span>
+              <button type="button" className={`semantic-version-tab live ${semanticTab === 'default' ? 'active' : ''}`} role="tab" aria-selected={semanticTab === 'default'} aria-label={`Default graph: ${bundle?.name || 'loading'}`} onClick={returnToActive}>
+                <span className="version-tab-copy"><strong>{bundle?.name || 'Default graph'}</strong><small>Workspace default</small></span>
+                <span className="version-tab-status"><i className="live-status" aria-hidden="true" /><code>v{bundle?.version || '—'}</code></span>
               </button>
-              <GenerationProgressTab events={generationEvents} trace={generationTrace} run={generationRun} starting={generationStarting} active={graphMode !== 'golden'} onSelect={openGeneratedWorkspace} />
+              <button type="button" className={`semantic-version-tab versions ${semanticTab === 'versions' ? 'active' : ''}`} role="tab" aria-selected={semanticTab === 'versions'} aria-label={`Saved graph versions: ${versionCatalog?.versions.length || 0} versions`} onClick={() => { void showSavedVersions() }}>
+                <span className="version-tab-copy"><strong>Versions</strong><small>Approved graph history</small></span>
+                <span className="version-tab-status"><ListChecks size={13} /><code>{versionCatalog?.versions.length || 0}</code></span>
+              </button>
+              <GenerationProgressTab events={generationEvents} trace={generationTrace} run={generationRun} starting={generationStarting} active={semanticTab === 'generation'} onSelect={openGeneration} />
             </nav>
           : <div className="runtime-chip"><i />Governed runtime <code>{runtime?.chat_ready ? 'ready' : 'setup'}</code></div>}
         {workspace === 'semantic'
-          ? displayedGraph
-            ? <div className="top-actions"><span>{visibleIds.size} / {displayedGraph.nodes.length} objects</span><button title="Fit graph" onClick={() => graphHandle.current?.fit()}><Focus size={17} /></button><button title="Reset view" onClick={reset}><RefreshCw size={17} /></button>{graphMode === 'candidate' && <button title="View pipeline trace" onClick={() => { setGenerationSurface('trace'); setSidePanel('build') }}><Terminal size={17} /></button>}</div>
+          ? showVersionLibrary
+            ? <div className="top-actions generation-status"><span>{versionCatalog?.versions.length || 0} approved versions</span><code>Immutable history</code></div>
+            : displayedGraph
+            ? <div className="top-actions"><span>{visibleIds.size} / {displayedGraph.nodes.length} objects</span><button title="Fit graph" onClick={() => graphHandle.current?.fit()}><Focus size={17} /></button><button title="Reset view" onClick={reset}><RefreshCw size={17} /></button>{graphMode === 'candidate' && <button title="View pipeline trace" onClick={() => setGenerationSurface('trace')}><Terminal size={17} /></button>}{graphMode === 'version' && <button title="Back to versions" onClick={() => { void showSavedVersions(selectedVersion?.id || null) }}><ListChecks size={17} /></button>}</div>
             : <div className="top-actions generation-status"><span>{generationRun ? generationRun.status : 'Ready for raw catalog'}</span><code>{generationRun?.id || 'No run'}</code></div>
           : <div className="top-actions setup-actions"><span>{runtime?.model || 'Model not configured'}</span><span className="setup-phase">{runtime?.chat_ready ? 'Ready' : 'Setup'}</span></div>}
       </header>
@@ -772,9 +856,11 @@ export default function App() {
         </aside>
       ) : workspace === 'text-to-sql' ? <AgentSetupRail runtime={runtime} /> : null)}
 
-      {workspace === 'semantic' ? <>
+      {workspace === 'semantic' ? showVersionLibrary
+        ? <VersionLibrary catalog={versionCatalog} loading={versionLoading} error={versionError} focusId={versionFocusId} actioning={generationActioning} onPreview={previewSavedVersion} onSetDefault={selectWorkspaceDefault} onRetry={() => { void refreshVersions().catch(() => undefined) }} onGenerate={openGeneration} />
+        : <>
         {displayedGraph ? <section className="canvas-wrap">
-          <div className="canvas-label"><span>{graphMode === 'golden' ? 'Bank workshop · Golden' : graphMode === 'candidate' ? 'Candidate build' : graphMode === 'definition' ? 'Definition draft' : 'Activated graph'}</span><small>{graphMode === 'candidate' || graphMode === 'definition' ? 'Validated preview · not active' : 'Drag to pan · Scroll to zoom · Select to trace'}</small></div>
+          <div className="canvas-label"><span>{graphMode === 'candidate' ? 'Candidate build' : graphMode === 'definition' ? 'Definition draft' : graphMode === 'version' ? `${selectedVersion?.name || 'Saved graph'} · v${selectedVersion?.version || displayedGraph.version}` : 'Workspace default'}</span><small>{graphMode === 'candidate' || graphMode === 'definition' || graphMode === 'version' ? 'Validated preview · runtime unchanged' : 'Drag to pan · Scroll to zoom · Select to trace'}</small></div>
           <GraphView ref={graphHandle} graph={displayedGraph} visibleIds={visibleIds} selectedId={selectedId} usedIds={usedIds} onSelect={select} />
           <div className="layer-caption"><span>Physical structures</span><i /><span>Business meaning</span><i /><span>Governed metrics</span></div>
           <GraphLegend />
@@ -790,9 +876,7 @@ export default function App() {
           >
             {rightPanelCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}
           </button>
-          {sidePanel === 'inspect'
-            ? <Inspector object={selected} loading={inspectorLoading} onBuild={openGeneration} onDefine={openDefinitions} canDefine={Boolean(runtime?.review_state === 'approved' && (graphMode === 'active' || graphMode === 'definition'))} sourceBase={graphMode === 'candidate' && candidateGraph && generationRun ? `/api/generation/runs/${encodeURIComponent(generationRun.id)}/documents` : graphMode === 'definition' ? null : '/knowledge'} />
-            : sidePanel === 'build' ? <GenerationPanel
+          {semanticTab === 'generation' ? <GenerationPanel
                 runtime={runtime}
                 run={generationRun}
                 events={generationEvents}
@@ -804,17 +888,22 @@ export default function App() {
                 error={generationError}
                 previewing={showCandidateGraph}
                 onReviewDraftChange={setGenerationReviewDraft}
-                onSelectStage={(stage) => { setSelectedGenerationStage(stage); setGenerationSurface('trace'); setSidePanel('build') }}
+                onSelectStage={(stage) => { setSelectedGenerationStage(stage); setGenerationSurface('trace') }}
                 onStart={startCandidate}
-                onInspect={() => { void previewCandidate(); setSidePanel('inspect') }}
-                onDefine={openDefinitions}
-                canDefine={Boolean(runtime?.review_state === 'approved' && (graphMode === 'active' || graphMode === 'definition'))}
                 onShowCandidate={previewCandidate}
                 onShowTrace={() => setGenerationSurface('trace')}
                 onReturnActive={returnToActive}
                 onReview={reviewCandidate}
-                onActivate={activateCandidate}
-              /> : <DefinitionComposer runtime={runtime} revision={definitionRevision} onRevision={registerDefinitionRevision} onGraphChange={showDefinitionGraph} onActivated={refreshAfterDefinitionActivation} onInspect={() => setSidePanel('inspect')} onBuild={openGeneration} />}
+                onOpenVersions={() => { void showSavedVersions(generationRun?.id || null) }}
+              /> : <div className="graph-side-panel">
+                <div className="side-panel-tabs graph-panel-tabs" role="tablist" aria-label="Graph details">
+                  <button className={sidePanel === 'inspect' ? 'active' : ''} onClick={() => setSidePanel('inspect')} role="tab" aria-selected={sidePanel === 'inspect'}>Inspect</button>
+                  <button className={sidePanel === 'define' ? 'active' : ''} onClick={openDefinitions} role="tab" aria-selected={sidePanel === 'define'}>Define</button>
+                </div>
+                {sidePanel === 'inspect'
+                  ? <Inspector object={selected} loading={inspectorLoading} sourceBase={graphMode === 'definition' || graphMode === 'version' ? null : '/knowledge'} />
+                  : <DefinitionComposer runtime={runtime} baseVersion={definitionBaseVersion} selectedObject={selected} revision={definitionRevision} onRevision={registerDefinitionRevision} onGraphChange={showDefinitionGraph} onReviewed={definitionReviewed} />}
+              </div>}
         </div>
       </> : <AgentSetupWorkspace runtime={runtime} onEvidence={onChatEvidence} />}
 

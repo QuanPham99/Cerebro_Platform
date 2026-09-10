@@ -1085,7 +1085,12 @@ def review_bundle(
     return record
 
 
-def activate_bundle(bundle_path: Path | str) -> dict[str, Any]:
+def activate_bundle(
+    bundle_path: Path | str,
+    *,
+    trusted_bundle_path: Path | str | None = None,
+    active_pointer: Path | str | None = None,
+) -> dict[str, Any]:
     path = Path(bundle_path).resolve()
     bundle = BundleLoader().load(path)
     report = BundleValidator().validate(bundle)
@@ -1093,20 +1098,23 @@ def activate_bundle(bundle_path: Path | str) -> dict[str, Any]:
         raise ActivationError("Cannot activate invalid bundle: " + "; ".join(issue.message for issue in report.issues))
     if bundle.review_state != "approved":
         raise ActivationError("Only an approved reviewed bundle can be activated")
-    receipt_path = path / "approval.json"
-    if not receipt_path.is_file():
-        raise ActivationError("Approved bundle is missing approval.json")
-    receipt = ReviewRecord.model_validate_json(receipt_path.read_text(encoding="utf-8"))
-    if receipt.decision != "approve" or receipt.reviewed_digest != bundle_digest(path):
-        raise ActivationError("Reviewed bundle digest does not match its approval receipt")
-    ACTIVE_BUNDLE_POINTER.parent.mkdir(parents=True, exist_ok=True)
+    trusted_path = Path(trusted_bundle_path).resolve() if trusted_bundle_path is not None else None
+    if path != trusted_path:
+        receipt_path = path / "approval.json"
+        if not receipt_path.is_file():
+            raise ActivationError("Approved bundle is missing approval.json")
+        receipt = ReviewRecord.model_validate_json(receipt_path.read_text(encoding="utf-8"))
+        if receipt.decision != "approve" or receipt.reviewed_digest != bundle_digest(path):
+            raise ActivationError("Reviewed bundle digest does not match its approval receipt")
+    pointer = Path(active_pointer) if active_pointer is not None else ACTIVE_BUNDLE_POINTER
+    pointer.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "path": str(path),
         "name": bundle.name,
         "version": bundle.version,
         "activated_at": datetime.now(timezone.utc).isoformat(),
     }
-    temporary = ACTIVE_BUNDLE_POINTER.with_suffix(".tmp")
+    temporary = pointer.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(ACTIVE_BUNDLE_POINTER)
+    temporary.replace(pointer)
     return payload

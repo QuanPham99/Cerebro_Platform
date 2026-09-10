@@ -387,6 +387,34 @@ class ReviewRecord(BaseModel):
     reviewed_digest: str | None = None
 
 
+class BundleVersionSummary(BaseModel):
+    id: str
+    name: str
+    version: str
+    origin: Literal["golden", "generation", "definition"]
+    is_default: bool = False
+    review_state: Literal["approved"] = "approved"
+    reviewer: str | None = None
+    reviewed_at: str | None = None
+    parent_version: str | None = None
+    counts: dict[str, int] = Field(default_factory=dict)
+    kind_counts: dict[str, int] = Field(default_factory=dict)
+    generation_mode: str
+    source_mode: Literal["configured", "database_only"] = "configured"
+    provider: str | None = None
+    model: str | None = None
+
+
+class BundleVersionCatalog(BaseModel):
+    default_id: str | None = None
+    default_change_allowed: bool = True
+    versions: list[BundleVersionSummary] = Field(default_factory=list)
+
+
+class BundleDefaultRequest(BaseModel):
+    bundle_id: str = Field(min_length=1, max_length=200)
+
+
 class MetricDefinitionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -413,6 +441,14 @@ class DefinitionTranslateRequest(BaseModel):
     kind: Literal["metric", "business_rule"]
     intent: str = Field(min_length=1, max_length=4000)
     entity_id: str | None = None
+    base_bundle_id: str | None = Field(default=None, min_length=1, max_length=200)
+    revision_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def require_one_definition_scope(self) -> "DefinitionTranslateRequest":
+        if self.base_bundle_id and self.revision_id:
+            raise ValueError("base_bundle_id and revision_id are mutually exclusive")
+        return self
 
 
 class DefinitionTranslation(BaseModel):
@@ -429,11 +465,23 @@ class DefinitionApplyRequest(BaseModel):
     origin: Literal["ai_proposed", "declared"] = "declared"
 
 
+class DefinitionRevisionCreateRequest(DefinitionApplyRequest):
+    base_bundle_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AuthoredDefinitionSummary(BaseModel):
+    id: str
+    name: str
+    kind: Literal["metric", "business_rule"]
+
+
 class DefinitionRevision(BaseModel):
     id: str
+    base_bundle_id: str | None = None
     base_version: str
     version: str
     counts: dict[str, int]
+    definitions: list[AuthoredDefinitionSummary] = Field(default_factory=list)
     generation_mode: Literal["authored"] = "authored"
     review_state: Literal["candidate", "approved", "rejected"] = "candidate"
     review_record: dict[str, Any] | None = None

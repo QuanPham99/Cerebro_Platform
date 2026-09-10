@@ -47,7 +47,7 @@ For live frontend development, install dependencies and run:
 
 The launcher prefers `.venv/bin/python` when the project virtual environment exists. It starts the API/MCP service on port 8000 and Vite on port 5173, and exits with the backend error instead of starting Vite when the API cannot initialize.
 
-In **Semantic constellation**, open **Semantic generation** and choose **Run full pipeline**. The workbench defaults to a raw DuckDB smoke test, keeps **Configured** under advanced options, restores the current server-process run after tab switches or a browser refresh, and exposes sanitized structured input/output for every stage. The active graph stays hidden until validation produces a separate candidate graph. A whole-candidate review decision is still recorded before a separately confirmed activation updates HTTP, MCP, graph, document, and chat consumers.
+In **Semantic constellation**, open **Semantic generation** and choose **Run full pipeline**. The workbench runs a raw DuckDB smoke test, restores the current server-process run after tab switches or a browser refresh, and exposes sanitized structured input/output for every stage. The active graph stays hidden until validation produces a separate candidate graph. The right rail remains dedicated to Pipeline while that candidate is previewed. Approval saves an immutable version; choosing the workspace default remains a separate action in **Versions**.
 
 ### Core commands
 
@@ -103,7 +103,11 @@ Run `cerebro doctor` after changing configuration. Model and key changes require
 
 | Interface | Purpose |
 | --- | --- |
+| `GET /api/bundles` | Golden plus every valid, immutable approved graph version and the workspace default |
 | `GET /api/bundles/active` | Active semantic version and object counts |
+| `GET /api/bundles/{id}/graph` | Preview one saved graph without changing the runtime |
+| `GET /api/bundles/{id}/objects/{object_id}` | Inspect one object from a saved graph version |
+| `PUT /api/bundles/default` | Explicitly set an approved saved graph or Golden as the workspace default |
 | `GET /api/graph` | Typed nodes and edges for visualization |
 | `GET /api/concepts/{id}` | Complete OKF/Cerebro object detail |
 | `GET /api/search?q=&types=` | Ranked semantic search |
@@ -119,9 +123,16 @@ Run `cerebro doctor` after changing configuration. Model and key changes require
 | `GET /api/generation/runs/{id}/documents/{path}` | Generated candidate Markdown |
 | `POST /api/generation/runs/{id}/reviews` | Record an idempotent whole-candidate approval or rejection |
 | `POST /api/generation/runs/{id}/activate` | Verify and activate the immutable approved bundle |
+| `GET /api/definitions/context?base_bundle_id=&revision_id=` | Guided authoring choices from an approved saved graph or open definition draft |
+| `POST /api/definitions/translate` | Translate one metric or business-rule idea against an explicit graph scope |
+| `POST /api/definition-revisions` | Fork an approved graph into a validated authored revision |
+| `POST /api/definition-revisions/{id}/definitions` | Add another typed definition to the same draft revision |
+| `POST /api/definition-revisions/{id}/reviews` | Approve and save, or reject, an authored revision |
 | MCP `retrieve_grounding` | Entities, dimensions, metrics, rules, physical bindings, joins, warnings, classifications, and provenance |
 | MCP `get_concept` | Stable-ID lookup |
 | MCP `expand_neighborhood` | Typed graph expansion up to depth three |
+
+In the Semantic Constellation workspace, approval saves an immutable copy without changing the runtime. Open **Versions** to compare Golden Bank Workshop v0.2.0 with approved generated graphs and Definition revisions, preview any graph, and explicitly set the workspace-wide default. Every graph preview has an **Inspect / Define** rail; Define can fork that exact approved version into a guided metric or business-rule revision. When an operator pins `CEREBRO_BUNDLE_PATH`, the version library remains available but default changes are disabled.
 
 Text-to-SQL execution is limited to the configured local DuckDB source. The validator accepts one explicit-column `SELECT`, applies the semantic data policy, enforces time and row limits, and blocks writes and external access before execution.
 

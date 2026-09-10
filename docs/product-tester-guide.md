@@ -105,10 +105,10 @@ Pass when:
 Activate only after inspecting validation:
 
 ```bash
-cerebro activate --bundle knowledge/generated/tester-live-001
+cerebro activate --bundle knowledge/reviewed/tester-live-001
 ```
 
-Activation updates the ignored `artifacts/active-bundle.json` pointer; it never overwrites the golden bundle. Restart the server after activation.
+Activation updates the ignored `artifacts/active-bundle.json` pointer; it never overwrites the golden bundle. The CLI requires a server restart because it cannot hot-swap an already running process. The web workspace updates the pointer and live runtime together.
 
 ## 5. Test the website
 
@@ -117,6 +117,22 @@ Activation updates the ignored `artifacts/active-bundle.json` pointer; it never 
 ```
 
 Open <http://127.0.0.1:5173>.
+
+In **Semantic constellation**:
+
+1. Open **Generate**, run the database-only pipeline, inspect the candidate, and choose **Approve and save version**.
+2. Confirm that **Versions** opens with the approved graph highlighted alongside Golden Bank Workshop v0.2.0.
+3. Use **View graph** to inspect a saved version without changing runtime behavior.
+4. Choose **Set as default**, review the current-to-next confirmation, and verify that Semantic Constellation, Define, Text to SQL, HTTP, and MCP now report that semantic version.
+5. Set the Golden entry as default to verify the baseline can be restored without deleting saved versions.
+
+### Inspect, Define, and Pipeline rails
+
+1. Open the default graph and a saved graph preview. Confirm the right rail contains only **Inspect** and **Define**; **Build** must not appear.
+2. From a non-default approved graph, choose **Define** and confirm its name and version appear as the locked base graph.
+3. Use the guided form to add an aggregate or ratio metric, including table/column bindings, compatible dimensions, grain, and optional filters. Confirm no raw measure JSON field appears.
+4. Add a business rule to the same revision, then approve it with a reviewer and acknowledgement. Confirm the immutable definition revision opens in **Versions** without becoming the default.
+5. Open **Semantic generation** before, during, and after a run. Confirm the right rail remains **Pipeline** only, including while the candidate graph is visible.
 
 ### Semantic constellation
 
@@ -195,4 +211,4 @@ Mark live generation and chat as **skipped**, not passed, when no real endpoint 
 - Database missing: set an absolute `CEREBRO_DATABASE_PATH`; the semantic graph still starts from the golden bundle, but chat remains blocked.
 - Model not configured: set both `CEREBRO_LLM_API_KEY` and `CEREBRO_LLM_MODEL`, then restart.
 - Candidate already exists: choose a new output directory; generation never overwrites evidence.
-- Restore the golden bundle without deleting artifacts: set `CEREBRO_BUNDLE_PATH=knowledge/bank-workshop` in `.env` and restart.
+- Restore the golden bundle without deleting artifacts: choose Golden in **Versions**. For an operator-enforced default, set `CEREBRO_BUNDLE_PATH=knowledge/bank-workshop` in `.env` and restart; this intentionally locks UI default changes.

@@ -150,10 +150,9 @@ function MetadataList({ value, empty }: { value: unknown; empty: string }) {
   return <ul>{items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>
 }
 
-export function Inspector({ object, loading, onBuild = () => {}, onDefine = () => {}, canDefine = false, sourceBase = '/knowledge' }: { object: SemanticObject | null; loading: boolean; onBuild?: () => void; onDefine?: () => void; canDefine?: boolean; sourceBase?: string | null }) {
-  const tabs = <div className="side-panel-tabs" role="tablist" aria-label="Semantic side panel"><button className="active" role="tab" aria-selected="true">Inspect</button><button onClick={onBuild} role="tab" aria-selected="false">Build</button><button onClick={onDefine} role="tab" aria-selected="false" disabled={!canDefine} title={canDefine ? 'Add a metric or business rule' : 'Activate an approved graph to define semantics'}>Define</button></div>
-  if (loading) return <aside className="inspector">{tabs}<div className="skeleton wide" /><div className="skeleton" /><div className="skeleton tall" /></aside>
-  if (!object) return <aside className="inspector empty-inspector">{tabs}<Braces size={30} /><h2>Select a semantic object</h2><p>Follow a semantic object through physical bindings, governed relationships, metrics, rules, and policy.</p></aside>
+export function Inspector({ object, loading, sourceBase = '/knowledge' }: { object: SemanticObject | null; loading: boolean; sourceBase?: string | null }) {
+  if (loading) return <aside className="inspector"><div className="skeleton wide" /><div className="skeleton" /><div className="skeleton tall" /></aside>
+  if (!object) return <aside className="inspector empty-inspector"><Braces size={30} /><h2>Select a semantic object</h2><p>Follow a semantic object through physical bindings, governed relationships, metrics, rules, and policy.</p></aside>
 
   const c = object.cerebro || {}
   const generated = object.generated ?? null
@@ -162,7 +161,6 @@ export function Inspector({ object, loading, onBuild = () => {}, onDefine = () =
 
   return (
     <aside className="inspector" aria-live="polite">
-      {tabs}
       <div className="inspector-kicker"><span className={`type-dot ${object.profile_kind}`} />{PROFILE_PRESENTATION[object.profile_kind].label}<em>{PROFILE_PRESENTATION[object.profile_kind].layer}</em></div>
       <h2>{object.name}</h2>
       <code>{object.id}</code>

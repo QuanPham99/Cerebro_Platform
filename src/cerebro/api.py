@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,7 +13,14 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
 
+from . import generation as generation_service
 from .bundle import load_validated_bundle
+from .bundle_versions import (
+    BundleDefaultLocked,
+    BundleVersionInvalid,
+    BundleVersionNotFound,
+    BundleVersionRegistry,
+)
 from .chat import ChatOrchestrator
 from .definitions import (
     DefinitionConflictError,
@@ -26,9 +34,11 @@ from .generation import ActivationError, ReviewConflictError, ReviewValidationEr
 from .generation_runs import GenerationRunConflict, GenerationRunManager, GenerationRunNotFound, GenerationRunNotReady
 from .models import (
     AgentTrace,
+    BundleDefaultRequest,
     ChatRequest,
     ChatResponse,
     DefinitionApplyRequest,
+    DefinitionRevisionCreateRequest,
     DefinitionTranslateRequest,
     GenerationStartRequest,
     GroundingResponse,
@@ -109,18 +119,33 @@ def create_app(
     runtime_database_path = source.database_path if source is not None else settings.database_path
     runtime = {"bundle": bundle, "retriever": retriever, "chat": chat_orchestrator}
 
-    def swap_runtime(reviewed_path: Path) -> None:
-        reviewed_bundle = load_validated_bundle(reviewed_path)
-        reviewed_retriever = SemanticRetriever(reviewed_bundle, embedder=embedder_from_environment())
-        reviewed_chat = (
-            ChatOrchestrator(reviewed_bundle, reviewed_retriever, runtime_database_path, settings, provider_from_environment())
+    def prepare_runtime(next_path: Path) -> dict:
+        next_bundle = load_validated_bundle(next_path)
+        next_retriever = SemanticRetriever(next_bundle, embedder=embedder_from_environment())
+        next_chat = (
+            ChatOrchestrator(next_bundle, next_retriever, runtime_database_path, settings, provider_from_environment())
             if runtime_database_path is not None
             else None
         )
-        runtime.update(bundle=reviewed_bundle, retriever=reviewed_retriever, chat=reviewed_chat)
-        app.state.bundle = reviewed_bundle
-        app.state.retriever = reviewed_retriever
-        app.state.chat = reviewed_chat
+        return {"bundle": next_bundle, "retriever": next_retriever, "chat": next_chat}
+
+    def install_runtime(next_runtime: dict) -> None:
+        runtime.update(next_runtime)
+        app.state.bundle = next_runtime["bundle"]
+        app.state.retriever = next_runtime["retriever"]
+        app.state.chat = next_runtime["chat"]
+
+    def swap_runtime(reviewed_path: Path) -> None:
+        install_runtime(prepare_runtime(reviewed_path))
+
+    reviewed_root = Path(reviewed_output_root) if reviewed_output_root is not None else ROOT / "knowledge" / "reviewed"
+    default_change_allowed = bundle_path is None and not bool(os.getenv("CEREBRO_BUNDLE_PATH", "").strip())
+    version_registry = BundleVersionRegistry(
+        golden_root=DEFAULT_BUNDLE,
+        reviewed_root=reviewed_root,
+        active_pointer=generation_service.ACTIVE_BUNDLE_POINTER,
+        default_change_allowed=default_change_allowed,
+    )
 
     generation_manager = GenerationRunManager(
         database_path=runtime_database_path,
@@ -135,7 +160,9 @@ def create_app(
         active_bundle=lambda: runtime["bundle"],
         provider_factory=provider_from_environment,
         output_root=Path(generation_output_root) if generation_output_root is not None else ROOT / "knowledge" / "generated",
-        reviewed_root=Path(reviewed_output_root) if reviewed_output_root is not None else ROOT / "knowledge" / "reviewed",
+        reviewed_root=reviewed_root,
+        resolve_bundle=lambda identifier: version_registry.resolve(identifier).bundle,
+        active_bundle_id=lambda: version_registry.catalog(runtime["bundle"].root).default_id,
         on_activate=swap_runtime,
     )
     mcp_server = create_mcp_server(lambda: runtime["retriever"])
@@ -159,10 +186,11 @@ def create_app(
     app.state.chat = chat_orchestrator
     app.state.provider = provider
     app.state.generation = generation_manager
+    app.state.bundle_versions = version_registry
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -230,6 +258,58 @@ def create_app(
     async def golden_bundle_info() -> dict:
         return bundle_info(golden_bundle)
 
+    @app.get("/api/bundles")
+    async def bundle_versions() -> dict:
+        return version_registry.catalog(runtime["bundle"].root).model_dump(mode="json")
+
+    @app.get("/api/bundles/{bundle_id}/graph")
+    async def bundle_version_graph(bundle_id: str) -> dict:
+        try:
+            return version_registry.graph(bundle_id)
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except BundleVersionInvalid as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "bundle_version_invalid", "message": str(exc)},
+            ) from exc
+
+    @app.get("/api/bundles/{bundle_id}/objects/{object_id}")
+    async def bundle_version_object(bundle_id: str, object_id: str) -> SemanticObject:
+        try:
+            obj = version_registry.object(bundle_id, object_id)
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except BundleVersionInvalid as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "bundle_version_invalid", "message": str(exc)},
+            ) from exc
+        if obj is None:
+            raise HTTPException(status_code=404, detail={"code": "unknown_object", "id": object_id})
+        return obj
+
+    @app.put("/api/bundles/default")
+    async def set_default_bundle(payload: BundleDefaultRequest) -> dict:
+        try:
+            resolved = version_registry.resolve(payload.bundle_id)
+            prepared = prepare_runtime(resolved.path)
+            _, activation = version_registry.set_default(payload.bundle_id)
+            install_runtime(prepared)
+            return activation
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except BundleDefaultLocked as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "default_locked_by_configuration", "message": str(exc)},
+            ) from exc
+        except (BundleVersionInvalid, ActivationError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "activation_blocked", "message": str(exc)},
+            ) from exc
+
     @app.get("/api/golden/graph")
     async def golden_graph() -> dict:
         return golden_retriever.graph().model_dump(mode="json")
@@ -242,35 +322,24 @@ def create_app(
         return obj
 
     @app.get("/api/definitions/context")
-    async def definition_context() -> dict:
-        current = runtime["bundle"]
-        if current.review_state != "approved":
+    async def definition_context(
+        base_bundle_id: str | None = Query(default=None),
+        revision_id: str | None = Query(default=None),
+    ) -> dict:
+        try:
+            return definition_manager.context(
+                base_bundle_id=base_bundle_id,
+                revision_id=revision_id,
+            )
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+        except (BundleVersionInvalid, DefinitionValidationError) as exc:
             raise HTTPException(
                 status_code=409,
-                detail={"code": "active_graph_not_approved", "message": "Activate an approved graph before authoring definitions."},
-            )
-        return {
-            "version": current.version,
-            "entities": [
-                {"id": obj.id, "name": obj.name}
-                for obj in current.objects if obj.profile_kind == "entity"
-            ],
-            "dimensions": [
-                {"id": obj.id, "name": obj.name, "entity": obj.cerebro.get("entity")}
-                for obj in current.objects if obj.profile_kind == "dimension"
-            ],
-            "tables": [
-                {
-                    "id": obj.id,
-                    "name": obj.name,
-                    "columns": [
-                        {"name": column.get("name"), "data_type": column.get("data_type")}
-                        for column in obj.cerebro.get("columns", [])
-                    ],
-                }
-                for obj in current.objects if obj.profile_kind == "physical_table"
-            ],
-        }
+                detail={"code": "definition_context_unavailable", "message": str(exc)},
+            ) from exc
 
     @app.get("/api/graph")
     async def graph() -> dict:
@@ -474,15 +543,25 @@ def create_app(
     async def translate_definition(payload: DefinitionTranslateRequest) -> dict:
         try:
             return definition_manager.translate(payload).model_dump(mode="json")
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except DefinitionRevisionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_definition_revision"}) from exc
+        except BundleVersionInvalid as exc:
+            raise HTTPException(status_code=409, detail={"code": "bundle_version_invalid", "message": str(exc)}) from exc
         except DefinitionProviderUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "definition_provider_unavailable", "message": str(exc)}) from exc
         except (DefinitionValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail={"code": "invalid_definition", "message": str(exc)}) from exc
 
     @app.post("/api/definition-revisions", status_code=201)
-    async def create_definition_revision(payload: DefinitionApplyRequest) -> dict:
+    async def create_definition_revision(payload: DefinitionRevisionCreateRequest) -> dict:
         try:
             return definition_manager.create(payload).model_dump(mode="json")
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except BundleVersionInvalid as exc:
+            raise HTTPException(status_code=409, detail={"code": "bundle_version_invalid", "message": str(exc)}) from exc
         except DefinitionConflictError as exc:
             raise HTTPException(status_code=409, detail={"code": "definition_conflict", "message": str(exc)}) from exc
         except DefinitionValidationError as exc:

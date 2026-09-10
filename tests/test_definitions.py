@@ -140,6 +140,74 @@ def test_definition_api_preserves_golden_and_exposes_draft_graph(tmp_path: Path)
     assert bundle_digest(DEFAULT_BUNDLE) == before
 
 
+def test_definition_api_forks_any_trusted_approved_version(tmp_path: Path):
+    generated = tmp_path / "generated"
+    reviewed = tmp_path / "reviewed"
+    before = bundle_digest(DEFAULT_BUNDLE)
+    app = create_app(
+        bundle_path=DEFAULT_BUNDLE,
+        generation_output_root=generated,
+        reviewed_output_root=reviewed,
+    )
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            first_payload = metric_request().model_dump(mode="json")
+            first_payload["base_bundle_id"] = "golden"
+            first = await client.post("/api/definition-revisions", json=first_payload)
+            assert first.status_code == 201
+            first_revision = first.json()
+            assert first_revision["base_bundle_id"] == "golden"
+            assert first_revision["definitions"] == [
+                {"id": "metric.account-count", "name": "Account Count", "kind": "metric"}
+            ]
+
+            draft_context = await client.get(
+                "/api/definitions/context",
+                params={"revision_id": first_revision["id"]},
+            )
+            assert draft_context.status_code == 200
+            assert any(item["id"] == "metric.account-count" for item in draft_context.json()["metrics"])
+
+            approval = await client.post(
+                f"/api/definition-revisions/{first_revision['id']}/reviews",
+                json={
+                    "decision": "approve",
+                    "reviewer": "Data Owner",
+                    "comment": "Metric reviewed.",
+                    "acknowledge_ai_risk": True,
+                },
+            )
+            assert approval.status_code == 200
+
+            saved_context = await client.get(
+                "/api/definitions/context",
+                params={"base_bundle_id": first_revision["id"]},
+            )
+            assert saved_context.status_code == 200
+            assert saved_context.json()["bundle_id"] == first_revision["id"]
+
+            second_payload = rule_request().model_dump(mode="json")
+            second_payload["base_bundle_id"] = first_revision["id"]
+            second = await client.post("/api/definition-revisions", json=second_payload)
+            assert second.status_code == 201
+            assert second.json()["base_bundle_id"] == first_revision["id"]
+            assert second.json()["base_version"] == first_revision["version"]
+
+            before_unknown = sorted(path.name for path in generated.iterdir())
+            unknown_payload = rule_request().model_dump(mode="json")
+            unknown_payload["base_bundle_id"] = "missing-version"
+            unknown = await client.post("/api/definition-revisions", json=unknown_payload)
+            assert unknown.status_code == 404
+            assert sorted(path.name for path in generated.iterdir()) == before_unknown
+
+    asyncio.run(exercise())
+    assert bundle_digest(DEFAULT_BUNDLE) == before
+
+
 def test_definition_translation_uses_typed_approved_graph_context(tmp_path: Path):
     requested_models: list[type] = []
     prompts: list[str] = []

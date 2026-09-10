@@ -18,6 +18,7 @@ from .models import (
     BusinessRuleDefinitionPayload,
     DefinitionApplyRequest,
     DefinitionRevision,
+    DefinitionRevisionCreateRequest,
     DefinitionTranslateRequest,
     DefinitionTranslation,
     MetricDefinitionPayload,
@@ -264,7 +265,7 @@ def _apply_to_copy(
     root: Path,
     request: DefinitionApplyRequest,
     provider: GenerationProvider | None,
-) -> None:
+) -> str:
     bundle = BundleLoader().load(root)
     normalized = _normalize_request(bundle, request)
     definition = normalized.payload.definition
@@ -279,6 +280,17 @@ def _apply_to_copy(
     if not report.valid:
         message = "; ".join(f"{issue.code}: {issue.message}" for issue in report.issues)
         raise DefinitionValidationError(message)
+    return definition.id
+
+
+def _record_authored_definition(root: Path, object_id: str) -> None:
+    manifest_path = root / "bundle.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    authored = [str(item) for item in manifest.get("authored_definition_ids", [])]
+    if object_id not in authored:
+        authored.append(object_id)
+    manifest["authored_definition_ids"] = authored
+    manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
 
 
 def _summary(revision_id: str, root: Path, review: ReviewRecord | None = None) -> DefinitionRevision:
@@ -289,9 +301,16 @@ def _summary(revision_id: str, root: Path, review: ReviewRecord | None = None) -
         counts[obj.profile_kind] = counts.get(obj.profile_kind, 0) + 1
     return DefinitionRevision(
         id=revision_id,
+        base_bundle_id=manifest.get("base_bundle_id"),
         base_version=str(manifest.get("parent_version", "")),
         version=bundle.version,
         counts=counts,
+        definitions=[
+            {"id": obj.id, "name": obj.name, "kind": obj.profile_kind}
+            for object_id in manifest.get("authored_definition_ids", [])
+            if (obj := bundle.by_id().get(str(object_id))) is not None
+            and obj.profile_kind in {"metric", "business_rule"}
+        ],
         review_state="approved" if review and review.decision == "approve" else "rejected" if review else "candidate",
         review_record=review.model_dump(mode="json") if review else None,
     )
@@ -304,21 +323,104 @@ class DefinitionRevisionManager:
         provider_factory: Callable[[], GenerationProvider | None],
         output_root: Path,
         reviewed_root: Path,
+        resolve_bundle: Callable[[str], SemanticBundle] | None = None,
+        active_bundle_id: Callable[[], str | None] | None = None,
         on_activate: Callable[[Path], None] | None = None,
     ):
         self.active_bundle = active_bundle
         self.provider_factory = provider_factory
         self.output_root = output_root
         self.reviewed_root = reviewed_root
+        self.resolve_bundle = resolve_bundle
+        self.active_bundle_id = active_bundle_id
         self.on_activate = on_activate
         self._paths: dict[str, Path] = {}
         self._reviews: dict[str, ReviewRecord] = {}
+
+    def _scoped_bundle(
+        self,
+        *,
+        base_bundle_id: str | None = None,
+        revision_id: str | None = None,
+    ) -> tuple[SemanticBundle, str | None]:
+        if base_bundle_id and revision_id:
+            raise DefinitionValidationError("base_bundle_id and revision_id are mutually exclusive")
+        if revision_id:
+            return BundleLoader().load(self._path(revision_id)), self.get(revision_id).base_bundle_id
+        if base_bundle_id:
+            if self.resolve_bundle is None:
+                raise DefinitionValidationError("Saved graph versions are unavailable")
+            bundle = self.resolve_bundle(base_bundle_id)
+            if bundle.review_state != "approved":
+                raise DefinitionValidationError("Definitions require an approved graph version")
+            return bundle, base_bundle_id
+        bundle = self.active_bundle()
+        return bundle, self.active_bundle_id() if self.active_bundle_id else None
+
+    @staticmethod
+    def _context(bundle: SemanticBundle, bundle_id: str | None) -> dict[str, Any]:
+        return {
+            "bundle_id": bundle_id,
+            "version": bundle.version,
+            "entities": [
+                {"id": obj.id, "name": obj.name}
+                for obj in bundle.objects if obj.profile_kind == "entity"
+            ],
+            "dimensions": [
+                {
+                    "id": obj.id,
+                    "name": obj.name,
+                    "entity": obj.cerebro.get("entity"),
+                    "semantic_type": obj.cerebro.get("semantic_type"),
+                }
+                for obj in bundle.objects if obj.profile_kind == "dimension"
+            ],
+            "tables": [
+                {
+                    "id": obj.id,
+                    "name": obj.name,
+                    "columns": [
+                        {"name": column.get("name"), "data_type": column.get("data_type")}
+                        for column in obj.cerebro.get("columns", [])
+                    ],
+                }
+                for obj in bundle.objects if obj.profile_kind == "physical_table"
+            ],
+            "metrics": [
+                {"id": obj.id, "name": obj.name, "entity": obj.cerebro.get("entity")}
+                for obj in bundle.objects if obj.profile_kind == "metric"
+            ],
+            "business_rules": [
+                {"id": obj.id, "name": obj.name, "entity": obj.cerebro.get("entity")}
+                for obj in bundle.objects if obj.profile_kind == "business_rule"
+            ],
+        }
+
+    def context(
+        self,
+        *,
+        base_bundle_id: str | None = None,
+        revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        bundle, bundle_id = self._scoped_bundle(
+            base_bundle_id=base_bundle_id,
+            revision_id=revision_id,
+        )
+        if bundle.review_state not in {"approved", "candidate"}:
+            raise DefinitionValidationError("Definitions require an approved graph version or open draft")
+        return self._context(bundle, bundle_id)
 
     def translate(self, request: DefinitionTranslateRequest) -> DefinitionTranslation:
         provider = self.provider_factory()
         if provider is None:
             raise DefinitionProviderUnavailable("No model provider is configured; use the manual form instead")
-        bundle = self.active_bundle()
+        bundle, _ = self._scoped_bundle(
+            base_bundle_id=request.base_bundle_id,
+            revision_id=request.revision_id,
+        )
+        allowed_states = {"approved", "candidate"} if request.revision_id else {"approved"}
+        if bundle.review_state not in allowed_states:
+            raise DefinitionValidationError("Definitions require an approved graph version or open draft")
         context = [
             {
                 "id": obj.id,
@@ -353,8 +455,10 @@ class DefinitionRevisionManager:
             model=provider.model,
         )
 
-    def create(self, request: DefinitionApplyRequest) -> DefinitionRevision:
-        base = self.active_bundle()
+    def create(self, request: DefinitionRevisionCreateRequest | DefinitionApplyRequest) -> DefinitionRevision:
+        base, base_bundle_id = self._scoped_bundle(
+            base_bundle_id=getattr(request, "base_bundle_id", None),
+        )
         if base.review_state != "approved":
             raise DefinitionValidationError("Definitions can be added only after the graph is approved and activated")
         revision_id = _revision_id()
@@ -374,9 +478,12 @@ class DefinitionRevisionManager:
                 "run_id": revision_id,
                 "parent_version": base.version,
                 "parent_digest": bundle_digest(base.root),
+                "base_bundle_id": base_bundle_id,
+                "authored_definition_ids": [],
             })
             manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
-            _apply_to_copy(temporary, request, self.provider_factory())
+            object_id = _apply_to_copy(temporary, request, self.provider_factory())
+            _record_authored_definition(temporary, object_id)
             destination = self.output_root / revision_id
             temporary.replace(destination)
             self._paths[revision_id] = destination
@@ -394,7 +501,8 @@ class DefinitionRevisionManager:
         backup = self.output_root / f".{revision_id}-backup"
         try:
             shutil.copytree(current, temporary, dirs_exist_ok=True)
-            _apply_to_copy(temporary, request, self.provider_factory())
+            object_id = _apply_to_copy(temporary, request, self.provider_factory())
+            _record_authored_definition(temporary, object_id)
             current.replace(backup)
             temporary.replace(current)
             shutil.rmtree(backup)

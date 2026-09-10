@@ -79,6 +79,38 @@ export interface BundleInfo {
   discovery_evidence?: Record<string, string | number | boolean>
 }
 
+export interface BundleVersionSummary {
+  id: string
+  name: string
+  version: string
+  origin: 'golden' | 'generation' | 'definition'
+  is_default: boolean
+  review_state: 'approved'
+  reviewer: string | null
+  reviewed_at: string | null
+  parent_version: string | null
+  counts: Record<string, number>
+  kind_counts: Record<string, number>
+  generation_mode: string
+  source_mode: 'configured' | 'database_only'
+  provider: string | null
+  model: string | null
+}
+
+export interface BundleVersionCatalog {
+  default_id: string | null
+  default_change_allowed: boolean
+  versions: BundleVersionSummary[]
+}
+
+export interface BundleActivation {
+  bundle_id: string
+  path: string
+  name: string
+  version: string
+  activated_at: string
+}
+
 export interface RuntimeStatus {
   llm_configured: boolean
   provider_id: string
@@ -192,19 +224,29 @@ export interface DefinitionTranslation {
 
 export interface DefinitionRevision {
   id: string
+  base_bundle_id: string | null
   base_version: string
   version: string
   counts: Record<string, number>
+  definitions: Array<{ id: string; name: string; kind: DefinitionKind }>
   generation_mode: 'authored'
   review_state: 'candidate' | 'approved' | 'rejected'
   review_record: ReviewRecord | null
 }
 
 export interface DefinitionContext {
+  bundle_id: string | null
   version: string
   entities: Array<{ id: string; name: string }>
-  dimensions: Array<{ id: string; name: string; entity?: string | null }>
+  dimensions: Array<{ id: string; name: string; entity?: string | null; semantic_type?: string | null }>
   tables: Array<{ id: string; name: string; columns: Array<{ name: string; data_type: string }> }>
+  metrics: Array<{ id: string; name: string; entity?: string | null }>
+  business_rules: Array<{ id: string; name: string; entity?: string | null }>
+}
+
+export interface DefinitionScope {
+  base_bundle_id?: string
+  revision_id?: string
 }
 
 export interface ReviewRecord {
