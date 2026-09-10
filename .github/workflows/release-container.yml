@@ -1,0 +1,129 @@
+name: Release production container
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version beginning with v
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+
+      - name: Resolve immutable release names
+        id: meta
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+          VCR_REGISTRY: ${{ secrets.VCR_REGISTRY }}
+          VCR_IMAGE_NAME: ${{ secrets.VCR_IMAGE_NAME }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="${MANUAL_VERSION}"
+          fi
+          [[ "${version}" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]
+          [[ -n "${VCR_REGISTRY}" && -n "${VCR_IMAGE_NAME}" ]]
+          image="${VCR_REGISTRY}/${VCR_IMAGE_NAME}"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+          echo "image=${image}" >>"${GITHUB_OUTPUT}"
+          echo "local_tag=cerebro-release:${GITHUB_SHA}" >>"${GITHUB_OUTPUT}"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up locked Python environment
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.18"
+          enable-cache: true
+
+      - name: Run complete Python suite
+        run: |
+          uv sync --frozen --extra ai --extra dev
+          uv run --frozen --extra ai --extra dev python -m pytest -q
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Test and build frontend
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build amd64 image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.local_tag }}
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test hardened image
+        run: scripts/deploy/image-smoke.sh "${{ steps.meta.outputs.local_tag }}"
+
+      - name: Log in to GreenNode vCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.VCR_REGISTRY }}
+          username: ${{ secrets.VCR_USERNAME }}
+          password: ${{ secrets.VCR_PASSWORD }}
+
+      - name: Push release and commit tags
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Report digest promotion input
+        run: |
+          echo "### Cerebro release" >>"${GITHUB_STEP_SUMMARY}"
+          echo "- Commit: \`${GITHUB_SHA}\`" >>"${GITHUB_STEP_SUMMARY}"
+          echo "- Version: \`${{ steps.meta.outputs.version }}\`" >>"${GITHUB_STEP_SUMMARY}"
+          echo "- Promotion input: \`${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}\`" >>"${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,7 @@
+# Copy to /srv/cerebro/config/caddy-users.caddy and replace the example hash.
+# Generate each value with: caddy hash-password --algorithm bcrypt
+(team_auth) {
+	basic_auth {
+		example_user $2a$14$REPLACE_WITH_A_CADDY_GENERATED_BCRYPT_HASH
+	}
+}

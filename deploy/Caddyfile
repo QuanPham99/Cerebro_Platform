@@ -1,0 +1,24 @@
+{
+	admin off
+	email {$CADDY_ACME_EMAIL}
+}
+
+import /etc/caddy/caddy-users.caddy
+
+{$CEREBRO_DOMAIN} {
+	import team_auth
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		-Server
+	}
+
+	reverse_proxy cerebro:8000 {
+		flush_interval -1
+	}
+}

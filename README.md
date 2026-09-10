@@ -47,6 +47,11 @@ For live frontend development, install dependencies and run:
 
 The launcher prefers `.venv/bin/python` when the project virtual environment exists. It starts the API/MCP service on port 8000 and Vite on port 5173, and exits with the backend error instead of starting Vite when the API cannot initialize.
 
+For the production Docker image, hardened Caddy/Compose topology, GreenNode vServer provisioning,
+digest promotion, backup, smoke, and rollback procedures, see
+[`docs/deployment-greennode-vserver.md`](docs/deployment-greennode-vserver.md). Production does not
+use the development launcher.
+
 In **Semantic constellation**, open **Semantic generation** and choose **Run full pipeline**. The workbench runs a raw DuckDB smoke test, restores the current server-process run after tab switches or a browser refresh, and exposes sanitized structured input/output for every stage. The active graph stays hidden until validation produces a separate candidate graph. The right rail remains dedicated to Pipeline while that candidate is previewed. Approval saves an immutable version; choosing the workspace default remains a separate action in **Versions**.
 
 ### Core commands
@@ -103,6 +108,8 @@ Run `cerebro doctor` after changing configuration. Model and key changes require
 
 | Interface | Purpose |
 | --- | --- |
+| `GET /api/health` | Backward-compatible process and loaded-bundle liveness |
+| `GET /api/health/ready` | Deployment readiness for bundles, compiled UI, DuckDB, and required LLM configuration |
 | `GET /api/bundles` | Golden plus every valid, immutable approved graph version and the workspace default |
 | `GET /api/bundles/active` | Active semantic version and object counts |
 | `GET /api/bundles/{id}/graph` | Preview one saved graph without changing the runtime |

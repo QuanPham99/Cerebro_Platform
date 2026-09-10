@@ -14,6 +14,13 @@ apps/web/dist/
 env
 artifacts/
 knowledge/generated/
+knowledge/reviewed/
+
+# Production deployment inputs and local evidence contain credentials or host state.
+deploy/cerebro.env
+deploy/deployment.env
+deploy/caddy-users.caddy
+deploy/evidence/
 
 # Phase 2: source data and materialized database
 archive/

@@ -1,0 +1,52 @@
+**
+
+# Build definition and locked dependency metadata.
+!Dockerfile
+!pyproject.toml
+!uv.lock
+
+# Python runtime source.
+!src/
+!src/**
+
+# Runtime configuration and immutable knowledge.
+!config/
+!config/**
+!knowledge/
+!knowledge/bank-workshop/
+!knowledge/bank-workshop/**
+!vendor/
+!vendor/open-knowledge-format/
+!vendor/open-knowledge-format/**
+
+# Frontend build inputs, including colocated Vitest tests.
+!apps/
+!apps/web/
+!apps/web/package.json
+!apps/web/package-lock.json
+!apps/web/index.html
+!apps/web/tsconfig.json
+!apps/web/tsconfig.app.json
+!apps/web/tsconfig.node.json
+!apps/web/vite.config.ts
+!apps/web/vitest.config.ts
+!apps/web/src/
+!apps/web/src/**
+
+# Explicit forbidden-content rules remain documented and defense in depth.
+.git
+.codegraph
+.env
+.env.*
+.venv
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+*.duckdb
+*.duckdb.wal
+artifacts
+knowledge/generated
+knowledge/reviewed
+tests
+docs
+specs

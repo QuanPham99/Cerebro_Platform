@@ -34,6 +34,10 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 
 1. [015 — Chat grounding and SQL-validator precision fixes](015-chat-grounding-and-validator-precision-fixes.md)
 
+### Operations and deployment
+
+1. [016 — Docker and GreenNode vServer deployment](016-docker-greennode-vserver-deployment.md)
+
 ## Phase 2 scope change
 
 Phase 1 declared text-to-SQL execution out of scope. Phase 2 brings generation and read-only execution in, under these bounds:

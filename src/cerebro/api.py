@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import duckdb
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -99,6 +100,7 @@ def create_app(
     source_config: Path | str = DEFAULT_CONFIG,
     generation_output_root: Path | str | None = None,
     reviewed_output_root: Path | str | None = None,
+    web_dist_path: Path | str | None = None,
 ) -> FastAPI:
     settings = Settings.from_environment()
     resolved_bundle_path = resolve_active_bundle(bundle_path)
@@ -194,7 +196,7 @@ def create_app(
         allow_headers=["*"],
     )
 
-    web_dist = ROOT / "apps" / "web" / "dist"
+    web_dist = Path(web_dist_path) if web_dist_path is not None else ROOT / "apps" / "web" / "dist"
 
     @app.get("/api/health")
     async def health() -> dict:
@@ -206,9 +208,47 @@ def create_app(
             "bundle": current.name,
             "version": current.version,
             "objects": len(current.objects),
-            "web_ui": "built" if web_dist.exists() else "not_built",
+            "web_ui": "built" if (web_dist / "index.html").is_file() else "not_built",
             "agent": agent_status(getattr(app.state, "agent_runtime", None)),
         }
+
+    def checked_bundle(path: Path | str) -> dict[str, str]:
+        try:
+            checked = load_validated_bundle(path)
+            if checked.review_state != "approved":
+                raise ValueError("bundle is not approved")
+            return {"status": "ok", "name": checked.name, "version": checked.version}
+        except Exception:  # The readiness contract intentionally redacts parser and path details.
+            return {"status": "error"}
+
+    def database_component() -> dict[str, object]:
+        configured = runtime_database_path is not None
+        if not configured:
+            return {"status": "error", "configured": False}
+        try:
+            with duckdb.connect(str(runtime_database_path), read_only=True) as connection:
+                reachable = connection.execute("SELECT 1").fetchone() == (1,)
+        except Exception:  # Driver messages can contain filesystem paths; never return them here.
+            reachable = False
+        return {"status": "ok" if reachable else "error", "configured": True}
+
+    @app.get("/api/health/ready")
+    async def readiness() -> Response:
+        components: dict[str, dict[str, object]] = {
+            "active_bundle": checked_bundle(runtime["bundle"].root),
+            "golden_bundle": checked_bundle(DEFAULT_BUNDLE),
+            "web_ui": {"status": "ok" if (web_dist / "index.html").is_file() else "error"},
+            "database": database_component(),
+            "llm": {
+                "status": "ok" if settings.llm_configured else "error",
+                "configured": settings.llm_configured,
+            },
+        }
+        ready = all(component["status"] == "ok" for component in components.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready", "components": components},
+        )
 
     @app.get("/api/runtime/status")
     async def runtime_status() -> dict:
@@ -218,6 +258,7 @@ def create_app(
             {
                 "database_configured": runtime_database_path is not None,
                 "database_reachable": bool(runtime_database_path and runtime_database_path.is_file()),
+                "web_ui": "built" if (web_dist / "index.html").is_file() else "not_built",
                 "bundle": current.name,
                 "semantic_version": current.version,
                 "generation_mode": current.generation_mode,

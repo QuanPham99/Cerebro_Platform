@@ -1,0 +1,113 @@
+name: cerebro
+
+services:
+  cerebro:
+    image: "${CEREBRO_IMAGE:?Set CEREBRO_IMAGE to a vCR repository@sha256 digest}"
+    user: "10001:10001"
+    env_file:
+      - path: /srv/cerebro/config/cerebro.env
+        required: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8000"
+    volumes:
+      - type: bind
+        source: /srv/cerebro/data/workshop.duckdb
+        target: /data/workshop.duckdb
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/cerebro/state/generated
+        target: /app/knowledge/generated
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/cerebro/state/reviewed
+        target: /app/knowledge/reviewed
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/cerebro/state/artifacts
+        target: /app/artifacts
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - backend
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    environment:
+      CEREBRO_DOMAIN: "${CEREBRO_DOMAIN:?Set the public Cerebro DNS name}"
+      CADDY_ACME_EMAIL: "${CADDY_ACME_EMAIL:?Set the ACME account email}"
+    ports:
+      - "80:80"
+      - "443:443"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: /srv/cerebro/config/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/cerebro/config/caddy-users.caddy
+        target: /etc/caddy/caddy-users.caddy
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      cerebro:
+        condition: service_healthy
+        restart: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - edge
+      - backend
+
+networks:
+  edge:
+  backend:
+    internal: true
+
+volumes:
+  caddy_data:
+  caddy_config:
