@@ -231,7 +231,7 @@ describe('workspace navigation', () => {
     expect(screen.getByRole('menu', { name: 'Switch workspace' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('menuitemradio', { name: /Text to SQL agents/i }))
-    expect(screen.getByRole('heading', { name: 'Your Curiosity - Reliable Answer' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Your Curiosity - Cerebro Reliable Answers' })).toBeInTheDocument()
     expect(screen.getByLabelText('Cerebro Agent')).toHaveTextContent('Cerebro Agent')
     expect(screen.getByRole('heading', { name: 'Ask Cerebro' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'What tables are available to query?' })).toBeInTheDocument()
@@ -243,9 +243,6 @@ describe('workspace navigation', () => {
     expect(screen.getByText('All metadata available · database read-only')).toBeInTheDocument()
     expect(screen.queryByText('Guardrails & evals')).not.toBeInTheDocument()
     expect(screen.getByText('GreenNode · test-model')).toBeInTheDocument()
-    expect(screen.getByLabelText('Runtime status')).toHaveTextContent('test-model')
-    expect(screen.getByLabelText('Runtime status')).toHaveTextContent('DuckDB read-only')
-    expect(screen.getByLabelText('Runtime status')).toHaveTextContent('100 row cap')
     expect(screen.queryByText(/Execution contract/i)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Collapse sidebar' }))

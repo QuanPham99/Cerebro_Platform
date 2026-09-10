@@ -4,6 +4,7 @@ import {
   Bot,
   Box,
   Check,
+  ChevronRight,
   ChevronsUpDown,
   Clock,
   Database,
@@ -24,14 +25,14 @@ import {
   Waypoints,
   X,
 } from 'lucide-react'
-import { generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, setDefaultBundle, startGeneration } from './api'
+import { generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, setDefaultBundle, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
-import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
+import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
 import { VersionLibrary } from './VersionLibrary'
 
 type Workspace = 'semantic' | 'text-to-sql'
@@ -135,6 +136,47 @@ function WorkspaceMenu({
   )
 }
 
+function SchemaOverview() {
+  const [context, setContext] = useState<DefinitionContext | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const controller = new AbortController()
+    getDefinitionContext({}, controller.signal)
+      .then(setContext)
+      .catch((reason: Error) => { if (reason.name !== 'AbortError') setError(reason.message || 'Could not load table schemas.') })
+    return () => controller.abort()
+  }, [])
+
+  return (
+    <details className="schema-overview" open>
+      <summary className="schema-overview-heading rail-toggle">
+        <ChevronRight size={12} className="chevron-icon" />
+        <Database size={13} />
+        <span>Database tables</span>
+        <em>{context ? context.tables.length : '—'}</em>
+      </summary>
+      {error && <p className="schema-overview-status error">{error}</p>}
+      {!context && !error && <p className="schema-overview-status">Loading table schemas…</p>}
+      {context && context.tables.length === 0 && <p className="schema-overview-status">No physical tables in the active bundle.</p>}
+      {context && context.tables.length > 0 && (
+        <div className="schema-overview-list">
+          {context.tables.map((table) => (
+            <details className="schema-table" key={table.id}>
+              <summary><ChevronRight size={12} /><span>{table.name}</span><em>{table.columns.length}</em></summary>
+              <ul className="schema-table-columns">
+                {table.columns.map((column) => (
+                  <li key={column.name}><code>{column.name}</code><span>{column.data_type}</span></li>
+                ))}
+              </ul>
+            </details>
+          ))}
+        </div>
+      )}
+    </details>
+  )
+}
+
 function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
   const setupSteps = [
     { label: 'Agent topology', detail: '5-agent bounded runtime', ready: true },
@@ -151,16 +193,22 @@ function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
   const nextIndex = setupSteps.findIndex((step) => !step.ready)
   return (
     <aside className="setup-rail">
-      <div className="setup-rail-heading"><span>Runtime setup</span><em>{readyCount} / 5 ready</em></div>
-      <div className="setup-progress"><i style={{ width: `${readyCount * 20}%` }} /></div>
-      <nav aria-label="Agent setup steps">
-        {setupSteps.map((step, index) => (
-          <div key={step.label} className={`setup-step ${index === nextIndex ? 'active' : ''}`} aria-current={index === nextIndex ? 'step' : undefined}>
-            <span className={`step-index ${step.ready ? 'ready' : index === nextIndex ? 'next' : 'waiting'}`}>{step.ready ? <Check size={12} /> : index + 1}</span>
-            <span><strong>{step.label}</strong><small>{step.detail}</small></span>
-          </div>
-        ))}
-      </nav>
+      <details className="setup-rail-section" open>
+        <summary className="setup-rail-heading rail-toggle">
+          <span className="rail-heading-label"><ChevronRight size={12} className="chevron-icon" />Runtime setup</span>
+          <em>{readyCount} / 5 ready</em>
+        </summary>
+        <div className="setup-progress"><i style={{ width: `${readyCount * 20}%` }} /></div>
+        <nav aria-label="Agent setup steps">
+          {setupSteps.map((step, index) => (
+            <div key={step.label} className={`setup-step ${index === nextIndex ? 'active' : ''}`} aria-current={index === nextIndex ? 'step' : undefined}>
+              <span className={`step-index ${step.ready ? 'ready' : index === nextIndex ? 'next' : 'waiting'}`}>{step.ready ? <Check size={12} /> : index + 1}</span>
+              <span><strong>{step.label}</strong><small>{step.detail}</small></span>
+            </div>
+          ))}
+        </nav>
+      </details>
+      <SchemaOverview />
       <div className="setup-rail-note"><ShieldCheck size={14} /><span>Execution stays read-only until every launch check passes.</span></div>
     </aside>
   )
@@ -232,10 +280,9 @@ const PRESET_QUESTION_LEVELS: { level: string; questions: string[] }[] = [
 
 function PresetQuestions({ onSelect, disabled }: { onSelect: (question: string) => void; disabled: boolean }) {
   return (
-    <aside className="preset-panel" aria-label="Preset test questions">
+    <aside className="preset-panel" aria-label="Preset questions">
       <div className="preset-panel-heading">
-        <div><ListChecks size={14} /><span>Preset test questions</span></div>
-        <p>Click a question to send it immediately — use these to probe the OKF, the semantic layer, and the agent's answer quality across rising difficulty.</p>
+        <div><ListChecks size={14} /><span>Preset questions</span>{disabled && <em className="preset-panel-status">Sending…</em>}</div>
       </div>
       <div className="preset-levels">
         {PRESET_QUESTION_LEVELS.map((group) => (
@@ -342,15 +389,6 @@ function AgentSetupWorkspace({
 
   return (
     <section className="agent-workspace">
-      <header className="agent-intro">
-        <h1>Your Curiosity - Reliable Answer</h1>
-        <div className="runtime-summary" aria-label="Runtime status">
-          <span className={runtime?.llm_configured ? 'ready' : 'blocked'}><Bot size={13} /> {runtime?.model || 'Model not configured'}</span>
-          <span className={runtime?.database_reachable ? 'ready' : 'blocked'}><Database size={13} /> {runtime?.database_reachable ? 'DuckDB read-only' : 'Database unavailable'}</span>
-          <span className="ready"><ShieldCheck size={13} /> {runtime?.query_row_limit || 100} row cap</span>
-        </div>
-      </header>
-
       <div className="chat-shell">
         <section className="chat-panel" aria-label="Cerebro Agent">
           <div className="chat-heading">
@@ -830,7 +868,7 @@ export default function App() {
               </button>
               <GenerationProgressTab events={generationEvents} trace={generationTrace} run={generationRun} starting={generationStarting} active={semanticTab === 'generation'} onSelect={openGeneration} />
             </nav>
-          : <div className="runtime-chip"><i />Governed runtime <code>{runtime?.chat_ready ? 'ready' : 'setup'}</code></div>}
+          : <h1 className="workspace-title"><span>Your Curiosity - Cerebro Reliable Answers</span></h1>}
         {workspace === 'semantic'
           ? showVersionLibrary
             ? <div className="top-actions generation-status"><span>{versionCatalog?.versions.length || 0} approved versions</span><code>Immutable history</code></div>
