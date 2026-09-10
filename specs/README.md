@@ -37,6 +37,7 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 ### Operations and deployment
 
 1. [016 — Docker and GreenNode vServer deployment](016-docker-greennode-vserver-deployment.md)
+2. [017 — GreenNode Agent Runtime deployment with baked-in database](017-greennode-agent-runtime-deployment.md)
 
 ## Phase 2 scope change
 

@@ -1,5 +1,10 @@
 # Deploy Cerebro to one GreenNode vServer
 
+This runbook targets a self-managed GreenNode **vServer** (VM) running Docker Compose. For the
+GreenNode **Agent Runtime** (managed PaaS) path, see
+[`deployment-greennode-agent-runtime.md`](deployment-greennode-agent-runtime.md) instead — that is
+the currently used path; this document remains valid if vServer access is available later.
+
 This runbook deploys one `linux/amd64` Cerebro container behind Caddy. Caddy is the only public
 service and applies HTTPS plus team-wide Basic Authentication before forwarding any SPA, API,
 documentation, knowledge, or MCP request. Cerebro's database is read-only; semantic candidates,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
 import json
 import os
 from collections.abc import Callable
@@ -189,6 +191,44 @@ def create_app(
     app.state.provider = provider
     app.state.generation = generation_manager
     app.state.bundle_versions = version_registry
+    if settings.basic_auth_enabled:
+        # Off by default. Every serving path (including the mounted MCP app and the
+        # static SPA) previously relied entirely on an external Caddy sidecar for
+        # auth (see deploy/Caddyfile) — that sidecar isn't part of the GreenNode
+        # Agent Runtime target, so this is a fallback gate to avoid ever shipping a
+        # fully open deployment. Prefer a platform-native gateway/access-control
+        # layer over this when one is confirmed available.
+        expected_user = settings.basic_auth_user or ""
+        expected_password = settings.basic_auth_password or ""
+        # Both the image's own HEALTHCHECK and any platform-level liveness/readiness
+        # probe (Docker, GreenNode Agent Runtime) hit these unauthenticated — they
+        # carry no secrets (already-redacted status only), so they stay open even
+        # when Basic Auth is enabled for every other route.
+        unauthenticated_paths = {"/api/health", "/api/health/ready"}
+
+        @app.middleware("http")
+        async def enforce_basic_auth(request: Request, call_next):
+            if request.url.path in unauthenticated_paths:
+                return await call_next(request)
+            scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+            supplied_user = supplied_password = ""
+            if scheme.lower() == "basic" and encoded:
+                try:
+                    decoded = base64.b64decode(encoded).decode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    decoded = ""
+                supplied_user, _, supplied_password = decoded.partition(":")
+            authorized = hmac.compare_digest(supplied_user, expected_user) and hmac.compare_digest(
+                supplied_password, expected_password
+            )
+            if not authorized:
+                return Response(
+                    status_code=401,
+                    content="Unauthorized",
+                    headers={"WWW-Authenticate": 'Basic realm="Cerebro"'},
+                )
+            return await call_next(request)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

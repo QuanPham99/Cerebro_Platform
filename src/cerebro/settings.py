@@ -38,10 +38,16 @@ class Settings:
     llm_max_retries: int = 2
     llm_retry_backoff_seconds: float = 2.0
     llm_timeout_backoff_multiplier: float = 1.5
+    basic_auth_user: str | None = None
+    basic_auth_password: str | None = None
 
     @property
     def llm_configured(self) -> bool:
         return bool(self.llm_api_key and self.llm_model)
+
+    @property
+    def basic_auth_enabled(self) -> bool:
+        return bool(self.basic_auth_user and self.basic_auth_password)
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -69,6 +75,8 @@ class Settings:
             llm_timeout_backoff_multiplier=max(
                 1.0, min(float(os.getenv("CEREBRO_LLM_TIMEOUT_BACKOFF_MULTIPLIER", "1.5")), 3.0)
             ),
+            basic_auth_user=_clean(os.getenv("CEREBRO_BASIC_AUTH_USER")),
+            basic_auth_password=_clean(os.getenv("CEREBRO_BASIC_AUTH_PASSWORD")),
         )
 
     def public_status(self) -> dict[str, object]:

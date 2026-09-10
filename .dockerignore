@@ -50,3 +50,10 @@ knowledge/reviewed
 tests
 docs
 specs
+
+# Baked-in demo database, staged into data/workshop.duckdb immediately before
+# `docker build` (see docs/deployment-greennode-agent-runtime.md). This must stay
+# after the *.duckdb exclusion above so the single file is re-included; sibling
+# files (e.g. a .duckdb.wal) remain excluded.
+!data/
+!data/workshop.duckdb

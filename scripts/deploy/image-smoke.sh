@@ -18,11 +18,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${work_dir}/data" "${work_dir}/generated" "${work_dir}/reviewed" "${work_dir}/artifacts"
+mkdir -p "${work_dir}/generated" "${work_dir}/reviewed" "${work_dir}/artifacts"
 chmod 0777 "${work_dir}"/*
-docker run --rm --user 10001:10001 --entrypoint python \
-  --mount "type=bind,src=${work_dir}/data,dst=/work" \
-  "${image}" -c "import os, duckdb; p='/work/workshop.duckdb'; c=duckdb.connect(p); c.execute('create table smoke(id integer)'); c.close(); os.chmod(p, 0o444)"
 
 configured_user=$(docker image inspect --format '{{.Config.User}}' "${image}")
 [[ ${configured_user} == "10001:10001" ]]
@@ -34,8 +31,11 @@ docker run --rm --entrypoint /bin/sh "${image}" -c '
   test ! -e /app/tests
   test ! -e /app/.codegraph
   test -z "$(find /app/knowledge/generated /app/knowledge/reviewed /app/artifacts -type f -print -quit)"
-  test -z "$(find /app -type f \( -name "*.duckdb" -o -name "*.duckdb.wal" \) -print -quit)"
+  test -f /data/workshop.duckdb
+  test -z "$(find / -xdev -type f \( -name "*.duckdb" -o -name "*.duckdb.wal" \) -not -path "/data/workshop.duckdb" -print -quit)"
 '
+baked_db_owner=$(docker run --rm --entrypoint /bin/sh "${image}" -c "stat -c '%u:%g %a' /data/workshop.duckdb")
+[[ ${baked_db_owner} == "10001:10001 444" ]]
 
 docker run --detach --name "${container_name}" \
   --read-only \
@@ -43,10 +43,8 @@ docker run --detach --name "${container_name}" \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --publish 127.0.0.1::8000 \
-  --env CEREBRO_DATABASE_PATH=/data/workshop.duckdb \
   --env CEREBRO_LLM_API_KEY=image-smoke-key \
   --env CEREBRO_LLM_MODEL=image-smoke-model \
-  --mount "type=bind,src=${work_dir}/data/workshop.duckdb,dst=/data/workshop.duckdb,readonly" \
   --mount "type=bind,src=${work_dir}/generated,dst=/app/knowledge/generated" \
   --mount "type=bind,src=${work_dir}/reviewed,dst=/app/knowledge/reviewed" \
   --mount "type=bind,src=${work_dir}/artifacts,dst=/app/artifacts" \
@@ -66,7 +64,7 @@ curl --fail --silent --show-error "http://127.0.0.1:${port}/api/health/ready" >/
 docker exec "${container_name}" sh -c '! touch /app/root-filesystem-must-be-read-only'
 docker exec "${container_name}" sh -c 'touch /app/artifacts/write-probe /app/knowledge/generated/write-probe /app/knowledge/reviewed/write-probe /tmp/write-probe'
 if docker exec "${container_name}" python -c "import duckdb; c=duckdb.connect('/data/workshop.duckdb'); c.execute('create table forbidden_write(id integer)')" >/dev/null 2>&1; then
-  echo "DuckDB bind mount unexpectedly accepted a write." >&2
+  echo "Baked-in DuckDB unexpectedly accepted a write." >&2
   exit 1
 fi
 

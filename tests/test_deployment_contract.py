@@ -32,6 +32,9 @@ def test_dockerfile_is_locked_multi_stage_non_root_runtime():
     assert "/api/health/ready" in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert "org.opencontainers.image.version" in dockerfile
+    assert "COPY --chown=10001:10001 data/workshop.duckdb /data/workshop.duckdb" in dockerfile
+    assert "test -s /data/workshop.duckdb" in dockerfile
+    assert "chmod 0444 /data/workshop.duckdb" in dockerfile
 
 
 def test_dockerignore_is_allowlisted_and_excludes_runtime_data():
@@ -54,6 +57,12 @@ def test_dockerignore_is_allowlisted_and_excludes_runtime_data():
         assert forbidden in ignored
     assert "!knowledge/bank-workshop/**" in ignored
     assert "!vendor/open-knowledge-format/**" in ignored
+    assert "!data/workshop.duckdb" in ignored
+    assert ignored.index("*.duckdb") < ignored.index("!data/workshop.duckdb"), (
+        "the re-include of the baked-in demo database must come after the "
+        "blanket *.duckdb exclusion, or Docker's last-match-wins ordering "
+        "would still block it"
+    )
 
 
 def test_compose_hardens_cerebro_and_publishes_only_caddy():
@@ -101,7 +110,11 @@ def test_caddy_authenticates_the_entire_site_and_preserves_streaming():
 def test_release_workflow_uses_amd64_immutable_tags_and_digest_output():
     workflow = read(".github/workflows/release-container.yml")
 
-    assert "v*" in workflow
+    # The release image bakes in data/workshop.duckdb (see Dockerfile), which only
+    # exists on the release operator's machine, not on GitHub-hosted runners, so
+    # automatic tag-push builds are disabled in favor of a manual, documented
+    # local build/push flow (docs/deployment-greennode-agent-runtime.md).
+    assert not re.search(r"^\s*-\s*\"v\*\"", workflow, re.MULTILINE)
     assert "workflow_dispatch:" in workflow
     assert "python -m pytest -q" in workflow
     assert "npm test" in workflow and "npm run build" in workflow

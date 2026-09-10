@@ -46,7 +46,10 @@ RUN install -d -o 10001 -g 10001 \
     /app/artifacts \
     /app/knowledge/generated \
     /app/knowledge/reviewed \
-    && install -d -o root -g root -m 0555 /data
+    && install -d -o 10001 -g 10001 -m 0555 /data
+COPY --chown=10001:10001 data/workshop.duckdb /data/workshop.duckdb
+RUN test -s /data/workshop.duckdb \
+    && chmod 0444 /data/workshop.duckdb
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown

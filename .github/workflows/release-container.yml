@@ -1,9 +1,12 @@
 name: Release production container
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Automatic tag-triggered builds are disabled: the release image now bakes in
+  # data/workshop.duckdb (see Dockerfile), and GitHub-hosted runners have no
+  # access to that file (it lives only on the release operator's machine, per
+  # docs/deployment-greennode-agent-runtime.md). Builds/pushes are done locally.
+  # This workflow is kept as a manually-runnable option for a self-hosted runner
+  # that does have the database staged in its checkout.
   workflow_dispatch:
     inputs:
       version:
