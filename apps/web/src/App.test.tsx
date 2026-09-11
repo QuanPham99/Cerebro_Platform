@@ -35,6 +35,11 @@ const mocks = vi.hoisted(() => ({
   getDefinitionContext: vi.fn().mockResolvedValue({
     bundle_id: 'golden', version: '0.2.0', entities: [], dimensions: [], tables: [], metrics: [], business_rules: [],
   }),
+  listSavedCharts: vi.fn().mockResolvedValue([]),
+  saveChart: vi.fn().mockResolvedValue({
+    id: 'chart-1', question: 'How many customers by gender?', sql: null, columns: [], rows: [], row_count: 0, truncated: false, created_at: '2026-09-11T00:00:00Z',
+  }),
+  deleteSavedChart: vi.fn().mockResolvedValue({ deleted: 'chart-1' }),
 }))
 
 let eventSource: MockEventSource | null = null
@@ -153,6 +158,9 @@ vi.mock('./api', () => ({
   activateDefinitionRevision: vi.fn(),
   postChat: mocks.postChat,
   cancelChat: mocks.cancelChat,
+  listSavedCharts: mocks.listSavedCharts,
+  saveChart: mocks.saveChart,
+  deleteSavedChart: mocks.deleteSavedChart,
 }))
 
 vi.mock('./GraphView', async () => {
@@ -298,11 +306,44 @@ describe('workspace navigation', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
 
     expect(await screen.findByText('Female: 2; Male: 1.')).toBeInTheDocument()
-    expect(screen.getByText('Female')).toBeInTheDocument()
+    const table = document.querySelector('.result-table-wrap table')
+    expect(table).not.toBeNull()
+    expect(within(table as HTMLElement).getByText('Female')).toBeInTheDocument()
+    expect(document.querySelector('.result-chart')).toBeInTheDocument()
     expect(screen.getByText('table.customers')).toBeInTheDocument()
     expect(mocks.postChat).toHaveBeenCalledTimes(1)
     expect(mocks.postChat.mock.calls[0][0].request_id).toEqual(expect.any(String))
     expect(mocks.postChat.mock.calls[0][1]).toBeInstanceOf(AbortSignal)
+  })
+
+  it('saves a chat result and reopens it from the sidebar without re-querying', async () => {
+    render(<App />)
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'How many customers are there by gender?' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    await screen.findByText('Female: 2; Male: 1.')
+
+    mocks.listSavedCharts.mockResolvedValueOnce([{
+      id: 'chart-1', question: 'How many customers are there by gender?', sql: null,
+      columns: ['gender', 'total'], rows: [['Female', 2], ['Male', 1]], row_count: 2, truncated: false,
+      created_at: '2026-09-11T00:00:00Z',
+    }])
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(mocks.saveChart).toHaveBeenCalledTimes(1))
+    expect(mocks.saveChart.mock.calls[0][0]).toMatchObject({
+      question: 'How many customers are there by gender?',
+      columns: ['gender', 'total'],
+      rows: [['Female', 2], ['Male', 1]],
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear chat' }))
+    expect(screen.queryByText('Female: 2; Male: 1.')).not.toBeInTheDocument()
+
+    fireEvent.click(await screen.findByText('How many customers are there by gender?'))
+    expect(await screen.findByText('Reopened saved result.')).toBeInTheDocument()
+    expect(mocks.postChat).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the conversation and active query alive across workspace switches', async () => {

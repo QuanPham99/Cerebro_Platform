@@ -156,6 +156,17 @@ export interface ChatResponse {
   trace: AgentTrace[]
 }
 
+export interface SavedChart {
+  id: string
+  question: string
+  sql: string | null
+  columns: string[]
+  rows: Array<Array<string | number | boolean | null>>
+  row_count: number
+  truncated: boolean
+  created_at: string
+}
+
 export type GenerationStage =
   | 'source_check'
   | 'catalog_scan'

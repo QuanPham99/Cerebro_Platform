@@ -58,10 +58,13 @@ from .models import (
     GenerationStartRequest,
     GroundingResponse,
     ReviewRequest,
+    SaveChartRequest,
+    SavedChart,
     SemanticObject,
 )
 from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG, ROOT
 from .retrieval import SemanticRetriever, embedder_from_environment
+from .saved_charts import SavedChartNotFound, SavedChartStore
 from .settings import Settings, resolve_active_bundle
 from .source import DuckDBSource
 
@@ -164,6 +167,7 @@ def create_app(
     source_config: Path | str = DEFAULT_CONFIG,
     generation_output_root: Path | str | None = None,
     reviewed_output_root: Path | str | None = None,
+    saved_charts_root: Path | str | None = None,
     web_dist_path: Path | str | None = None,
 ) -> FastAPI:
     settings = Settings.from_environment()
@@ -212,6 +216,7 @@ def create_app(
         active_pointer=generation_service.ACTIVE_BUNDLE_POINTER,
         default_change_allowed=default_change_allowed,
     )
+    saved_chart_store = SavedChartStore(saved_charts_root) if saved_charts_root is not None else SavedChartStore()
 
     generation_manager = GenerationRunManager(
         database_path=runtime_database_path,
@@ -475,6 +480,22 @@ def create_app(
                 status_code=409,
                 detail={"code": "bundle_version_protected", "message": str(exc)},
             ) from exc
+
+    @app.post("/api/saved-charts", response_model=SavedChart)
+    async def create_saved_chart(payload: SaveChartRequest) -> SavedChart:
+        return saved_chart_store.create(payload)
+
+    @app.get("/api/saved-charts", response_model=list[SavedChart])
+    async def list_saved_charts() -> list[SavedChart]:
+        return saved_chart_store.list()
+
+    @app.delete("/api/saved-charts/{chart_id}")
+    async def delete_saved_chart(chart_id: str) -> dict:
+        try:
+            saved_chart_store.delete(chart_id)
+            return {"deleted": chart_id}
+        except SavedChartNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_saved_chart"}) from exc
 
     @app.get("/api/golden/graph")
     async def golden_graph() -> dict:

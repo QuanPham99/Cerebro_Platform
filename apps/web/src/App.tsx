@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  Bookmark,
   Bot,
   Box,
   Check,
@@ -26,7 +27,7 @@ import {
   Waypoints,
   X,
 } from 'lucide-react'
-import { cancelChat, deleteBundleVersion, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, SemanticApiError, setDefaultBundle, startGeneration } from './api'
+import { cancelChat, deleteBundleVersion, deleteSavedChart, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, listSavedCharts, postChat, reviewGeneration, saveChart, SemanticApiError, setDefaultBundle, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
@@ -34,7 +35,9 @@ import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
 import presetQuestionLevels from './presetQuestions.json'
-import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
+import { ResultPanel } from './ResultPanel'
+import { SavedCharts } from './SavedCharts'
+import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SavedChart, SemanticObject } from './types'
 import { VersionLibrary } from './VersionLibrary'
 
 type Workspace = 'semantic' | 'text-to-sql'
@@ -216,7 +219,7 @@ function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
 
 type ConversationEntry =
   | { role: 'user'; content: string }
-  | { role: 'assistant'; response: ChatResponse }
+  | { role: 'assistant'; question: string; response: ChatResponse }
   | { role: 'status'; requestId: string; content: string; warning?: boolean }
 
 type ActiveChatRequest = {
@@ -286,6 +289,43 @@ function QueryProgress({ elapsed }: { elapsed: number }) {
   )
 }
 
+function SaveResultButton({ question, response, onSaved }: {
+  question: string
+  response: ChatResponse
+  onSaved: () => void
+}) {
+  const [state, setState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+
+  const handleClick = async () => {
+    if (state === 'saving') return
+    setState('saving')
+    try {
+      await saveChart({
+        question,
+        sql: response.sql,
+        columns: response.columns,
+        rows: response.rows,
+        row_count: response.row_count,
+        truncated: response.truncated,
+      })
+      setState('saved')
+      onSaved()
+      window.setTimeout(() => setState('idle'), 2000)
+    } catch (reason) {
+      console.error('[Cerebro chat] Failed to save chart', reason)
+      setState('error')
+      window.setTimeout(() => setState('idle'), 2000)
+    }
+  }
+
+  return (
+    <button type="button" className="save-result" onClick={() => { void handleClick() }} disabled={state === 'saving'}>
+      {state === 'saved' ? <Check size={12} /> : <Bookmark size={12} />}
+      {state === 'saved' ? 'Saved' : state === 'error' ? 'Save failed' : 'Save'}
+    </button>
+  )
+}
+
 function AgentSetupWorkspace({
   runtime,
   onEvidence,
@@ -300,6 +340,7 @@ function AgentSetupWorkspace({
   const [pending, setPending] = useState(false)
   const [pendingElapsed, setPendingElapsed] = useState(0)
   const [conversationId, setConversationId] = useState<string>()
+  const [savedRefreshKey, setSavedRefreshKey] = useState(0)
   const transcriptRef = useRef<HTMLDivElement>(null)
   const activeRequestRef = useRef<ActiveChatRequest | null>(null)
 
@@ -341,7 +382,7 @@ function AgentSetupWorkspace({
       const response = await postChat({ message, request_id: requestId, conversation_id: conversationId, history }, controller.signal)
       if (activeRequestRef.current?.requestId !== requestId) return
       setConversationId(response.conversation_id)
-      setEntries((current) => [...current, { role: 'assistant', response }])
+      setEntries((current) => [...current, { role: 'assistant', question: message, response }])
       onEvidence(new Set(response.evidence_ids))
     } catch (reason) {
       if (activeRequestRef.current?.requestId !== requestId) return
@@ -359,6 +400,7 @@ function AgentSetupWorkspace({
       const messageText = reason instanceof Error ? reason.message : 'Chat request failed'
       setEntries((current) => [...current, {
         role: 'assistant',
+        question: message,
         response: {
           conversation_id: conversationId || 'error', status: 'blocked', answer: messageText, sql: null,
           columns: [], rows: [], row_count: 0, truncated: false,
@@ -408,6 +450,22 @@ function AgentSetupWorkspace({
     void sendMessage(input.trim())
   }
 
+  const openSavedChart = (saved: SavedChart) => {
+    setEntries((current) => [
+      ...current,
+      { role: 'user', content: saved.question },
+      {
+        role: 'assistant',
+        question: saved.question,
+        response: {
+          conversation_id: 'saved', status: 'answered', answer: 'Reopened saved result.', sql: saved.sql,
+          columns: saved.columns, rows: saved.rows, row_count: saved.row_count, truncated: saved.truncated,
+          semantic_version: runtime?.semantic_version || 'unknown', evidence_ids: [], warnings: [], trace: [],
+        },
+      },
+    ])
+  }
+
   return (
     <section className="agent-workspace" hidden={!active}>
       <div className="chat-shell">
@@ -431,10 +489,15 @@ function AgentSetupWorkspace({
             ) : entry.role === 'status' ? (
               <article className={`chat-message assistant cancelled${entry.warning ? ' warning' : ''}`} key={index}><span>Cerebro · cancelled</span><p>{entry.content}</p></article>
             ) : (
-              <article className={`chat-message assistant ${entry.response.status}`} key={index}>
+              <article className={`chat-message assistant ${entry.response.status}${entry.response.columns.length > 0 ? ' has-results' : ''}`} key={index}>
                 <span>Cerebro · {entry.response.status}</span><p>{entry.response.answer}</p>
                 {entry.response.sql && <details className="chat-detail"><summary><Terminal size={13} /> Generated SQL</summary><pre>{entry.response.sql}</pre></details>}
-                {entry.response.columns.length > 0 && <div className="result-table-wrap"><table><thead><tr>{entry.response.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{entry.response.rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((value, cellIndex) => <td key={cellIndex}>{String(value ?? 'NULL')}</td>)}</tr>)}</tbody></table>{entry.response.truncated && <small>Results truncated by the governed row cap.</small>}</div>}
+                {entry.response.columns.length > 0 && (
+                  <ResultPanel columns={entry.response.columns} rows={entry.response.rows} rowCount={entry.response.row_count} truncated={entry.response.truncated} />
+                )}
+                {entry.response.status === 'answered' && entry.response.columns.length > 0 && (
+                  <SaveResultButton question={entry.question} response={entry.response} onSaved={() => setSavedRefreshKey((key) => key + 1)} />
+                )}
                 {entry.response.evidence_ids.length > 0 && <details className="chat-detail"><summary><Network size={13} /> Semantic evidence · {entry.response.semantic_version}</summary><div className="evidence-chips">{entry.response.evidence_ids.map((id) => <code key={id}>{id}</code>)}</div></details>}
                 {entry.response.warnings.length > 0 && <details className="chat-detail warning-detail"><summary><AlertTriangle size={13} /> Warnings</summary><ul>{entry.response.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></details>}
                 {entry.response.trace.length > 0 && <details className="chat-detail"><summary><Waypoints size={13} /> Agent trace</summary><ol className="trace-list">{entry.response.trace.map((item, traceIndex) => <li className={item.status} key={`${item.agent}-${traceIndex}`}><strong>{item.agent.replaceAll('_', ' ')}</strong><span>{item.summary}</span></li>)}</ol></details>}
@@ -449,6 +512,7 @@ function AgentSetupWorkspace({
         </section>
 
         <aside className="chat-tools" aria-label="Chat tools">
+          <SavedCharts onOpen={openSavedChart} refreshKey={savedRefreshKey} />
           <PresetQuestions onSelect={sendMessage} disabled={pending} />
           <SchemaOverview />
         </aside>

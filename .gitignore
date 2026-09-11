@@ -15,6 +15,7 @@ env
 artifacts/
 knowledge/generated/
 knowledge/reviewed/
+knowledge/saved_charts/
 
 # Production deployment inputs and local evidence contain credentials or host state.
 deploy/cerebro.env

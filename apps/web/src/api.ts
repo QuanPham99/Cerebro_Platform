@@ -1,4 +1,4 @@
-import type { BundleActivation, BundleInfo, BundleVersionCatalog, ChatResponse, DefinitionContext, DefinitionPayload, DefinitionRevision, DefinitionScope, DefinitionTranslation, GenerationRun, GenerationTrace, GraphResponse, ReviewRecord, RuntimeStatus, SemanticObject } from './types'
+import type { BundleActivation, BundleInfo, BundleVersionCatalog, ChatResponse, DefinitionContext, DefinitionPayload, DefinitionRevision, DefinitionScope, DefinitionTranslation, GenerationRun, GenerationTrace, GraphResponse, ReviewRecord, RuntimeStatus, SavedChart, SemanticObject } from './types'
 
 type SemanticApiErrorPayload = {
   detail?: string | { message?: string; code?: string }
@@ -193,3 +193,13 @@ export const cancelChat = (requestId: string) =>
     undefined,
     { method: 'POST' },
   )
+
+export const listSavedCharts = (signal?: AbortSignal) => request<SavedChart[]>('/api/saved-charts', signal)
+export const saveChart = (
+  payload: { question: string; sql: string | null; columns: string[]; rows: Array<Array<string | number | boolean | null>>; row_count: number; truncated: boolean },
+  signal?: AbortSignal,
+) => request<SavedChart>('/api/saved-charts', signal, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+})
+export const deleteSavedChart = (chartId: string, signal?: AbortSignal) =>
+  request<{ deleted: string }>(`/api/saved-charts/${encodeURIComponent(chartId)}`, signal, { method: 'DELETE' })

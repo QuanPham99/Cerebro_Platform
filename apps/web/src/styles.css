@@ -518,7 +518,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .topology-footer span { display: flex; align-items: center; gap: 6px; }
 .topology-footer svg { color: #8d7fcb; }
 
-.chat-shell { width: 100%; max-width: 1680px; min-height: 760px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 320px); align-items: start; gap: 14px; margin: 0 auto; }
+.chat-shell { width: 100%; max-width: 1900px; min-height: 760px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 320px); align-items: start; gap: 14px; margin: 0 auto; }
 .chat-panel { min-width: 0; overflow: hidden; border: 1px solid #344058; border-radius: 14px; background: #11192bd9; box-shadow: 0 22px 70px #03061055; }
 .chat-panel { min-height: 760px; display: grid; grid-template-rows: 52px minmax(0, 1fr) auto; }
 .chat-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 17px; border-bottom: 1px solid #303b51; background: #151d2fd9; }
@@ -536,6 +536,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .chat-empty p { max-width: 390px; margin: 0; color: #7c899f; font-size: 11px; line-height: 1.6; }
 .chat-empty-hint { color: #a99be4; }
 .chat-message { max-width: 88%; margin-bottom: 15px; padding: 11px 13px; border: 1px solid #303c53; border-radius: 11px; background: #0e1525; }
+.chat-message.has-results { max-width: 100%; }
 .chat-message > span { color: #758198; font: 8px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .09em; }
 .chat-message > p { margin: 6px 0 0; color: #b7c1d0; font-size: 11px; line-height: 1.62; white-space: pre-wrap; }
 .chat-message.user { margin-left: auto; border-color: #a78bfa42; background: #251e4099; }
@@ -563,15 +564,44 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .result-table-wrap { margin-top: 11px; overflow-x: auto; border: 1px solid #2b384f; border-radius: 7px; }
 .result-table-wrap table { width: 100%; border-collapse: collapse; font: 9px 'JetBrains Mono'; }
 .result-table-wrap th, .result-table-wrap td { padding: 7px 8px; border-bottom: 1px solid #27344a; text-align: left; white-space: nowrap; }
-.result-table-wrap th { color: #7d8ba2; background: #0c1322; }
+.result-table-wrap th { position: sticky; top: 0; z-index: 1; color: #7d8ba2; background: #0c1322; }
 .result-table-wrap td { color: #bdc7d7; }
 .result-table-wrap td:last-child { min-width: 360px; white-space: pre-wrap; }
 .result-table-wrap small { display: block; padding: 6px 8px; color: var(--amber); font-size: 8px; }
-.chat-composer { display: flex; align-items: flex-end; gap: 9px; padding: 12px; border-top: 1px solid #303b51; background: #0d1423; }
+.result-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; align-items: stretch; }
+.result-panels .result-table-wrap { margin-top: 0; max-height: 320px; overflow-y: auto; }
+.result-chart { display: flex; flex-direction: column; margin-top: 0; padding: 12px 13px 10px; border: 1px solid #2b384f; border-radius: 7px; background: #0c1322; }
+.result-chart-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; color: #8694a9; font: 9px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .06em; }
+.result-chart-header svg { color: var(--violet); }
+.result-chart-note { display: block; margin-top: 6px; color: var(--amber); font-size: 8px; }
+.result-chart-frame { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; }
+.result-chart-svg { display: block; width: 100%; height: auto; max-height: 100%; overflow: visible; }
+.result-chart-grid { stroke: #27344a; stroke-width: 1; }
+.result-chart-axis-label { fill: #7d8ba2; font-size: 8px; font-family: 'JetBrains Mono', monospace; }
+.result-chart-bar { transition: filter .1s ease; }
+.result-chart-bar.hovered { filter: brightness(1.2); }
+.result-chart-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.result-chart-dot { stroke: #0c1322; stroke-width: 2; }
+.result-chart-crosshair { stroke: #4a5a78; stroke-width: 1; stroke-dasharray: 2 2; }
+.result-chart-tooltip { position: absolute; z-index: 3; max-width: 220px; padding: 6px 8px; color: #d7deea; border: 1px solid #344058; border-radius: 6px; background: #151d2fee; font: 9px 'JetBrains Mono'; white-space: nowrap; pointer-events: none; }
+.result-chart-tooltip strong { color: var(--text); }
+.result-chart-tooltip-row { display: flex; align-items: center; gap: 5px; margin-top: 3px; }
+.result-chart-tooltip-key { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 2px; }
+.result-chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.result-chart-legend-item { display: flex; align-items: center; gap: 5px; color: #b7c1d0; font: 9px 'JetBrains Mono'; }
+.result-chart-legend-swatch { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 2px; }
+.result-chart-kpis { display: flex; flex-wrap: wrap; gap: 8px; }
+.result-chart-kpi { min-width: 110px; padding: 9px 11px; border: 1px solid #27344a; border-radius: 7px; background: #101a2c; }
+.result-chart-kpi-label { display: block; color: #7d8ba2; font: 8px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .05em; }
+.result-chart-kpi-value { display: block; margin-top: 4px; color: var(--text); font: 15px 'JetBrains Mono'; font-weight: 600; }
+.save-result { display: flex; align-items: center; gap: 5px; margin-top: 9px; padding: 5px 9px; color: #9bd9c1; border: 1px solid #199e7055; border-radius: 6px; background: #199e700c; cursor: pointer; font-size: 9px; }
+.save-result:hover { border-color: #199e7090; background: #199e7018; }
+.save-result:disabled { opacity: .6; cursor: not-allowed; }
+.chat-composer { display: flex; align-items: center; gap: 9px; padding: 12px; border-top: 1px solid #303b51; background: #0d1423; }
 .chat-composer label { flex: 1; min-width: 0; }
-.chat-composer textarea { display: block; width: 100%; min-height: 48px; max-height: 130px; resize: vertical; padding: 11px 12px; color: #d7deea; border: 1px solid #35415a; border-radius: 10px; outline: 0; background: #080e1a; font-size: 11px; line-height: 1.45; }
+.chat-composer textarea { display: block; width: 100%; min-height: 44px; max-height: 130px; resize: vertical; padding: 11px 12px; color: #d7deea; border: 1px solid #35415a; border-radius: 10px; outline: 0; background: #080e1a; font-size: 11px; line-height: 1.45; }
 .chat-composer textarea:focus { border-color: #a78bfa7a; box-shadow: 0 0 0 3px #a78bfa0d; }
-.chat-composer button { flex: 0 0 auto; width: 42px; height: 42px; display: grid; place-items: center; color: #0b1020; border: 0; border-radius: 9px; background: linear-gradient(135deg, var(--cyan), var(--violet)); cursor: pointer; }
+.chat-composer button { flex: 0 0 auto; width: 44px; height: 44px; display: grid; place-items: center; color: #0b1020; border: 0; border-radius: 9px; background: linear-gradient(135deg, var(--cyan), var(--violet)); cursor: pointer; }
 .chat-composer button:disabled { opacity: .35; cursor: not-allowed; }
 
 .chat-tools { min-width: 0; max-height: 760px; overflow-y: auto; display: grid; align-content: start; gap: 10px; scrollbar-width: thin; scrollbar-color: #35415a transparent; }
@@ -592,6 +622,25 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .preset-level-questions button { padding: 8px 9px; color: #aab5c7; border: 1px solid #35415a; border-radius: 8px; background: #0d1424; cursor: pointer; text-align: left; font-size: 9.5px; line-height: 1.45; }
 .preset-level-questions button:hover { color: white; border-color: #a78bfa6b; background: #131b2e; }
 .preset-level-questions button:disabled { opacity: .6; cursor: not-allowed; }
+
+.saved-charts { min-width: 0; overflow: hidden; border: 1px solid #344058; border-radius: 14px; background: #11192bd9; box-shadow: 0 22px 70px #03061055; }
+.saved-charts-heading { display: flex; align-items: center; gap: 7px; padding: 14px 15px 12px; color: #cbd3df; background: #151d2f; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; }
+.saved-charts[open] > .saved-charts-heading { border-bottom: 1px solid #303b51; }
+.saved-charts-heading svg:not(.chevron-icon) { color: #9bd9c1; }
+.saved-charts-heading em { margin-left: auto; color: #6f7d94; font: 8px 'JetBrains Mono'; font-style: normal; text-transform: uppercase; }
+.saved-charts-status { margin: 6px; padding: 9px; color: #738198; border: 1px solid #2d394f; border-radius: 7px; background: #0b1120; font-size: 9px; line-height: 1.5; }
+.saved-charts-status.error { color: #ffc0cc; border-color: #f17b9144; background: #f17b910c; }
+.saved-charts-list { max-height: 320px; overflow-y: auto; display: grid; gap: 4px; margin: 0; padding: 6px; list-style: none; scrollbar-width: thin; scrollbar-color: #35415a transparent; }
+.saved-chart-item { display: flex; align-items: center; gap: 6px; padding: 3px; border: 1px solid #263250; border-radius: 7px; background: #0d1424; }
+.saved-chart-open { flex: 1; min-width: 0; display: grid; gap: 2px; padding: 6px 7px; color: #aab5c7; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.saved-chart-open:hover { color: white; }
+.saved-chart-question { overflow: hidden; font-size: 9.5px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.saved-chart-date { color: #5c6a80; font: 8px 'JetBrains Mono'; }
+.saved-chart-delete { flex: 0 0 auto; display: grid; place-items: center; width: 24px; height: 24px; color: #8694a9; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
+.saved-chart-delete:hover { color: var(--rose); background: #f17b9114; }
+.saved-chart-confirm { flex: 0 0 auto; display: flex; gap: 4px; }
+.saved-chart-confirm button { padding: 4px 7px; color: #d7deea; border: 1px solid #35415a; border-radius: 5px; background: #131b2e; cursor: pointer; font-size: 8px; }
+.saved-chart-confirm button:first-child { color: #ffc0cc; border-color: #f17b9155; }
 .preset-level-questions button:disabled:hover { color: #aab5c7; border-color: #35415a; background: #0d1424; }
 .preset-level:nth-of-type(1) header strong { color: #a78bfa; }
 .preset-level:nth-of-type(2) header strong { color: #9bd9c1; }

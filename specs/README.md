@@ -36,6 +36,8 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 2. [018 — Vietnamese preset questions with live-validated SQL guarantee](018-vietnamese-preset-questions.md)
 3. [019 — Chat gateway diagnostics and correlated console logging](019-chat-gateway-diagnostics.md)
 4. [020 — Branch TOI proxy metric and business rule](020-branch-toi-proxy.md)
+5. [021 — Saved-version deletion and review-form affordances](021-saved-version-delete-and-review-affordances.md)
+6. [022 — Chat result dashboard visualization and saved charts](022-chat-result-visualization.md)
 
 ### Operations and deployment
 

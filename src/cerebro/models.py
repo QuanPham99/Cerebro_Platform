@@ -540,6 +540,26 @@ class ChatResponse(BaseModel):
     trace: list[AgentTrace] = Field(default_factory=list)
 
 
+class SaveChartRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    sql: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+
+
+class SavedChart(BaseModel):
+    id: str
+    question: str
+    sql: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+    created_at: str
+
+
 class SemanticObject(BaseModel):
     model_config = ConfigDict(extra="allow")
 
