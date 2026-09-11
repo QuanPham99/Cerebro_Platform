@@ -24,6 +24,7 @@ import {
   Sparkles,
   Square,
   Terminal,
+  Trash2,
   Waypoints,
   X,
 } from 'lucide-react'
@@ -326,6 +327,26 @@ function SaveResultButton({ question, response, onSaved }: {
   )
 }
 
+function DeleteEntryButton({ onDelete }: { onDelete: () => void }) {
+  const [confirming, setConfirming] = useState(false)
+
+  if (confirming) {
+    return (
+      <span className="chat-message-delete-confirm">
+        <button type="button" onClick={onDelete}>Delete</button>
+        <button type="button" onClick={() => setConfirming(false)}>Cancel</button>
+      </span>
+    )
+  }
+
+  return (
+    <button type="button" className="chat-message-delete" onClick={() => setConfirming(true)}>
+      <Trash2 size={12} />
+      Delete
+    </button>
+  )
+}
+
 function AgentSetupWorkspace({
   runtime,
   onEvidence,
@@ -450,6 +471,14 @@ function AgentSetupWorkspace({
     void sendMessage(input.trim())
   }
 
+  const deleteEntry = (index: number) => {
+    setEntries((current) => {
+      const precedingIsQuestion = index > 0 && current[index - 1]?.role === 'user'
+      const cutStart = precedingIsQuestion ? index - 1 : index
+      return [...current.slice(0, cutStart), ...current.slice(index + 1)]
+    })
+  }
+
   const openSavedChart = (saved: SavedChart) => {
     setEntries((current) => [
       ...current,
@@ -490,13 +519,19 @@ function AgentSetupWorkspace({
               <article className={`chat-message assistant cancelled${entry.warning ? ' warning' : ''}`} key={index}><span>Cerebro · cancelled</span><p>{entry.content}</p></article>
             ) : (
               <article className={`chat-message assistant ${entry.response.status}${entry.response.columns.length > 0 ? ' has-results' : ''}`} key={index}>
-                <span>Cerebro · {entry.response.status}</span><p>{entry.response.answer}</p>
+                <div className="chat-message-head">
+                  <span>Cerebro · {entry.response.status}</span>
+                  <div className="chat-message-actions">
+                    {entry.response.status === 'answered' && entry.response.columns.length > 0 && (
+                      <SaveResultButton question={entry.question} response={entry.response} onSaved={() => setSavedRefreshKey((key) => key + 1)} />
+                    )}
+                    <DeleteEntryButton onDelete={() => deleteEntry(index)} />
+                  </div>
+                </div>
+                <p>{entry.response.answer}</p>
                 {entry.response.sql && <details className="chat-detail"><summary><Terminal size={13} /> Generated SQL</summary><pre>{entry.response.sql}</pre></details>}
                 {entry.response.columns.length > 0 && (
                   <ResultPanel columns={entry.response.columns} rows={entry.response.rows} rowCount={entry.response.row_count} truncated={entry.response.truncated} />
-                )}
-                {entry.response.status === 'answered' && entry.response.columns.length > 0 && (
-                  <SaveResultButton question={entry.question} response={entry.response} onSaved={() => setSavedRefreshKey((key) => key + 1)} />
                 )}
                 {entry.response.evidence_ids.length > 0 && <details className="chat-detail"><summary><Network size={13} /> Semantic evidence · {entry.response.semantic_version}</summary><div className="evidence-chips">{entry.response.evidence_ids.map((id) => <code key={id}>{id}</code>)}</div></details>}
                 {entry.response.warnings.length > 0 && <details className="chat-detail warning-detail"><summary><AlertTriangle size={13} /> Warnings</summary><ul>{entry.response.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></details>}

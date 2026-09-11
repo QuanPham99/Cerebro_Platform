@@ -478,7 +478,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .schema-overview-status { margin: 6px; padding: 9px; color: #738198; border: 1px solid #2d394f; border-radius: 7px; background: #0b1120; font-size: 9px; line-height: 1.5; }
 .schema-overview-status.error { color: #ffc0cc; border-color: #f17b9144; background: #f17b910c; }
 
-.agent-workspace { grid-column: 2 / -1; min-width: 0; min-height: 0; overflow: auto; padding: clamp(20px, 3vw, 36px) clamp(26px, 5vw, 78px) 32px; background: radial-gradient(circle at 48% 34%, #2b245354 0, transparent 32%), radial-gradient(circle at 78% 78%, #173b4640 0, transparent 31%), #0b1020; scrollbar-width: thin; scrollbar-color: #35415a transparent; }
+.agent-workspace { grid-column: 2 / -1; min-width: 0; min-height: 0; overflow: auto; padding: clamp(20px, 3vw, 36px) clamp(16px, 2.4vw, 40px) 32px; background: radial-gradient(circle at 48% 34%, #2b245354 0, transparent 32%), radial-gradient(circle at 78% 78%, #173b4640 0, transparent 31%), #0b1020; scrollbar-width: thin; scrollbar-color: #35415a transparent; }
 .agent-workspace[hidden] { display: none; }
 .topology-panel { max-width: 1040px; margin: 0 auto; overflow: hidden; border: 1px solid #344058; border-radius: 14px; background: #11192bd9; box-shadow: 0 28px 80px #03061070, 0 1px 0 #ffffff0a inset; }
 .topology-heading { min-height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid #303b51; background: #151d2fd9; }
@@ -518,7 +518,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .topology-footer span { display: flex; align-items: center; gap: 6px; }
 .topology-footer svg { color: #8d7fcb; }
 
-.chat-shell { width: 100%; max-width: 1900px; min-height: 760px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 320px); align-items: start; gap: 14px; margin: 0 auto; }
+.chat-shell { width: 100%; max-width: 2100px; min-height: 760px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 280px); align-items: start; gap: 12px; margin: 0; }
 .chat-panel { min-width: 0; overflow: hidden; border: 1px solid #344058; border-radius: 14px; background: #11192bd9; box-shadow: 0 22px 70px #03061055; }
 .chat-panel { min-height: 760px; display: grid; grid-template-rows: 52px minmax(0, 1fr) auto; }
 .chat-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 17px; border-bottom: 1px solid #303b51; background: #151d2fd9; }
@@ -537,7 +537,14 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .chat-empty-hint { color: #a99be4; }
 .chat-message { max-width: 88%; margin-bottom: 15px; padding: 11px 13px; border: 1px solid #303c53; border-radius: 11px; background: #0e1525; }
 .chat-message.has-results { max-width: 100%; }
-.chat-message > span { color: #758198; font: 8px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .09em; }
+.chat-message > span, .chat-message-head > span { color: #758198; font: 8px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .09em; }
+.chat-message-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chat-message-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+.chat-message-delete { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; padding: 5px 9px; color: #ffaebb; border: 1px solid #f17b9155; border-radius: 6px; background: #f17b910c; cursor: pointer; font-size: 9px; }
+.chat-message-delete:hover { border-color: #f17b9190; background: #f17b9118; }
+.chat-message-delete-confirm { display: flex; align-items: center; gap: 5px; }
+.chat-message-delete-confirm button { padding: 3px 7px; border-radius: 5px; border: 1px solid #344159; background: transparent; color: #b7c1d0; font-size: 8px; cursor: pointer; }
+.chat-message-delete-confirm button:first-child { color: #ff9fae; border-color: #f17b9155; background: #f17b910d; }
 .chat-message > p { margin: 6px 0 0; color: #b7c1d0; font-size: 11px; line-height: 1.62; white-space: pre-wrap; }
 .chat-message.user { margin-left: auto; border-color: #a78bfa42; background: #251e4099; }
 .chat-message.user > span { color: #a796e2; }
@@ -568,7 +575,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .result-table-wrap td { color: #bdc7d7; }
 .result-table-wrap td:last-child { min-width: 360px; white-space: pre-wrap; }
 .result-table-wrap small { display: block; padding: 6px 8px; color: var(--amber); font-size: 8px; }
-.result-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; align-items: stretch; }
+.result-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; align-items: stretch; margin-top: 16px; }
 .result-panels .result-table-wrap { margin-top: 0; max-height: 320px; overflow-y: auto; }
 .result-chart { display: flex; flex-direction: column; margin-top: 0; padding: 12px 13px 10px; border: 1px solid #2b384f; border-radius: 7px; background: #0c1322; }
 .result-chart-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; color: #8694a9; font: 9px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .06em; }
@@ -594,7 +601,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .result-chart-kpi { min-width: 110px; padding: 9px 11px; border: 1px solid #27344a; border-radius: 7px; background: #101a2c; }
 .result-chart-kpi-label { display: block; color: #7d8ba2; font: 8px 'JetBrains Mono'; text-transform: uppercase; letter-spacing: .05em; }
 .result-chart-kpi-value { display: block; margin-top: 4px; color: var(--text); font: 15px 'JetBrains Mono'; font-weight: 600; }
-.save-result { display: flex; align-items: center; gap: 5px; margin-top: 9px; padding: 5px 9px; color: #9bd9c1; border: 1px solid #199e7055; border-radius: 6px; background: #199e700c; cursor: pointer; font-size: 9px; }
+.save-result { display: flex; align-items: center; gap: 5px; padding: 5px 9px; color: #9bd9c1; border: 1px solid #199e7055; border-radius: 6px; background: #199e700c; cursor: pointer; font-size: 9px; }
 .save-result:hover { border-color: #199e7090; background: #199e7018; }
 .save-result:disabled { opacity: .6; cursor: not-allowed; }
 .chat-composer { display: flex; align-items: center; gap: 9px; padding: 12px; border-top: 1px solid #303b51; background: #0d1423; }
