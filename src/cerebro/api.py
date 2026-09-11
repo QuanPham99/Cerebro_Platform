@@ -4,10 +4,15 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import os
+import threading
+import time
+import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
 
 import duckdb
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -24,7 +29,13 @@ from .bundle_versions import (
     BundleVersionNotFound,
     BundleVersionRegistry,
 )
-from .chat import ChatOrchestrator
+from .chat import (
+    ChatCancellation,
+    ChatCancelled,
+    ChatOrchestrator,
+    ChatRequestRegistry,
+    DuplicateChatRequest,
+)
 from .definitions import (
     DefinitionConflictError,
     DefinitionProviderUnavailable,
@@ -52,6 +63,56 @@ from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG, ROOT
 from .retrieval import SemanticRetriever, embedder_from_environment
 from .settings import Settings, resolve_active_bundle
 from .source import DuckDBSource
+
+logger = logging.getLogger("uvicorn.error.cerebro.chat")
+
+
+def _chat_log_payload(response: ChatResponse) -> dict[str, object]:
+    """Keep console diagnostics useful without persisting raw database rows."""
+    payload = response.model_dump(mode="json", exclude={"rows"})
+    payload["rows_omitted"] = len(response.rows)
+    return payload
+
+
+async def _run_chat_in_thread(
+    orchestrator: ChatOrchestrator,
+    payload: ChatRequest,
+    cancellation: ChatCancellation,
+    request_id: str,
+) -> ChatResponse:
+    """Run synchronous chat work without occupying the API event loop."""
+    started_at = time.monotonic()
+    completed = threading.Event()
+    outcome: dict[str, ChatResponse | BaseException] = {}
+
+    def worker() -> None:
+        logger.info("chat.worker.started request_id=%s", request_id)
+        try:
+            outcome["result"] = orchestrator.chat(payload, cancellation)
+        except BaseException as error:  # noqa: BLE001 - forwarded to the request task
+            outcome["error"] = error
+        finally:
+            logger.info(
+                "chat.worker.finished request_id=%s elapsed_ms=%d",
+                request_id,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            completed.set()
+
+    threading.Thread(
+        target=worker,
+        daemon=True,
+        name=f"cerebro-chat-{request_id}",
+    ).start()
+    while not completed.is_set():
+        await asyncio.sleep(0.01)
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    result = outcome.get("result")
+    if not isinstance(result, ChatResponse):  # pragma: no cover - worker always records one outcome
+        raise RuntimeError("Chat worker completed without a response")
+    return result
 
 
 def create_mcp_server(
@@ -169,6 +230,7 @@ def create_app(
         active_bundle_id=lambda: version_registry.catalog(runtime["bundle"].root).default_id,
         on_activate=swap_runtime,
     )
+    chat_requests = ChatRequestRegistry()
     mcp_server = create_mcp_server(lambda: runtime["retriever"])
     mcp_app = mcp_server.streamable_http_app()
 
@@ -188,6 +250,7 @@ def create_app(
     app.state.bundle = bundle
     app.state.retriever = retriever
     app.state.chat = chat_orchestrator
+    app.state.chat_requests = chat_requests
     app.state.provider = provider
     app.state.generation = generation_manager
     app.state.bundle_versions = version_registry
@@ -482,15 +545,92 @@ def create_app(
     async def chat(payload: ChatRequest) -> ChatResponse:
         current_chat = runtime["chat"]
         current_bundle = runtime["bundle"]
+        request_id = str(payload.request_id or uuid.uuid4())
+        started_at = time.monotonic()
+        logger.info(
+            "chat.request.received %s",
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "conversation_id": payload.conversation_id,
+                    "history_count": len(payload.history),
+                    "message": payload.message,
+                },
+                ensure_ascii=False,
+            ),
+        )
         if current_chat is None:
-            return ChatResponse(
+            response = ChatResponse(
                 conversation_id=payload.conversation_id or "unavailable",
                 status="blocked",
                 answer="Configure CEREBRO_DATABASE_PATH with a readable DuckDB database, then restart the server.",
                 semantic_version=current_bundle.version,
                 trace=[AgentTrace(agent="orchestrator", status="blocked", summary="Database is not configured")],
             )
-        return current_chat.chat(payload)
+            logger.info(
+                "chat.response.completed %s",
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                        "response": _chat_log_payload(response),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+            return response
+        try:
+            cancellation = chat_requests.register(request_id)
+        except DuplicateChatRequest as exc:
+            logger.warning("chat.request.duplicate request_id=%s", request_id)
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "duplicate_request_id", "request_id": str(exc)},
+            ) from None
+        try:
+            response = await _run_chat_in_thread(
+                current_chat, payload, cancellation, request_id
+            )
+            logger.info(
+                "chat.response.completed %s",
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                        "response": _chat_log_payload(response),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+            return response
+        except ChatCancelled:
+            logger.info(
+                "chat.request.cancelled request_id=%s elapsed_ms=%d",
+                request_id,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "chat_cancelled", "request_id": request_id},
+            ) from None
+        except Exception:
+            logger.exception(
+                "chat.request.failed request_id=%s elapsed_ms=%d",
+                request_id,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            raise
+        finally:
+            chat_requests.finish(request_id, cancellation)
+
+    @app.post("/api/chat/requests/{request_id}/cancel", status_code=202)
+    async def cancel_chat(request_id: UUID) -> dict[str, str]:
+        normalized = str(request_id)
+        chat_requests.cancel(normalized)
+        logger.info("chat.cancel.requested request_id=%s", normalized)
+        return {"request_id": normalized, "status": "cancellation_requested"}
 
     @app.post("/api/generation/runs", status_code=202)
     async def start_generation(payload: GenerationStartRequest | None = None) -> dict:

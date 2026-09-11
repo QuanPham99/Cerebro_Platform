@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     warnings: [],
     trace: [{ agent: 'validation', status: 'completed', summary: 'Read-only checks passed' }],
   }),
+  cancelChat: vi.fn().mockResolvedValue({ request_id: 'request-1', status: 'cancellation_requested' }),
   startGeneration: vi.fn().mockResolvedValue({
     id: 'run-1', status: 'running', created_at: '2026-09-03T00:00:00Z', updated_at: '2026-09-03T00:00:00Z',
     events: [], candidate: null, error: null, source_mode: 'database_only',
@@ -61,6 +62,11 @@ const defaultVersionCatalog = {
 }
 
 vi.mock('./api', () => ({
+  SemanticApiError: class SemanticApiError extends Error {
+    constructor(public status: number, message: string) {
+      super(message)
+    }
+  },
   getGraph: vi.fn().mockResolvedValue({
     version: '0.1.0',
     nodes: [
@@ -146,6 +152,7 @@ vi.mock('./api', () => ({
   reviewDefinitionRevision: vi.fn(),
   activateDefinitionRevision: vi.fn(),
   postChat: mocks.postChat,
+  cancelChat: mocks.cancelChat,
 }))
 
 vi.mock('./GraphView', async () => {
@@ -169,9 +176,15 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+async function selectWorkspace(name: RegExp) {
+  fireEvent.click(await screen.findByRole('button', { name: /Cerebro (Semantic constellation|Text to SQL agents)/i }))
+  fireEvent.click(screen.getByRole('menuitemradio', { name }))
+}
+
 describe('workspace navigation', () => {
   it('lists approved graph lineage and previews a saved version without changing the default', async () => {
     render(<App />)
+    await selectWorkspace(/Semantic constellation/i)
 
     fireEvent.click(await screen.findByRole('tab', { name: /Saved graph versions: 2 versions/i }))
     expect(await screen.findByRole('heading', { name: 'Saved graph versions' })).toBeInTheDocument()
@@ -201,6 +214,7 @@ describe('workspace navigation', () => {
 
   it('filters canonical profile kinds with presets, checkboxes, search, and reset', async () => {
     render(<App />)
+    await selectWorkspace(/Semantic constellation/i)
     expect(await screen.findByTestId('visible-ids')).toHaveTextContent('custom.note')
     const legend = screen.getByLabelText('Graph edge legend')
     expect(legend.closest('.canvas-wrap')).not.toBeNull()
@@ -227,14 +241,21 @@ describe('workspace navigation', () => {
   it('switches workspaces and collapses and expands the left rail', async () => {
     render(<App />)
 
-    fireEvent.click(await screen.findByRole('button', { name: /Cerebro Semantic constellation/i }))
+    expect(await screen.findByRole('heading', { name: 'Your Curiosity - Cerebro Reliable Answers' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Cerebro Text to SQL agents/i }))
     expect(screen.getByRole('menu', { name: 'Switch workspace' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitemradio', { name: /Text to SQL agents/i })).toHaveAttribute('aria-checked', 'true')
 
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Text to SQL agents/i }))
-    expect(screen.getByRole('heading', { name: 'Your Curiosity - Cerebro Reliable Answers' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /Semantic constellation/i }))
+    expect(await screen.findByTestId('graph-view')).toBeInTheDocument()
+    await selectWorkspace(/Text to SQL agents/i)
     expect(screen.getByLabelText('Cerebro Agent')).toHaveTextContent('Cerebro Agent')
     expect(screen.getByRole('heading', { name: 'Ask Cerebro' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'What tables are available to query?' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Có bao nhiêu khách hàng theo từng giới tính?' })).toBeInTheDocument()
+    const chatTools = screen.getByLabelText('Chat tools')
+    expect(within(chatTools).getByText('Preset questions').closest('details')).toHaveAttribute('open')
+    expect(within(chatTools).getByText('Database tables').closest('details')).not.toHaveAttribute('open')
+    expect(document.querySelector('.setup-rail .schema-overview')).not.toBeInTheDocument()
     expect(document.querySelectorAll('.chat-panel')).toHaveLength(1)
     expect(document.querySelector('.chat-dock')).not.toBeInTheDocument()
     expect(screen.queryByText(/Governed database chat/i)).not.toBeInTheDocument()
@@ -255,6 +276,7 @@ describe('workspace navigation', () => {
 
   it('collapses the right details rail without moving the graph legend', async () => {
     render(<App />)
+    await selectWorkspace(/Semantic constellation/i)
     expect(await screen.findByTestId('visible-ids')).toHaveTextContent('custom.note')
 
     fireEvent.click(screen.getByRole('button', { name: 'Collapse details panel' }))
@@ -269,10 +291,8 @@ describe('workspace navigation', () => {
 
   it('submits a governed database question and renders SQL, results, and evidence', async () => {
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /Cerebro Semantic constellation/i }))
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Text to SQL agents/i }))
 
-    fireEvent.change(screen.getByRole('textbox', { name: 'Ask about the database' }), {
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
       target: { value: 'How many customers are there by gender?' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
@@ -281,10 +301,145 @@ describe('workspace navigation', () => {
     expect(screen.getByText('Female')).toBeInTheDocument()
     expect(screen.getByText('table.customers')).toBeInTheDocument()
     expect(mocks.postChat).toHaveBeenCalledTimes(1)
+    expect(mocks.postChat.mock.calls[0][0].request_id).toEqual(expect.any(String))
+    expect(mocks.postChat.mock.calls[0][1]).toBeInstanceOf(AbortSignal)
+  })
+
+  it('keeps the conversation and active query alive across workspace switches', async () => {
+    const lateResponse = {
+      conversation_id: 'conversation-late', status: 'answered' as const, answer: 'Late answer', sql: null,
+      columns: [], rows: [], row_count: 0, truncated: false, semantic_version: '0.1.0',
+      evidence_ids: [], warnings: [], trace: [],
+    }
+    let resolveChat: (value: typeof lateResponse) => void = () => undefined
+    let requestSignal: AbortSignal | undefined
+    mocks.postChat.mockImplementationOnce((_payload: unknown, signal?: AbortSignal) => {
+      requestSignal = signal
+      return new Promise<typeof lateResponse>((resolve) => { resolveChat = resolve })
+    })
+    render(<App />)
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'Long-running workspace query' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    await waitFor(() => expect(mocks.postChat).toHaveBeenCalledTimes(1))
+
+    await selectWorkspace(/Semantic constellation/i)
+    expect(mocks.cancelChat).not.toHaveBeenCalled()
+    expect(requestSignal?.aborted).toBe(false)
+
+    await act(async () => { resolveChat(lateResponse); await Promise.resolve() })
+    await selectWorkspace(/Text to SQL agents/i)
+    expect(screen.getByText('Long-running workspace query')).toBeInTheDocument()
+    expect(screen.getByText('Late answer')).toBeInTheDocument()
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'Follow-up draft' },
+    })
+    await selectWorkspace(/Semantic constellation/i)
+    await selectWorkspace(/Text to SQL agents/i)
+    expect(screen.getByRole('textbox', { name: 'Ask about the database' })).toHaveValue('Follow-up draft')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    await waitFor(() => expect(mocks.postChat).toHaveBeenCalledTimes(2))
+    expect(mocks.postChat.mock.calls[1][0]).toEqual(expect.objectContaining({
+      conversation_id: 'conversation-late',
+      history: [
+        { role: 'user', content: 'Long-running workspace query' },
+        { role: 'assistant', content: 'Late answer' },
+      ],
+    }))
+  })
+
+  it('cancels backend work after a network failure', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    mocks.postChat.mockRejectedValueOnce(new Error('Network connection closed'))
+    render(<App />)
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'Có bao nhiêu khách hàng theo từng giới tính?' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    const requestId = mocks.postChat.mock.calls[0][0].request_id
+
+    expect(await screen.findByText('Network connection closed')).toBeInTheDocument()
+    await waitFor(() => expect(mocks.cancelChat).toHaveBeenCalledWith(requestId))
+  })
+
+  it('stops the active query and ignores a late response', async () => {
+    const lateResponse = {
+      conversation_id: 'conversation-late', status: 'answered' as const, answer: 'Late answer', sql: null,
+      columns: [], rows: [], row_count: 0, truncated: false, semantic_version: '0.1.0',
+      evidence_ids: [], warnings: [], trace: [],
+    }
+    let resolveChat: (value: typeof lateResponse) => void = () => undefined
+    mocks.postChat.mockImplementationOnce(() => new Promise<typeof lateResponse>((resolve) => { resolveChat = resolve }))
+    render(<App />)
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'Long-running question' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    const requestId = mocks.postChat.mock.calls[0][0].request_id
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop query' }))
+
+    await waitFor(() => expect(mocks.cancelChat).toHaveBeenCalledWith(requestId))
+    expect(screen.getByText('Query cancelled.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop query' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Có bao nhiêu khách hàng theo từng giới tính?' })).toBeEnabled()
+
+    await act(async () => { resolveChat(lateResponse); await Promise.resolve() })
+    expect(screen.queryByText('Late answer')).not.toBeInTheDocument()
+  })
+
+  it('clear chat also cancels the active query and cannot be repopulated', async () => {
+    const lateResponse = {
+      conversation_id: 'conversation-late', status: 'answered' as const, answer: 'Late answer', sql: null,
+      columns: [], rows: [], row_count: 0, truncated: false, semantic_version: '0.1.0',
+      evidence_ids: [], warnings: [], trace: [],
+    }
+    let resolveChat: (value: typeof lateResponse) => void = () => undefined
+    mocks.postChat.mockImplementationOnce(() => new Promise<typeof lateResponse>((resolve) => { resolveChat = resolve }))
+    render(<App />)
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'Another long-running question' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    const requestId = mocks.postChat.mock.calls[0][0].request_id
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear chat' }))
+
+    await waitFor(() => expect(mocks.cancelChat).toHaveBeenCalledWith(requestId))
+    expect(screen.queryByText('Another long-running question')).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Ask Cerebro' })).toBeInTheDocument()
+
+    await act(async () => { resolveChat(lateResponse); await Promise.resolve() })
+    expect(screen.queryByText('Late answer')).not.toBeInTheDocument()
+  })
+
+  it('cancels an active query when the full app unmounts', async () => {
+    let requestSignal: AbortSignal | undefined
+    mocks.postChat.mockImplementationOnce((_payload: unknown, signal?: AbortSignal) => {
+      requestSignal = signal
+      return new Promise(() => undefined)
+    })
+    const { unmount } = render(<App />)
+
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Ask about the database' }), {
+      target: { value: 'Query active during unload' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send question' }))
+    const requestId = mocks.postChat.mock.calls[0][0].request_id
+    unmount()
+
+    await waitFor(() => expect(mocks.cancelChat).toHaveBeenCalledWith(requestId))
+    expect(requestSignal?.aborted).toBe(true)
   })
 
   it('streams generation, saves approval, and selects the default separately', async () => {
     render(<App />)
+    await selectWorkspace(/Semantic constellation/i)
 
     const liveTab = await screen.findByRole('tab', { name: /Default graph: Bank workshop/i })
     const generationTab = screen.getByRole('tab', { name: /Semantic generation/i })
@@ -397,6 +552,7 @@ describe('workspace navigation', () => {
     window.sessionStorage.setItem('cerebro.semanticGenerationRunId', 'run-restored')
 
     render(<App />)
+    await selectWorkspace(/Semantic constellation/i)
 
     expect(await screen.findByRole('heading', { name: 'Semantic inventory' })).toBeInTheDocument()
     expect(screen.getByLabelText('Input payload')).toHaveTextContent('accounts')
@@ -406,6 +562,7 @@ describe('workspace navigation', () => {
 
   it('keeps smoke generation database-only', async () => {
     render(<App />)
+    await selectWorkspace(/Semantic constellation/i)
     fireEvent.click(await screen.findByRole('tab', { name: /Semantic generation/i }))
     expect(screen.queryByText('Advanced source mode')).not.toBeInTheDocument()
     expect(screen.queryByRole('radio', { name: /Configured/i })).not.toBeInTheDocument()

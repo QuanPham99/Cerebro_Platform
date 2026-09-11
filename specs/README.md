@@ -33,6 +33,8 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 ### Post-launch fixes
 
 1. [015 — Chat grounding and SQL-validator precision fixes](015-chat-grounding-and-validator-precision-fixes.md)
+2. [018 — Vietnamese preset questions with live-validated SQL guarantee](018-vietnamese-preset-questions.md)
+3. [019 — Chat gateway diagnostics and correlated console logging](019-chat-gateway-diagnostics.md)
 
 ### Operations and deployment
 

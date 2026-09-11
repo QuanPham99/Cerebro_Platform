@@ -9,6 +9,7 @@ from datetime import date as _Date
 from datetime import datetime as _DateTime
 from decimal import Decimal
 from typing import Annotated, Any, Literal, TypeAlias
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -513,6 +514,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    request_id: UUID | None = None
     conversation_id: str | None = None
     history: list[ChatMessage] = Field(default_factory=list, max_length=10)
 

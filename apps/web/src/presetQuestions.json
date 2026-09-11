@@ -1,0 +1,58 @@
+[
+  {
+    "level": "Giới thiệu",
+    "requiresSql": false,
+    "questions": [
+      "Cơ sở dữ liệu này mô tả lĩnh vực kinh doanh nào?",
+      "Cơ sở dữ liệu này có những bảng nào, cấu trúc (schema) của từng bảng ra sao, và các bảng liên kết với nhau như thế nào?",
+      "Các thực thể (entity) cốt lõi trong bộ dữ liệu ngân hàng này là gì và chúng liên quan với nhau như thế nào?",
+      "Có những chỉ số (metric) và quy tắc nghiệp vụ (business rule) nào sẵn có để phân tích?",
+      "Dữ liệu giao dịch tài khoản và giao dịch thẻ bao phủ khoảng thời gian nào?",
+      "Cơ sở dữ liệu này áp dụng những chính sách dữ liệu nhạy cảm hoặc hạn chế truy cập nào?"
+    ]
+  },
+  {
+    "level": "Cơ bản",
+    "requiresSql": true,
+    "questions": [
+      "Có bao nhiêu khách hàng theo từng giới tính?",
+      "Số dư tài khoản trung bình theo từng loại tài khoản là bao nhiêu?",
+      "Có bao nhiêu phiếu hỗ trợ đang mở theo từng loại vấn đề?",
+      "Ngân hàng hiện có bao nhiêu chi nhánh?",
+      "Có bao nhiêu tài khoản đang ở trạng thái hoạt động?"
+    ]
+  },
+  {
+    "level": "Trung bình",
+    "requiresSql": true,
+    "questions": [
+      "Tỷ lệ phần trăm giao dịch thẻ là gian lận là bao nhiêu?",
+      "Tổng khối lượng giao dịch theo từng kênh giao dịch là bao nhiêu?",
+      "Tổng số tiền giao dịch theo từng chi nhánh là bao nhiêu?",
+      "Tỷ lệ thanh toán trễ hạn theo từng loại khoản vay là bao nhiêu?",
+      "Tỷ lệ gian lận theo từng loại thẻ là bao nhiêu?"
+    ]
+  },
+  {
+    "level": "Nâng cao",
+    "requiresSql": true,
+    "questions": [
+      "Tổng khối lượng giao dịch theo từng tháng trong 24 tháng gần nhất là bao nhiêu?",
+      "Tổng khối lượng giao dịch thẻ theo từng danh mục merchant là bao nhiêu?",
+      "Dòng tiền ròng của khách hàng theo từng chi nhánh là bao nhiêu?",
+      "Tổng giá trị các giao dịch thẻ gian lận theo từng chi nhánh là bao nhiêu?",
+      "Tỷ lệ nợ xấu theo từng chi nhánh là bao nhiêu?"
+    ]
+  },
+  {
+    "level": "Khó",
+    "requiresSql": true,
+    "questions": [
+      "Những chi nhánh nào có tổng giá trị giao dịch thẻ gian lận cao nhất, phân theo loại thẻ và danh mục merchant?",
+      "So sánh tổng giá trị giao dịch thẻ gian lận với tỷ lệ gian lận thẻ của từng chi nhánh.",
+      "Những khách hàng nào bị trễ hạn thanh toán khoản vay và đồng thời có phiếu hỗ trợ đang mở, theo quy tắc ưu tiên hỗ trợ khách hàng trễ hạn?",
+      "Tổng số tiền đã thanh toán khoản vay của các khách hàng từng có giao dịch thẻ gian lận là bao nhiêu?",
+      "Tổng số dư khoản vay và tỷ lệ nợ xấu theo từng chi nhánh là bao nhiêu?"
+    ]
+  }
+]

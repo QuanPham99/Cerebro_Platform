@@ -21,17 +21,19 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  Square,
   Terminal,
   Waypoints,
   X,
 } from 'lucide-react'
-import { generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, setDefaultBundle, startGeneration } from './api'
+import { cancelChat, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, SemanticApiError, setDefaultBundle, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
+import presetQuestionLevels from './presetQuestions.json'
 import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SemanticObject } from './types'
 import { VersionLibrary } from './VersionLibrary'
 
@@ -149,7 +151,7 @@ function SchemaOverview() {
   }, [])
 
   return (
-    <details className="schema-overview" open>
+    <details className="schema-overview">
       <summary className="schema-overview-heading rail-toggle">
         <ChevronRight size={12} className="chevron-icon" />
         <Database size={13} />
@@ -208,7 +210,6 @@ function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
           ))}
         </nav>
       </details>
-      <SchemaOverview />
       <div className="setup-rail-note"><ShieldCheck size={14} /><span>Execution stays read-only until every launch check passes.</span></div>
     </aside>
   )
@@ -217,73 +218,33 @@ function AgentSetupRail({ runtime }: { runtime: RuntimeStatus | null }) {
 type ConversationEntry =
   | { role: 'user'; content: string }
   | { role: 'assistant'; response: ChatResponse }
+  | { role: 'status'; requestId: string; content: string; warning?: boolean }
+
+type ActiveChatRequest = {
+  requestId: string
+  controller: AbortController
+}
 
 /**
  * Difficulty-tiered evaluation prompts for the bank-workshop OKF bundle. Each
  * tier increases how many entities/joins, business rules, and semantic
  * ambiguity a correct answer must resolve, so a level-by-level run surfaces
  * where retrieval, the semantic profile, or the agent itself breaks down.
+ * Source of truth is presetQuestions.json (shared with
+ * scripts/validate_preset_questions.py) so the UI and the validation harness
+ * never drift apart.
  */
-const PRESET_QUESTION_LEVELS: { level: string; questions: string[] }[] = [
-  {
-    level: 'Onboarding Questions',
-    questions: [
-      'What business domain does this database describe?',
-      'What tables are available in this database, what does each table\'s schema look like, and how are the tables related to each other?',
-      'What are the core entities in this bank dataset and how are they related?',
-      'What metrics and business rules are available for analysis?',
-      'What time range does the transaction data cover?',
-      'What sensitive or restricted data policies apply to this database?',
-    ],
-  },
-  {
-    level: 'Simple Questions',
-    questions: [
-      'What tables are available to query?',
-      'How many customers are there by gender?',
-      'What is the total number of active accounts?',
-      'What is the average account balance?',
-      'How many branches does the bank have?',
-    ],
-  },
-  {
-    level: 'Intermediate Questions',
-    questions: [
-      'What percentage of card transactions are fraud?',
-      'What is the transaction volume by transaction channel?',
-      'How many customers are classified as active under the active-customer rule?',
-      'What is the late payment rate by loan type?',
-      'Show total card transaction volume by merchant category.',
-    ],
-  },
-  {
-    level: 'Hard Questions',
-    questions: [
-      'Explain the approved joins for transaction amount by branch.',
-      'Which branches have the highest fraud exposure, and what drives that metric?',
-      'List customers who qualify as high-value multichannel customers along with their net cash flow.',
-      'What is the non-performing loan rate by branch, and which employees own those risk portfolios?',
-      'Compare fraud exposure to card fraud rate for each branch — which branches are outliers?',
-    ],
-  },
-  {
-    level: 'Really Hard Questions',
-    questions: [
-      'Which delinquent customers submitted support tickets, and were those tickets prioritized under the delinquent-customer support-priority rule?',
-      'Rank employees by the combined non-performing-loan and late-payment risk of the loans they oversee.',
-      'For customers who are both high-value multichannel and had a fraudulent card transaction, what is their combined loan repayment total?',
-      'Explain how customer net cash flow is computed and which restricted or confidential columns it excludes under the sensitive banking data policy.',
-      'Show me our best customers.',
-    ],
-  },
-]
+const PRESET_QUESTION_LEVELS: { level: string; requiresSql: boolean; questions: string[] }[] = presetQuestionLevels
 
 function PresetQuestions({ onSelect, disabled }: { onSelect: (question: string) => void; disabled: boolean }) {
   return (
-    <aside className="preset-panel" aria-label="Preset questions">
-      <div className="preset-panel-heading">
-        <div><ListChecks size={14} /><span>Preset questions</span>{disabled && <em className="preset-panel-status">Sending…</em>}</div>
-      </div>
+    <details className="preset-panel" open>
+      <summary className="preset-panel-heading rail-toggle">
+        <ChevronRight size={12} className="chevron-icon" />
+        <ListChecks size={14} />
+        <span>Preset questions</span>
+        {disabled && <em className="preset-panel-status">Sending…</em>}
+      </summary>
       <div className="preset-levels">
         {PRESET_QUESTION_LEVELS.map((group) => (
           <section className="preset-level" key={group.level} aria-label={group.level}>
@@ -296,7 +257,7 @@ function PresetQuestions({ onSelect, disabled }: { onSelect: (question: string) 
           </section>
         ))}
       </div>
-    </aside>
+    </details>
   )
 }
 
@@ -329,9 +290,11 @@ function QueryProgress({ elapsed }: { elapsed: number }) {
 function AgentSetupWorkspace({
   runtime,
   onEvidence,
+  active,
 }: {
   runtime: RuntimeStatus | null
   onEvidence: (ids: Set<string>) => void
+  active: boolean
 }) {
   const [entries, setEntries] = useState<ConversationEntry[]>([])
   const [input, setInput] = useState('')
@@ -339,6 +302,7 @@ function AgentSetupWorkspace({
   const [pendingElapsed, setPendingElapsed] = useState(0)
   const [conversationId, setConversationId] = useState<string>()
   const transcriptRef = useRef<HTMLDivElement>(null)
+  const activeRequestRef = useRef<ActiveChatRequest | null>(null)
 
   useEffect(() => {
     if (transcriptRef.current) transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
@@ -352,21 +316,47 @@ function AgentSetupWorkspace({
     return () => window.clearInterval(timer)
   }, [pending])
 
+  useEffect(() => () => {
+    const active = activeRequestRef.current
+    if (!active) return
+    activeRequestRef.current = null
+    void cancelChat(active.requestId).catch(() => undefined)
+    active.controller.abort()
+  }, [])
+
   const sendMessage = async (message: string) => {
-    if (!message || pending) return
+    if (!message || activeRequestRef.current) return
     const previous = entries
+    const requestId = crypto.randomUUID()
+    const controller = new AbortController()
+    activeRequestRef.current = { requestId, controller }
     setEntries([...previous, { role: 'user', content: message }])
     setInput('')
     setPending(true)
     try {
-      const history = previous.map<{ role: 'user' | 'assistant'; content: string }>((entry) => entry.role === 'user'
-        ? { role: 'user', content: entry.content }
-        : { role: 'assistant', content: entry.response.answer }).slice(-10)
-      const response = await postChat({ message, conversation_id: conversationId, history })
+      const history = previous.reduce<Array<{ role: 'user' | 'assistant'; content: string }>>((messages, entry) => {
+        if (entry.role === 'user') messages.push({ role: 'user', content: entry.content })
+        if (entry.role === 'assistant') messages.push({ role: 'assistant', content: entry.response.answer })
+        return messages
+      }, []).slice(-10)
+      const response = await postChat({ message, request_id: requestId, conversation_id: conversationId, history }, controller.signal)
+      if (activeRequestRef.current?.requestId !== requestId) return
       setConversationId(response.conversation_id)
       setEntries((current) => [...current, { role: 'assistant', response }])
       onEvidence(new Set(response.evidence_ids))
     } catch (reason) {
+      if (activeRequestRef.current?.requestId !== requestId) return
+      if (reason instanceof Error && reason.name === 'AbortError') return
+      if (!(reason instanceof SemanticApiError) || reason.status >= 500) {
+        void cancelChat(requestId).then((response) => {
+          console.info('[Cerebro chat] Background cancellation requested after API failure', response)
+        }).catch((cancellationError) => {
+          console.error('[Cerebro chat] Background cancellation failed after API failure', {
+            requestId,
+            error: cancellationError,
+          })
+        })
+      }
       const messageText = reason instanceof Error ? reason.message : 'Chat request failed'
       setEntries((current) => [...current, {
         role: 'assistant',
@@ -378,7 +368,39 @@ function AgentSetupWorkspace({
       }])
       onEvidence(new Set())
     } finally {
+      if (activeRequestRef.current?.requestId === requestId) {
+        activeRequestRef.current = null
+        setPending(false)
+      }
+    }
+  }
+
+  const cancelActiveRequest = (clear: boolean) => {
+    const active = activeRequestRef.current
+    if (active) {
+      activeRequestRef.current = null
       setPending(false)
+      const cancellation = cancelChat(active.requestId)
+      active.controller.abort()
+      if (!clear) {
+        setEntries((current) => [...current, {
+          role: 'status', requestId: active.requestId, content: 'Query cancelled.',
+        }])
+        void cancellation.catch(() => {
+          setEntries((current) => current.map((entry) => (
+            entry.role === 'status' && entry.requestId === active.requestId
+              ? { ...entry, content: 'Query cancelled in this browser, but server cancellation could not be confirmed.', warning: true }
+              : entry
+          )))
+        })
+      } else {
+        void cancellation.catch(() => undefined)
+      }
+    }
+    if (clear) {
+      setEntries([])
+      setConversationId(undefined)
+      onEvidence(new Set())
     }
   }
 
@@ -388,12 +410,15 @@ function AgentSetupWorkspace({
   }
 
   return (
-    <section className="agent-workspace">
+    <section className="agent-workspace" hidden={!active}>
       <div className="chat-shell">
         <section className="chat-panel" aria-label="Cerebro Agent">
           <div className="chat-heading">
-            <div><Bot size={16} /><span>Cerebro Agent</span></div>
-            {entries.length > 0 && <button onClick={() => { setEntries([]); setConversationId(undefined) }}>Clear chat</button>}
+            <div className="chat-heading-title"><Bot size={16} /><span>Cerebro Agent</span></div>
+            <div className="chat-heading-actions">
+              {pending && <button type="button" className="stop-query" onClick={() => cancelActiveRequest(false)}><Square size={10} />Stop query</button>}
+              {entries.length > 0 && <button type="button" onClick={() => cancelActiveRequest(true)}>Clear chat</button>}
+            </div>
           </div>
           <div className="chat-transcript" ref={transcriptRef} aria-live="polite">
             {entries.length === 0 && <div className="chat-empty">
@@ -404,6 +429,8 @@ function AgentSetupWorkspace({
             </div>}
             {entries.map((entry, index) => entry.role === 'user' ? (
               <article className="chat-message user" key={index}><span>You</span><p>{entry.content}</p></article>
+            ) : entry.role === 'status' ? (
+              <article className={`chat-message assistant cancelled${entry.warning ? ' warning' : ''}`} key={index}><span>Cerebro · cancelled</span><p>{entry.content}</p></article>
             ) : (
               <article className={`chat-message assistant ${entry.response.status}`} key={index}>
                 <span>Cerebro · {entry.response.status}</span><p>{entry.response.answer}</p>
@@ -422,7 +449,10 @@ function AgentSetupWorkspace({
           </form>
         </section>
 
-        <PresetQuestions onSelect={sendMessage} disabled={pending} />
+        <aside className="chat-tools" aria-label="Chat tools">
+          <PresetQuestions onSelect={sendMessage} disabled={pending} />
+          <SchemaOverview />
+        </aside>
       </div>
     </section>
   )
@@ -461,7 +491,7 @@ export default function App() {
   const [generationStarting, setGenerationStarting] = useState(false)
   const [generationError, setGenerationError] = useState('')
   const [generationActioning, setGenerationActioning] = useState(false)
-  const [workspace, setWorkspace] = useState<Workspace>('semantic')
+  const [workspace, setWorkspace] = useState<Workspace>('text-to-sql')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false)
   const [usedIds, setUsedIds] = useState<Set<string>>(new Set())
@@ -943,7 +973,9 @@ export default function App() {
                   : <DefinitionComposer runtime={runtime} baseVersion={definitionBaseVersion} selectedObject={selected} revision={definitionRevision} onRevision={registerDefinitionRevision} onGraphChange={showDefinitionGraph} onReviewed={definitionReviewed} />}
               </div>}
         </div>
-      </> : <AgentSetupWorkspace runtime={runtime} onEvidence={onChatEvidence} />}
+      </> : null}
+
+      <AgentSetupWorkspace runtime={runtime} onEvidence={onChatEvidence} active={workspace === 'text-to-sql'} />
 
       {error && <div className="toast">{error}<button onClick={() => setError('')}><X size={14} /></button></div>}
     </main>

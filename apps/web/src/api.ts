@@ -1,19 +1,67 @@
 import type { BundleActivation, BundleInfo, BundleVersionCatalog, ChatResponse, DefinitionContext, DefinitionPayload, DefinitionRevision, DefinitionScope, DefinitionTranslation, GenerationRun, GenerationTrace, GraphResponse, ReviewRecord, RuntimeStatus, SemanticObject } from './types'
 
+type SemanticApiErrorPayload = {
+  detail?: string | { message?: string; code?: string }
+  message?: string
+  request_id?: string
+}
+
+export class SemanticApiError extends Error {
+  readonly status: number
+  readonly path: string
+  readonly requestId?: string
+  readonly payload: unknown
+
+  constructor(message: string, status: number, path: string, requestId: string | undefined, payload: unknown) {
+    super(message)
+    this.name = 'SemanticApiError'
+    this.status = status
+    this.path = path
+    this.requestId = requestId
+    this.payload = payload
+  }
+}
+
+function parseResponseBody(rawBody: string): unknown {
+  if (!rawBody) return null
+  try {
+    return JSON.parse(rawBody)
+  } catch {
+    return rawBody
+  }
+}
+
 async function request<T>(path: string, signal?: AbortSignal, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...init, signal })
+  const rawBody = await response.text()
+  const parsedBody = parseResponseBody(rawBody)
   if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { detail?: string | { message?: string; code?: string } } | null
+    const payload = (
+      parsedBody && typeof parsedBody === 'object' ? parsedBody : null
+    ) as SemanticApiErrorPayload | null
     const detail = payload?.detail
     if (response.status === 404 && detail === 'Not Found') {
       throw new Error('This Semantic API route is unavailable. Restart the Cerebro API to load the current graph-saving endpoints.')
     }
-    throw new Error(
-      (typeof detail === 'string' ? detail : detail?.message || detail?.code)
-      || `Semantic API returned ${response.status}`,
+    const upstreamMessage = (
+      typeof detail === 'string' ? detail : detail?.message || detail?.code || payload?.message
+    )
+    const requestId = payload?.request_id
+      || response.headers.get('x-kong-request-id')
+      || response.headers.get('x-cerebro-request-id')
+      || undefined
+    const summary = upstreamMessage
+      ? `Semantic API returned ${response.status}: ${upstreamMessage}`
+      : `Semantic API returned ${response.status}`
+    throw new SemanticApiError(
+      requestId ? `${summary} (request ID: ${requestId})` : summary,
+      response.status,
+      path,
+      requestId,
+      parsedBody,
     )
   }
-  return response.json() as Promise<T>
+  return parsedBody as T
 }
 
 export const getBundle = (signal?: AbortSignal) => request<BundleInfo>('/api/bundles/active', signal)
@@ -99,11 +147,47 @@ export const activateDefinitionRevision = (revisionId: string, signal?: AbortSig
   request<{ path: string; name: string; version: string; activated_at: string }>(
     `/api/definition-revisions/${encodeURIComponent(revisionId)}/activate`, signal, { method: 'POST' },
   )
-export const postChat = (
-  payload: { message: string; conversation_id?: string; history: Array<{ role: 'user' | 'assistant'; content: string }> },
+export const postChat = async (
+  payload: { message: string; request_id?: string; conversation_id?: string; history: Array<{ role: 'user' | 'assistant'; content: string }> },
   signal?: AbortSignal,
-) => request<ChatResponse>('/api/chat', signal, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify(payload),
-})
+) => {
+  const startedAt = performance.now()
+  console.info('[Cerebro chat] User request', {
+    requestId: payload.request_id,
+    conversationId: payload.conversation_id,
+    message: payload.message,
+    historyCount: payload.history.length,
+  })
+  try {
+    const response = await request<ChatResponse>('/api/chat', signal, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    console.info('[Cerebro chat] Semantic API response', {
+      requestId: payload.request_id,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      response,
+    })
+    return response
+  } catch (reason) {
+    console.error('[Cerebro chat] Semantic API error', {
+      requestId: payload.request_id,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      error: reason,
+      ...(reason instanceof SemanticApiError ? {
+        httpStatus: reason.status,
+        gatewayRequestId: reason.requestId,
+        response: reason.payload,
+      } : {}),
+    })
+    throw reason
+  }
+}
+
+export const cancelChat = (requestId: string) =>
+  request<{ request_id: string; status: 'cancellation_requested' }>(
+    `/api/chat/requests/${encodeURIComponent(requestId)}/cancel`,
+    undefined,
+    { method: 'POST' },
+  )

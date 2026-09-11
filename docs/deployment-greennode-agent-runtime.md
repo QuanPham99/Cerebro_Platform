@@ -102,7 +102,7 @@ answer differs from the current assumption:
 | Persistent volumes | Assumed unavailable — `knowledge/generated`/`reviewed`/`artifacts` are ephemeral, reset on every redeploy | If volumes exist and matter, consider mounting them (out of scope for this iteration) |
 | Domain / TLS | Assumed platform-terminated (own subdomain or attachable custom domain) | Attach a custom domain if desired |
 | Gateway / access control | Unknown whether Agent Runtime provides one | If yes, prefer it; keep the Basic Auth fallback (§4 above, off by default) as a safety net regardless |
-| Request/gateway timeout | Unknown; watch for cutoffs on `/mcp` and generation-run SSE streaming | If a hard timeout exists, document it as a known limitation |
+| Request/gateway timeout | **Observed cutoff near 60 seconds.** On 2026-09-11, Kong returned `502` after 54.35 seconds for `POST /api/chat` while `/health` remained `200`; this is consistent with an upstream request/read timeout, not an unhealthy Cerebro process. | If configurable, set the timeout above the longest accepted chat latency (at least 300 seconds for the current model). Otherwise use a faster model until chat moves to a streaming or asynchronous transport. Correlate failures with the request IDs and stage timings now emitted in browser and runtime console logs. |
 
 ## 5. Deploy and verify live
 
