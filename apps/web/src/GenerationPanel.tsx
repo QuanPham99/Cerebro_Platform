@@ -252,14 +252,14 @@ export function GenerationPanel({
               <header><ShieldCheck size={13} /><span><strong>Human governance gate</strong><small>The automated smoke test stops here.</small></span></header>
               {run.candidate.review_state === 'candidate' && (
                 <form className="review-form" onSubmit={(event) => { event.preventDefault(); onReview({ decision: reviewDraft.decision, reviewer: reviewDraft.reviewer, comment: reviewDraft.comment, acknowledge_ai_risk: reviewDraft.acknowledged }) }}>
-                  <label>Reviewer<input aria-label="Reviewer name" value={reviewDraft.reviewer} onChange={(event) => onReviewDraftChange({ ...reviewDraft, reviewer: event.target.value })} required /></label>
+                  <label>Reviewer<span className="required-mark"> *</span><input aria-label="Reviewer name" value={reviewDraft.reviewer} onChange={(event) => onReviewDraftChange({ ...reviewDraft, reviewer: event.target.value })} required /></label>
                   <div className="review-decisions">
                     <label><input type="radio" name="review-decision" checked={reviewDraft.decision === 'approve'} onChange={() => onReviewDraftChange({ ...reviewDraft, decision: 'approve' })} /> Approve</label>
                     <label><input type="radio" name="review-decision" checked={reviewDraft.decision === 'reject'} onChange={() => onReviewDraftChange({ ...reviewDraft, decision: 'reject' })} /> Reject</label>
                   </div>
-                  <label>Comment<textarea aria-label="Review comment" value={reviewDraft.comment} onChange={(event) => onReviewDraftChange({ ...reviewDraft, comment: event.target.value })} required={reviewDraft.decision === 'reject'} /></label>
+                  <label>Comment{reviewDraft.decision === 'reject' && <span className="required-mark"> *</span>}<textarea aria-label="Review comment" value={reviewDraft.comment} onChange={(event) => onReviewDraftChange({ ...reviewDraft, comment: event.target.value })} required={reviewDraft.decision === 'reject'} /></label>
                   {reviewDraft.decision === 'approve' && <label className="risk-check"><input type="checkbox" checked={reviewDraft.acknowledged} onChange={(event) => onReviewDraftChange({ ...reviewDraft, acknowledged: event.target.checked })} /> I acknowledge that AI-proposed semantics require human judgment.</label>}
-                  <button className="review-submit" disabled={actioning || !reviewDraft.reviewer.trim() || (reviewDraft.decision === 'approve' && !reviewDraft.acknowledged) || (reviewDraft.decision === 'reject' && !reviewDraft.comment.trim())} type="submit"><ShieldCheck size={13} /> {reviewDraft.decision === 'approve' ? 'Approve and save version' : 'Record rejection'}</button>
+                  <button className="review-submit" disabled={actioning || !reviewDraft.reviewer.trim() || (reviewDraft.decision === 'approve' && !reviewDraft.acknowledged) || (reviewDraft.decision === 'reject' && !reviewDraft.comment.trim())} type="submit"><ShieldCheck size={13} /> {reviewDraft.decision === 'approve' ? 'Approve Graph' : 'Record rejection'}</button>
                 </form>
               )}
               {run.candidate.review_state === 'approved' && <div className="review-result approved"><strong>Saved by {run.candidate.review_record?.reviewer}</strong><small>This immutable version is available without changing the workspace default.</small><button disabled={actioning} onClick={onOpenVersions}><GitBranch size={13} /> Open saved versions</button></div>}

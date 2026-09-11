@@ -411,11 +411,11 @@ export function DefinitionComposer({
       <header><Check size={13} /><span><strong>Draft revision</strong><small>{revision.version}</small></span></header>
       <div className="authored-list">{(revision.definitions || []).map((item) => <div key={item.id}><span className={`type-dot ${item.kind}`} /><span><strong>{item.name}</strong><code>{item.id}</code></span></div>)}</div>
       {revision.review_state === 'candidate' && <>
-        <label>Reviewer<input aria-label="Definition reviewer" value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label>
+        <label>Reviewer<span className="required-mark"> *</span><input aria-label="Definition reviewer" value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label>
         <div className="review-decisions"><label><input type="radio" name="definition-review" checked={decision === 'approve'} onChange={() => setDecision('approve')} /> Approve</label><label><input type="radio" name="definition-review" checked={decision === 'reject'} onChange={() => setDecision('reject')} /> Reject</label></div>
-        <label>Comment<textarea aria-label="Definition review comment" value={comment} onChange={(event) => setComment(event.target.value)} required={decision === 'reject'} /></label>
+        <label>Comment{decision === 'reject' && <span className="required-mark"> *</span>}<textarea aria-label="Definition review comment" value={comment} onChange={(event) => setComment(event.target.value)} required={decision === 'reject'} /></label>
         {decision === 'approve' && <label className="risk-check"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> I reviewed the authored definitions and acknowledge AI risk.</label>}
-        <button disabled={busy || !reviewer.trim() || (decision === 'approve' && !acknowledged) || (decision === 'reject' && !comment.trim())} onClick={review}><ShieldCheck size={13} /> {decision === 'approve' ? 'Approve and save version' : 'Record rejection'}</button>
+        <button disabled={busy || !reviewer.trim() || (decision === 'approve' && !acknowledged) || (decision === 'reject' && !comment.trim())} onClick={review}><ShieldCheck size={13} /> {decision === 'approve' ? 'Approve Graph' : 'Record rejection'}</button>
       </>}
     </section>}
   </aside>

@@ -26,7 +26,7 @@ import {
   Waypoints,
   X,
 } from 'lucide-react'
-import { cancelChat, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, SemanticApiError, setDefaultBundle, startGeneration } from './api'
+import { cancelChat, deleteBundleVersion, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, postChat, reviewGeneration, SemanticApiError, setDefaultBundle, startGeneration } from './api'
 import { DefinitionComposer } from './DefinitionComposer'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
 import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
@@ -703,6 +703,19 @@ export default function App() {
     }
   }
 
+  const deleteSavedVersion = async (version: BundleVersionSummary) => {
+    setGenerationActioning(true)
+    setVersionError('')
+    try {
+      await deleteBundleVersion(version.id)
+      await refreshVersions()
+    } catch (reason) {
+      setVersionError(reason instanceof Error ? reason.message : 'The version could not be deleted.')
+    } finally {
+      setGenerationActioning(false)
+    }
+  }
+
   const registerDefinitionRevision = (revision: DefinitionRevision) => {
     setDefinitionRevision(revision)
     window.sessionStorage.setItem(DEFINITION_REVISION_STORAGE_KEY, revision.id)
@@ -925,7 +938,7 @@ export default function App() {
       ) : workspace === 'text-to-sql' ? <AgentSetupRail runtime={runtime} /> : null)}
 
       {workspace === 'semantic' ? showVersionLibrary
-        ? <VersionLibrary catalog={versionCatalog} loading={versionLoading} error={versionError} focusId={versionFocusId} actioning={generationActioning} onPreview={previewSavedVersion} onSetDefault={selectWorkspaceDefault} onRetry={() => { void refreshVersions().catch(() => undefined) }} onGenerate={openGeneration} />
+        ? <VersionLibrary catalog={versionCatalog} loading={versionLoading} error={versionError} focusId={versionFocusId} actioning={generationActioning} onPreview={previewSavedVersion} onSetDefault={selectWorkspaceDefault} onDelete={(version) => { void deleteSavedVersion(version) }} onRetry={() => { void refreshVersions().catch(() => undefined) }} onGenerate={openGeneration} />
         : <>
         {displayedGraph ? <section className="canvas-wrap">
           <div className="canvas-label"><span>{graphMode === 'candidate' ? 'Candidate build' : graphMode === 'definition' ? 'Definition draft' : graphMode === 'version' ? `${selectedVersion?.name || 'Saved graph'} · v${selectedVersion?.version || displayedGraph.version}` : 'Workspace default'}</span><small>{graphMode === 'candidate' || graphMode === 'definition' || graphMode === 'version' ? 'Validated preview · runtime unchanged' : 'Drag to pan · Scroll to zoom · Select to trace'}</small></div>

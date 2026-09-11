@@ -13,6 +13,7 @@ from cerebro.bundle_versions import (
     BundleDefaultLocked,
     BundleVersionInvalid,
     BundleVersionNotFound,
+    BundleVersionProtected,
     BundleVersionRegistry,
 )
 from cerebro.generation import review_bundle
@@ -106,6 +107,41 @@ def test_catalog_rejects_untrusted_paths_and_tampered_versions(tmp_path: Path):
         version_registry.resolve("../bank-workshop")
 
 
+def test_delete_rejects_golden_and_the_active_default(tmp_path: Path):
+    reviewed = tmp_path / "reviewed"
+    saved = approved_copy(tmp_path, reviewed, "run-generated")
+    version_registry = registry(tmp_path, reviewed)
+
+    with pytest.raises(BundleVersionProtected):
+        version_registry.delete("golden", active_root=DEFAULT_BUNDLE)
+    assert DEFAULT_BUNDLE.is_dir()
+
+    with pytest.raises(BundleVersionProtected):
+        version_registry.delete("run-generated", active_root=saved)
+    assert saved.is_dir()
+
+
+def test_delete_removes_a_non_default_saved_version(tmp_path: Path):
+    reviewed = tmp_path / "reviewed"
+    saved = approved_copy(tmp_path, reviewed, "run-generated")
+    version_registry = registry(tmp_path, reviewed)
+
+    version_registry.delete("run-generated", active_root=DEFAULT_BUNDLE)
+
+    assert not saved.exists()
+    assert [item.id for item in version_registry.catalog(DEFAULT_BUNDLE).versions] == ["golden"]
+
+
+def test_delete_rejects_unknown_or_traversal_identifiers(tmp_path: Path):
+    reviewed = tmp_path / "reviewed"
+    version_registry = registry(tmp_path, reviewed)
+
+    with pytest.raises(BundleVersionNotFound):
+        version_registry.delete("not-a-version", active_root=DEFAULT_BUNDLE)
+    with pytest.raises(BundleVersionNotFound):
+        version_registry.delete("../bank-workshop", active_root=DEFAULT_BUNDLE)
+
+
 def test_configuration_lock_keeps_catalog_read_only(tmp_path: Path):
     version_registry = registry(tmp_path, tmp_path / "reviewed", allowed=False)
 
@@ -142,6 +178,14 @@ def test_http_catalog_previews_and_switches_the_workspace_default(
             assert (await client.get("/api/graph")).json()["version"].endswith("run-generated")
             assert app.state.bundle.root == str(saved)
 
+            protected_golden = await client.delete("/api/bundles/golden")
+            assert protected_golden.status_code == 409
+            assert protected_golden.json()["detail"]["code"] == "bundle_version_protected"
+
+            protected_default = await client.delete("/api/bundles/run-generated")
+            assert protected_default.status_code == 409
+            assert protected_default.json()["detail"]["code"] == "bundle_version_protected"
+
             restored = await client.put("/api/bundles/default", json={"bundle_id": "golden"})
             assert restored.status_code == 200
             assert (await client.get("/api/bundles")).json()["default_id"] == "golden"
@@ -150,6 +194,12 @@ def test_http_catalog_previews_and_switches_the_workspace_default(
             assert missing.status_code == 404
             traversal = await client.put("/api/bundles/default", json={"bundle_id": "../bank-workshop"})
             assert traversal.status_code == 404
+
+            deleted = await client.delete("/api/bundles/run-generated")
+            assert deleted.status_code == 200
+            assert deleted.json() == {"deleted": "run-generated"}
+            remaining = await client.get("/api/bundles")
+            assert [item["id"] for item in remaining.json()["versions"]] == ["golden"]
 
     asyncio.run(exercise())
 

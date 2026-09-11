@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, Database, Eye, GitBranch, Network, RefreshCw, ShieldCheck, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, Check, Database, Eye, GitBranch, Network, RefreshCw, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { BundleVersionCatalog, BundleVersionSummary } from './types'
 
@@ -23,6 +23,7 @@ export function VersionLibrary({
   actioning,
   onPreview,
   onSetDefault,
+  onDelete,
   onRetry,
   onGenerate,
 }: {
@@ -33,11 +34,14 @@ export function VersionLibrary({
   actioning: boolean
   onPreview: (version: BundleVersionSummary) => void
   onSetDefault: (version: BundleVersionSummary) => void
+  onDelete: (version: BundleVersionSummary) => void
   onRetry: () => void
   onGenerate: () => void
 }) {
   const [pending, setPending] = useState<BundleVersionSummary | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<BundleVersionSummary | null>(null)
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const confirmDeleteRef = useRef<HTMLButtonElement>(null)
   const defaultVersion = catalog?.versions.find((version) => version.is_default) || null
 
   useEffect(() => {
@@ -49,6 +53,16 @@ export function VersionLibrary({
     document.addEventListener('keydown', closeOnEscape)
     return () => document.removeEventListener('keydown', closeOnEscape)
   }, [actioning, pending])
+
+  useEffect(() => {
+    if (!pendingDelete) return
+    confirmDeleteRef.current?.focus()
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !actioning) setPendingDelete(null)
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [actioning, pendingDelete])
 
   return (
     <section className="version-library" aria-label="Saved graph versions">
@@ -103,6 +117,14 @@ export function VersionLibrary({
                   title={!catalog.default_change_allowed ? 'The default is locked by server configuration' : undefined}
                   onClick={() => setPending(version)}
                 >{version.is_default ? <><Check size={13} /> Current default</> : <><ShieldCheck size={13} /> Set as default</>}</button>
+                {version.origin !== 'golden' && (
+                  <button
+                    className="delete-version"
+                    disabled={version.is_default || actioning}
+                    title={version.is_default ? 'Set another version as default before deleting this one' : undefined}
+                    onClick={() => setPendingDelete(version)}
+                  ><Trash2 size={13} /> Delete</button>
+                )}
               </footer>
             </article>
           </li>
@@ -117,6 +139,16 @@ export function VersionLibrary({
           <p id="default-dialog-description">Semantic Constellation, Define, Text to SQL, API, and MCP will switch to this approved graph.</p>
           <div className="default-transition"><span><small>Current</small><code>v{defaultVersion?.version || '—'}</code></span><i>→</i><span><small>Next</small><code>v{pending.version}</code></span></div>
           <footer><button disabled={actioning} onClick={() => setPending(null)}>Keep current</button><button ref={confirmRef} className="confirm-default" disabled={actioning} onClick={() => onSetDefault(pending)}>{actioning ? 'Switching…' : 'Set as default'}</button></footer>
+        </div>
+      </div>}
+
+      {pendingDelete && <div className="version-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !actioning) setPendingDelete(null) }}>
+        <div className="version-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" aria-describedby="delete-dialog-description">
+          <button className="dialog-close" aria-label="Cancel deletion" disabled={actioning} onClick={() => setPendingDelete(null)}><X size={15} /></button>
+          <span className="version-kicker"><Trash2 size={13} /> Permanent removal</span>
+          <h2 id="delete-dialog-title">Delete v{pendingDelete.version} permanently?</h2>
+          <p id="delete-dialog-description">This immutable checkpoint will be removed and cannot be recovered.</p>
+          <footer><button disabled={actioning} onClick={() => setPendingDelete(null)}>Keep version</button><button ref={confirmDeleteRef} className="confirm-delete" disabled={actioning} onClick={() => { onDelete(pendingDelete); setPendingDelete(null) }}>{actioning ? 'Deleting…' : 'Delete permanently'}</button></footer>
         </div>
       </div>}
     </section>

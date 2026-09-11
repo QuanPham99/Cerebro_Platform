@@ -81,6 +81,8 @@ export const setDefaultBundle = (bundleId: string, signal?: AbortSignal) =>
   request<BundleActivation>('/api/bundles/default', signal, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bundle_id: bundleId }),
   })
+export const deleteBundleVersion = (bundleId: string, signal?: AbortSignal) =>
+  request<{ deleted: string }>(`/api/bundles/${encodeURIComponent(bundleId)}`, signal, { method: 'DELETE' })
 export const getRuntimeStatus = (signal?: AbortSignal) => request<RuntimeStatus>('/api/runtime/status', signal)
 export const startGeneration = (sourceMode: 'configured' | 'database_only', signal?: AbortSignal) => request<GenerationRun>('/api/generation/runs', signal, {
   method: 'POST',

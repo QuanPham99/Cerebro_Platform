@@ -27,6 +27,7 @@ from .bundle_versions import (
     BundleDefaultLocked,
     BundleVersionInvalid,
     BundleVersionNotFound,
+    BundleVersionProtected,
     BundleVersionRegistry,
 )
 from .chat import (
@@ -460,6 +461,19 @@ def create_app(
             raise HTTPException(
                 status_code=409,
                 detail={"code": "activation_blocked", "message": str(exc)},
+            ) from exc
+
+    @app.delete("/api/bundles/{bundle_id}")
+    async def delete_bundle_version(bundle_id: str) -> dict:
+        try:
+            version_registry.delete(bundle_id, active_root=runtime["bundle"].root)
+            return {"deleted": bundle_id}
+        except BundleVersionNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_bundle_version"}) from exc
+        except BundleVersionProtected as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "bundle_version_protected", "message": str(exc)},
             ) from exc
 
     @app.get("/api/golden/graph")

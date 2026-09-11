@@ -518,7 +518,7 @@ describe('workspace navigation', () => {
         { id: 'run-1', name: 'bank-workshop', version: '0.1.0+candidate', origin: 'generation', is_default: false, review_state: 'approved', reviewer: 'Data Owner', reviewed_at: '2026-09-09T00:00:00Z', parent_version: null, counts: {}, kind_counts: { physical_table: 10 }, generation_mode: 'live', source_mode: 'database_only', provider: 'greennode-glm', model: 'test-model' },
       ],
     })
-    fireEvent.click(screen.getByRole('button', { name: 'Approve and save version' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Approve Graph' }))
     await waitFor(() => expect(mocks.reviewGeneration).toHaveBeenCalledWith('run-1', expect.objectContaining({ reviewer: 'Data Owner', acknowledge_ai_risk: true })))
     expect(await screen.findByRole('heading', { name: 'Saved graph versions' })).toBeInTheDocument()
     expect(mocks.getGeneration).not.toHaveBeenCalled()

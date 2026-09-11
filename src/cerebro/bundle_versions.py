@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,10 @@ class BundleVersionInvalid(ValueError):
 
 
 class BundleDefaultLocked(RuntimeError):
+    pass
+
+
+class BundleVersionProtected(RuntimeError):
     pass
 
 
@@ -183,6 +188,16 @@ class BundleVersionRegistry:
     def object(self, identifier: str, object_id: str) -> SemanticObject | None:
         resolved = self.resolve(identifier)
         return SemanticRetriever(resolved.bundle).by_id.get(object_id)
+
+    def delete(self, identifier: str, *, active_root: Path | str) -> None:
+        if identifier == "golden":
+            raise BundleVersionProtected("The golden graph cannot be deleted")
+        path = self._reviewed_path(identifier)
+        if Path(active_root).resolve() == path:
+            raise BundleVersionProtected(
+                "The active default graph cannot be deleted — set another version as default first"
+            )
+        shutil.rmtree(path)
 
     def set_default(self, identifier: str) -> tuple[ResolvedBundleVersion, dict]:
         if not self.default_change_allowed:
