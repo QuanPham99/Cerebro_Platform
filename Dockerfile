@@ -47,6 +47,7 @@ RUN install -d -o 10001 -g 10001 \
     /app/artifacts \
     /app/knowledge/generated \
     /app/knowledge/reviewed \
+    /app/knowledge/saved_charts \
     && install -d -o 10001 -g 10001 -m 0555 /data
 COPY --chown=10001:10001 data/workshop.duckdb /data/workshop.duckdb
 RUN test -s /data/workshop.duckdb \
