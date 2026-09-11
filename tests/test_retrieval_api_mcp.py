@@ -111,7 +111,7 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
         ))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             health = (await client.get("/api/health")).json()
-            assert health["objects"] == 64
+            assert health["objects"] == 66
             runtime = (await client.get("/api/runtime/status")).json()
             assert runtime["bundle"] == "bank-workshop"
             assert "api_key" not in runtime
@@ -124,14 +124,14 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
             )
             assert schema_chat.status_code == 200
             assert schema_chat.json()["status"] == "answered"
-            assert schema_chat.json()["row_count"] == 64
+            assert schema_chat.json()["row_count"] == 66
             assert {row[1] for row in schema_chat.json()["rows"]} >= {
                 "table.accounts",
                 "table.customers",
                 "table.transactions",
                 "dataset.bank-workshop",
             }
-            assert len((await client.get("/api/graph")).json()["nodes"]) == 64
+            assert len((await client.get("/api/graph")).json()["nodes"]) == 66
             assert (await client.get("/api/concepts/table.accounts")).status_code == 200
             assert (await client.get("/api/concepts/missing")).status_code == 404
             search = await client.get(

@@ -21,8 +21,8 @@ def test_golden_bundle_contract(bundle):
         "physical_table": 10,
         "entity": 10,
         "dimension": 11,
-        "metric": 10,
-        "business_rule": 10,
+        "metric": 11,
+        "business_rule": 11,
         "relationship": 11,
         "policy": 1,
     }

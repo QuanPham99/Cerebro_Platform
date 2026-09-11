@@ -30,14 +30,14 @@ DIMENSIONS = [
     ("customer-gender", "Customer Gender", "customer", [("customers", "gender")], "categorical", ["customer-count", "customer-net-cash-flow", "customer-loan-repayment-total", "supported-delinquency-population"], None),
     ("customer-age", "Customer Age", "customer", [("customers", "date_of_birth")], "derived", ["customer-count", "customer-net-cash-flow", "customer-loan-repayment-total", "supported-delinquency-population"], "Completed years from date_of_birth at the relevant maximum available date."),
     ("account-type", "Account Type", "account", [("accounts", "account_type")], "categorical", ["account-balance"], None),
-    ("branch", "Branch", "branch", [("branches", "branch_name")], "geographic", ["transaction-volume", "account-balance", "non-performing-loan-rate", "customer-net-cash-flow", "branch-fraud-exposure", "customer-loan-repayment-total", "supported-delinquency-population"], None),
-    ("transaction-type", "Transaction Type", "transaction", [("transactions", "txn_type")], "categorical", ["transaction-volume", "customer-net-cash-flow"], None),
+    ("branch", "Branch", "branch", [("branches", "branch_name")], "geographic", ["transaction-volume", "account-balance", "non-performing-loan-rate", "customer-net-cash-flow", "branch-fraud-exposure", "branch-toi-proxy", "customer-loan-repayment-total", "supported-delinquency-population"], None),
+    ("transaction-type", "Transaction Type", "transaction", [("transactions", "txn_type")], "categorical", ["transaction-volume", "customer-net-cash-flow", "branch-toi-proxy"], None),
     ("transaction-channel", "Transaction Channel", "transaction", [("transactions", "channel")], "categorical", ["transaction-volume", "customer-net-cash-flow"], None),
     ("merchant-category", "Merchant Category", "card-transaction", [("card_transactions", "merchant_category")], "categorical", ["card-fraud-rate", "branch-fraud-exposure"], None),
     ("card-type", "Card Type", "card", [("cards", "card_type")], "categorical", ["card-fraud-rate", "branch-fraud-exposure"], None),
     ("loan-type", "Loan Type", "loan", [("loans", "loan_type")], "categorical", ["late-payment-rate", "non-performing-loan-rate", "customer-loan-repayment-total", "supported-delinquency-population"], None),
     ("loan-status", "Loan Status", "loan", [("loans", "status")], "categorical", ["non-performing-loan-rate", "customer-loan-repayment-total", "supported-delinquency-population"], None),
-    ("transaction-date", "Transaction Date", "transaction", [("transactions", "txn_date")], "temporal", ["transaction-volume", "customer-net-cash-flow"], None),
+    ("transaction-date", "Transaction Date", "transaction", [("transactions", "txn_date")], "temporal", ["transaction-volume", "customer-net-cash-flow", "branch-toi-proxy"], None),
 ]
 
 METRICS: list[dict[str, Any]] = [
@@ -61,6 +61,7 @@ METRICS: list[dict[str, Any]] = [
         "id": "customer-count", "name": "Customer Count", "entity": "customer",
         "description": "Distinct count of banking customers.",
         "aliases": ["customer gender population", "customer demographic total"],
+        "result_type": "integer",
         "measure": {"kind": "aggregate", "aggregation": "count_distinct", "source": {"table": "table.customers", "column": "customer_id"}, "predicates": []},
         "dependencies": ["table.customers"], "dimensions": ["dimension.customer-gender", "dimension.customer-age"],
         "classification": "restricted", "warnings": ["Return aggregated results for restricted customer attributes."],
@@ -106,6 +107,22 @@ METRICS: list[dict[str, Any]] = [
         "classification": "confidential", "warnings": ["Preserve card-transaction grain across the three many-to-one joins."],
     },
     {
+        "id": "branch-toi-proxy", "name": "Branch TOI Proxy", "entity": "branch",
+        "description": "Partial branch operating-income proxy calculated as fee debits less interest credits; it is not audited Total Operating Income.",
+        "aliases": ["TOI", "TOI by branch", "total operating income by branch", "branch operating income proxy"],
+        "measure": {"kind": "aggregate", "aggregation": "sum", "source": {"table": "table.transactions", "column": "amount"}, "predicates": []},
+        "dependencies": ["table.branches", "table.accounts", "table.transactions"],
+        "dimensions": ["dimension.branch", "dimension.transaction-type", "dimension.transaction-date"],
+        "time_dimension": "dimension.transaction-date", "relative_time_anchor": "max_available_date",
+        "formula": "SUM(CASE WHEN transactions.txn_type = 'Fee Debit' THEN transactions.amount WHEN transactions.txn_type = 'Interest Credit' THEN -transactions.amount ELSE 0 END) FROM branches JOIN accounts ON branches.branch_id = accounts.branch_id JOIN transactions ON accounts.account_id = transactions.account_id",
+        "classification": "confidential",
+        "warnings": [
+            "Proxy only: the database lacks complete bank P&L components required for audited Total Operating Income.",
+            "Exclude Deposit, Withdrawal, Transfer In, and Transfer Out because they are principal or customer cash movements, not operating revenue or expense.",
+            "Preserve transaction grain when joining transactions to accounts and branches; group branches by branch_id and label them with branch_name.",
+        ],
+    },
+    {
         "id": "customer-loan-repayment-total", "name": "Customer Loan Repayment Total", "entity": "customer",
         "description": "Total loan-payment amount by customer, loan attributes, and originating branch.",
         "measure": {"kind": "aggregate", "aggregation": "sum", "source": {"table": "table.loan_payments", "column": "amount_paid"}, "predicates": []},
@@ -117,6 +134,7 @@ METRICS: list[dict[str, Any]] = [
     {
         "id": "supported-delinquency-population", "name": "Supported Delinquency Population", "entity": "customer",
         "description": "Distinct customers who have both a support ticket and at least one late loan payment.",
+        "result_type": "integer",
         "measure": {"kind": "aggregate", "aggregation": "count_distinct", "source": {"table": "table.customers", "column": "customer_id"}, "predicates": []},
         "dependencies": ["table.customers", "table.support_tickets", "table.loans", "table.loan_payments"],
         "dimensions": ["dimension.customer-gender", "dimension.customer-age", "dimension.branch", "dimension.loan-type", "dimension.loan-status"],
@@ -134,6 +152,7 @@ RULES = [
     ("relative-time-anchor", "Relative Time Anchor", "transaction", "time_anchor", "date", ["dimension.transaction-date"], "Interpret relative account-transaction periods from MAX(transactions.txn_date), not wall-clock time."),
     ("high-value-multichannel-customer", "High-value Multichannel Customer", "customer", "classification", "boolean", ["table.customers", "table.accounts", "table.transactions", "table.cards"], "A customer qualifies when their accounts have at least one active card and at least 100000 in signed transaction activity across two or more channels during the latest 90-day period; join customers to accounts, then aggregate the transaction and card branches independently at customer grain."),
     ("branch-fraud-escalation", "Branch Fraud Escalation", "branch", "classification", "boolean", ["table.branches", "table.accounts", "table.cards", "table.card_transactions"], "Escalate a branch when it has at least five fraudulent card transactions or at least 10000 in fraudulent card-transaction amount during the latest 30-day period; join branches to accounts, accounts to cards, and cards to card transactions while preserving card-transaction grain."),
+    ("branch-toi-proxy-definition", "Branch TOI Proxy Definition", "branch", "aggregation_constraint", "boolean", ["metric.branch-toi-proxy", "dimension.transaction-type", "table.branches", "table.accounts", "table.transactions"], "A branch TOI proxy is compliant only when it equals the sum of Fee Debit amounts minus the sum of Interest Credit amounts at transaction grain, using transactions to accounts to branches; Deposit, Withdrawal, Transfer In, and Transfer Out must contribute zero, and the result must be labeled as a proxy because complete bank P&L components are unavailable."),
     ("delinquent-customer-support-priority", "Delinquent Customer Support Priority", "customer", "classification", "boolean", ["table.support_tickets", "table.customers", "table.loans", "table.loan_payments"], "Prioritize a customer when an open support ticket exists and any loan payment is flagged late during the latest 90-day period; join support tickets to customers, customers to loans, and loans to loan payments, then evaluate existence at customer grain to prevent fanout."),
     ("employee-risk-portfolio-assignment", "Employee Risk Portfolio Assignment", "employee", "classification", "boolean", ["table.employees", "table.branches", "table.loans", "table.customers"], "Flag an employee assignment for review when the employee's branch owns at least three defaulted or written-off loans held by customers with credit scores below 600; join employees to branches, branches to loans, and loans to customers."),
 ]
@@ -227,7 +246,8 @@ def main() -> None:
         formula = metric.get("formula") or metric_formula(metric["measure"])
         document = base_document("metric", object_id, metric["name"], metric["description"], links, {
             "classification": metric["classification"], "entity": f"entity.{metric['entity']}", "measure": metric["measure"],
-            "dependencies": metric["dependencies"], "formula": formula, "filters": [],
+            "dependencies": metric["dependencies"], "formula": formula,
+            "metric_result_type": metric.get("result_type", "decimal"), "filters": [],
             "grain": {"type": "aggregate", "description": "Requested compatible dimensions"},
             "compatible_dimensions": dimensions, "time_dimension": metric.get("time_dimension"),
             "relative_time_anchor": metric.get("relative_time_anchor"), "warnings": metric["warnings"],

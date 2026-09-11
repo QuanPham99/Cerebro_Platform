@@ -8,6 +8,7 @@ links:
 - entity.branch
 - metric.account-balance
 - metric.branch-fraud-exposure
+- metric.branch-toi-proxy
 - metric.customer-loan-repayment-total
 - metric.customer-net-cash-flow
 - metric.non-performing-loan-rate
@@ -36,6 +37,7 @@ cerebro:
   - metric.non-performing-loan-rate
   - metric.customer-net-cash-flow
   - metric.branch-fraud-exposure
+  - metric.branch-toi-proxy
   - metric.customer-loan-repayment-total
   - metric.supported-delinquency-population
   warnings: []

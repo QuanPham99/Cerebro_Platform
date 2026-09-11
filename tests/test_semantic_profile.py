@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 import yaml
 
 from cerebro.bundle import BundleLoader, BundleValidator, load_validated_bundle
@@ -13,7 +14,7 @@ from cerebro.models import (
     PhysicalColumnBinding,
     StructuredMetricCandidate,
 )
-from cerebro.paths import DEFAULT_BUNDLE
+from cerebro.paths import DEFAULT_BUNDLE, ROOT
 from cerebro.retrieval import SemanticRetriever
 from cerebro.evaluation import compare_semantic_oracle, compare_structural_oracle
 from cerebro.semantic.compiler import canonical_object_id, normalize_reference
@@ -149,12 +150,12 @@ def test_golden_semantic_profile_contract_and_grounding():
         "physical_table": 10,
         "entity": 10,
         "dimension": 11,
-        "metric": 10,
-        "business_rule": 10,
+        "metric": 11,
+        "business_rule": 11,
         "relationship": 11,
         "policy": 1,
     }
-    assert len(bundle.objects) == 64
+    assert len(bundle.objects) == 66
     assert sum(
         len(obj.cerebro.get("columns", []))
         for obj in bundle.objects
@@ -168,6 +169,68 @@ def test_golden_semantic_profile_contract_and_grounding():
     assert "dimension.merchant-category" in {item["id"] for item in grounding.dimensions}
     assert "entity.card-transaction" in {item["id"] for item in grounding.entities}
     assert "table.card_transactions" in {item["id"] for item in grounding.tables}
+
+
+def test_branch_toi_proxy_is_grounded_governed_and_calculable():
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    by_id = bundle.by_id()
+    metric = by_id["metric.branch-toi-proxy"]
+    rule = by_id["rule.branch-toi-proxy-definition"]
+
+    assert metric.cerebro["metric_result_type"] == "decimal"
+    assert metric.cerebro["compatible_dimensions"] == [
+        "dimension.branch",
+        "dimension.transaction-type",
+        "dimension.transaction-date",
+    ]
+    assert set(metric.cerebro["dependencies"]) == {
+        "table.branches",
+        "table.accounts",
+        "table.transactions",
+    }
+    assert "Fee Debit" in metric.cerebro["formula"]
+    assert "Interest Credit" in metric.cerebro["formula"]
+    assert "metric.branch-toi-proxy" in rule.cerebro["dependencies"]
+    assert "proxy" in rule.cerebro["logic"].lower()
+
+    graph = SemanticRetriever(bundle).graph()
+    metric_edges = {
+        edge.target
+        for edge in graph.edges
+        if edge.source == metric.id and edge.type == "metric_dependency"
+    }
+    rule_edges = {
+        edge.target
+        for edge in graph.edges
+        if edge.source == rule.id and edge.type == "rule_dependency"
+    }
+    assert set(metric.cerebro["dependencies"]) <= metric_edges
+    assert "metric.branch-toi-proxy" in rule_edges
+
+    grounding = SemanticRetriever(bundle).grounding("TOI by branch")
+    assert metric.id in {item["id"] for item in grounding.metrics}
+    assert rule.id in {item["id"] for item in grounding.rules}
+
+    with duckdb.connect(str(ROOT / "data" / "workshop.duckdb"), read_only=True) as connection:
+        rows = connection.execute(
+            """
+            SELECT branches.branch_id,
+                   SUM(CASE
+                       WHEN transactions.txn_type = 'Fee Debit' THEN transactions.amount
+                       WHEN transactions.txn_type = 'Interest Credit' THEN -transactions.amount
+                       ELSE 0
+                   END) AS branch_toi_proxy
+            FROM branches
+            JOIN accounts ON branches.branch_id = accounts.branch_id
+            JOIN transactions ON accounts.account_id = transactions.account_id
+            GROUP BY branches.branch_id
+            """
+        ).fetchall()
+
+    values = [value for _, value in rows]
+    assert len(rows) == 150
+    assert all(value is not None for value in values)
+    assert min(values) < 0 < max(values)
 
 
 def test_golden_showcase_definitions_each_span_at_least_three_joins():
@@ -242,7 +305,7 @@ def test_progressive_grounding_is_bounded_and_semantic_oracle_is_kind_aware():
 
     report = compare_semantic_oracle(DEFAULT_BUNDLE)
     assert report["precision"] == report["recall"] == 1.0
-    assert report["matched"] == 52
+    assert report["matched"] == 54
     assert all(item["recall"] == 1.0 for item in report["by_kind"].values())
 
     structural = compare_structural_oracle(DEFAULT_BUNDLE)

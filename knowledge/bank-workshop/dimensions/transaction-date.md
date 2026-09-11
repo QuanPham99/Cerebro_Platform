@@ -6,6 +6,7 @@ description: Governed transaction date dimension.
 status: stable
 links:
 - entity.transaction
+- metric.branch-toi-proxy
 - metric.customer-net-cash-flow
 - metric.transaction-volume
 - table.transactions
@@ -28,6 +29,7 @@ cerebro:
   compatible_metrics:
   - metric.transaction-volume
   - metric.customer-net-cash-flow
+  - metric.branch-toi-proxy
   warnings: []
 ---
 
