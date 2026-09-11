@@ -67,7 +67,6 @@ function WorkspaceMenu({
 }) {
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
-  const ActiveIcon = workspaceDetails[active].icon
 
   useEffect(() => {
     if (!open) return
@@ -88,7 +87,7 @@ function WorkspaceMenu({
   if (collapsed) {
     return (
       <button className="collapsed-brand" onClick={onCollapse} aria-label="Expand sidebar" title="Expand sidebar">
-        <Network className="collapsed-brand-logo" size={19} aria-hidden="true" />
+        <img className="collapsed-brand-logo" src="/icons8-brain-96.png" alt="" aria-hidden="true" />
         <PanelLeftOpen className="collapsed-brand-expand" size={18} aria-hidden="true" />
       </button>
     )
@@ -102,7 +101,7 @@ function WorkspaceMenu({
         aria-expanded={open}
         aria-haspopup="menu"
       >
-        <span className="brand-mark"><ActiveIcon size={19} /></span>
+        <span className="brand-mark"><img src="/icons8-brain-96.png" alt="" aria-hidden="true" /></span>
         <span className="workspace-trigger-copy"><strong>Cerebro</strong><span>{workspaceDetails[active].label}</span></span>
         <ChevronsUpDown className="workspace-chevrons" size={14} />
       </button>

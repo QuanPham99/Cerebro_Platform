@@ -56,7 +56,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-control { height: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 33px; align-items: center; gap: 3px; padding: 0 8px 0 10px; }
 .workspace-trigger { min-width: 0; height: 48px; display: grid; grid-template-columns: 34px minmax(0, 1fr) 14px; align-items: center; gap: 10px; padding: 0 3px 0 0; color: inherit; border: 0; border-radius: 9px; background: transparent; cursor: pointer; text-align: left; }
 .workspace-trigger:hover, .workspace-trigger[aria-expanded='true'] { background: #1a2336; }
-.brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; color: var(--night); background: linear-gradient(135deg, var(--cyan), var(--violet)); box-shadow: 0 0 24px #58c7d934; }
+.brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; color: var(--night); background: #f4f7fb; box-shadow: 0 0 24px #58c7d94d; }
+.brand-mark img { width: 22px; height: 22px; object-fit: contain; }
 .workspace-trigger-copy { min-width: 0; }
 .workspace-trigger-copy strong, .workspace-trigger-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-trigger-copy strong { font-size: 15px; letter-spacing: .02em; }
@@ -64,8 +65,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-chevrons { color: #67758d; }
 .collapse-sidebar { width: 31px; height: 31px; display: grid; place-items: center; padding: 0; color: #78869c; border: 0; border-radius: 7px; background: transparent; cursor: pointer; }
 .collapse-sidebar:hover { color: var(--text); background: #222c40; }
-.collapsed-brand { position: relative; justify-self: center; width: 34px; height: 34px; display: grid; place-items: center; padding: 0; color: var(--night); border: 0; border-radius: 9px; background: linear-gradient(135deg, var(--cyan), var(--violet)); box-shadow: 0 0 24px #58c7d934; cursor: pointer; }
-.collapsed-brand svg { grid-area: 1 / 1; transition: opacity .14s ease, transform .14s ease; }
+.collapsed-brand { position: relative; justify-self: center; width: 34px; height: 34px; display: grid; place-items: center; padding: 0; color: var(--night); border: 0; border-radius: 9px; background: #f4f7fb; box-shadow: 0 0 24px #58c7d94d; cursor: pointer; }
+.collapsed-brand svg, .collapsed-brand img { grid-area: 1 / 1; transition: opacity .14s ease, transform .14s ease; }
+.collapsed-brand-logo { width: 22px; height: 22px; object-fit: contain; }
 .collapsed-brand-expand { opacity: 0; transform: scale(.72); }
 .collapsed-brand:hover .collapsed-brand-logo, .collapsed-brand:focus-visible .collapsed-brand-logo { opacity: 0; transform: scale(.72); }
 .collapsed-brand:hover .collapsed-brand-expand, .collapsed-brand:focus-visible .collapsed-brand-expand { opacity: 1; transform: scale(1); }
