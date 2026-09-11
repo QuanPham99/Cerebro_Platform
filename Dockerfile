@@ -6,6 +6,7 @@ WORKDIR /build/apps/web
 COPY apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci
 COPY apps/web/index.html apps/web/tsconfig.json apps/web/tsconfig.app.json apps/web/tsconfig.node.json apps/web/vite.config.ts apps/web/vitest.config.ts ./
+COPY apps/web/public ./public
 COPY apps/web/src ./src
 RUN npm test && npm run build
 
