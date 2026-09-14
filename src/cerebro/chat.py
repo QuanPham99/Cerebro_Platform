@@ -242,6 +242,8 @@ class SQLGuardrail:
                     continue
                 if not column.table and column.name in output_aliases and self._inside_output_reference(column):
                     continue
+                if not column.table and self._enclosing_select_table_names(column) & cte_names:
+                    continue
                 raise SQLSafetyError(f"Column is not in the approved catalog: {column.sql()}")
             if "restricted" in classifications:
                 raise SQLSafetyError(f"Restricted column is blocked: {column.sql()}")
@@ -280,6 +282,21 @@ class SQLGuardrail:
                 return True
             current = current.parent
         return False
+
+    @staticmethod
+    def _enclosing_select_table_names(column: exp.Column) -> set[str]:
+        current: exp.Expression | None = column.parent
+        while current is not None and not isinstance(current, exp.Select):
+            current = current.parent
+        if current is None:
+            return set()
+        names: set[str] = set()
+        from_expr = current.args.get("from") or current.args.get("from_")
+        if from_expr is not None:
+            names.update(table.name for table in from_expr.find_all(exp.Table))
+        for join in current.args.get("joins") or []:
+            names.update(table.name for table in join.find_all(exp.Table))
+        return names
 
 
 class DuckDBQueryExecutor:

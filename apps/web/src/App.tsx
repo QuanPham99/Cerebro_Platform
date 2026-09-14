@@ -9,6 +9,7 @@ import {
   ChevronsUpDown,
   Clock,
   Database,
+  FileText,
   Filter,
   Focus,
   ListChecks,
@@ -36,12 +37,13 @@ import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
 import presetQuestionLevels from './presetQuestions.json'
+import { ReportPanel } from './ReportPanel'
 import { ResultPanel } from './ResultPanel'
 import { SavedCharts } from './SavedCharts'
 import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SavedChart, SemanticObject } from './types'
 import { VersionLibrary } from './VersionLibrary'
 
-type Workspace = 'semantic' | 'text-to-sql'
+type Workspace = 'semantic' | 'text-to-sql' | 'report'
 const GENERATION_RUN_STORAGE_KEY = 'cerebro.semanticGenerationRunId'
 const DEFINITION_REVISION_STORAGE_KEY = 'cerebro.definitionRevisionId'
 
@@ -55,6 +57,11 @@ const workspaceDetails = {
     label: 'Text to SQL agents',
     description: 'Configure the agent runtime',
     icon: Bot,
+  },
+  report: {
+    label: 'Report agent',
+    description: 'Multi-SQL reports, exported as PDF',
+    icon: FileText,
   },
 } satisfies Record<Workspace, { label: string; description: string; icon: typeof Network }>
 
@@ -115,7 +122,7 @@ function WorkspaceMenu({
 
       {open && (
         <div className="workspace-menu" role="menu" aria-label="Switch workspace">
-          <div className="workspace-menu-heading"><span>Workspaces</span><kbd>2</kbd></div>
+          <div className="workspace-menu-heading"><span>Workspaces</span><kbd>3</kbd></div>
           {(Object.keys(workspaceDetails) as Workspace[]).map((workspace) => {
             const detail = workspaceDetails[workspace]
             const Icon = detail.icon
@@ -134,7 +141,7 @@ function WorkspaceMenu({
               </button>
             )
           })}
-          <div className="workspace-menu-foot">One knowledge layer. Two ways to work.</div>
+          <div className="workspace-menu-foot">One knowledge layer. Three ways to work.</div>
         </div>
       )}
     </div>
@@ -1087,6 +1094,7 @@ export default function App() {
       </> : null}
 
       <AgentSetupWorkspace runtime={runtime} onEvidence={onChatEvidence} active={workspace === 'text-to-sql'} />
+      <ReportPanel active={workspace === 'report'} />
 
       {error && <div className="toast">{error}<button onClick={() => setError('')}><X size={14} /></button></div>}
     </main>

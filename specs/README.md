@@ -38,6 +38,7 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 4. [020 — Branch TOI proxy metric and business rule](020-branch-toi-proxy.md)
 5. [021 — Saved-version deletion and review-form affordances](021-saved-version-delete-and-review-affordances.md)
 6. [022 — Chat result dashboard visualization and saved charts](022-chat-result-visualization.md)
+7. [023 — Executive report agent (dynamic multi-SQL, PDF export)](023-executive-report-agent.md)
 
 ### Operations and deployment
 

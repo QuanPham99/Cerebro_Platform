@@ -283,6 +283,53 @@ export interface GenerationRun {
   source_mode: 'configured' | 'database_only'
 }
 
+// --- Executive report agent (spec 023) --------------------------------------
+
+export interface ReportSectionResult {
+  id: string
+  title: string
+  question: string
+  status: 'answered' | 'clarification' | 'blocked'
+  answer: string
+  sql: string | null
+  columns: string[]
+  rows: Array<Array<string | number | boolean | null>>
+  row_count: number
+  truncated: boolean
+  evidence_ids: string[]
+  warnings: string[]
+}
+
+export interface ReportDocument {
+  run_id: string
+  request: string
+  title: string
+  overview: string
+  generated_at: string
+  semantic_version: string
+  status: 'completed' | 'partial' | 'failed'
+  sections: ReportSectionResult[]
+}
+
+export interface ReportEvent {
+  sequence: number
+  stage: string
+  status: 'started' | 'completed' | 'clarification' | 'blocked' | 'failed'
+  summary: string
+  details: Record<string, unknown>
+}
+
+export interface ReportRun {
+  run_id: string
+  request: string
+  status: 'running' | 'completed' | 'partial' | 'failed' | 'cancelled'
+  started_at: string
+  completed_at: string | null
+  current_stage: string | null
+  error: string | null
+  events: ReportEvent[]
+}
+
 // --- Text-to-SQL agent -------------------------------------------------------
 // These mirror the value-free response contract. Resolved literals and bound
 // parameter values are excluded server side, so no field here can carry one.

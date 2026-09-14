@@ -57,12 +57,15 @@ from .models import (
     DefinitionTranslateRequest,
     GenerationStartRequest,
     GroundingResponse,
+    ReportRunRequest,
     ReviewRequest,
     SaveChartRequest,
     SavedChart,
     SemanticObject,
 )
 from .paths import DEFAULT_BUNDLE, DEFAULT_CONFIG, ROOT
+from .report_agent import ReportOrchestrator
+from .report_runs import ReportNotReady, ReportRunManager, ReportRunNotFound
 from .retrieval import SemanticRetriever, embedder_from_environment
 from .saved_charts import SavedChartNotFound, SavedChartStore
 from .settings import Settings, resolve_active_bundle
@@ -236,6 +239,15 @@ def create_app(
         active_bundle_id=lambda: version_registry.catalog(runtime["bundle"].root).default_id,
         on_activate=swap_runtime,
     )
+    def _report_orchestrator_factory() -> ReportOrchestrator:
+        current_chat = runtime["chat"]
+        if current_chat is None:
+            raise RuntimeError(
+                "Configure CEREBRO_DATABASE_PATH with a readable DuckDB database, then restart the server."
+            )
+        return ReportOrchestrator(current_chat)
+
+    report_run_manager = ReportRunManager(orchestrator_factory=_report_orchestrator_factory)
     chat_requests = ChatRequestRegistry()
     mcp_server = create_mcp_server(lambda: runtime["retriever"])
     mcp_app = mcp_server.streamable_http_app()
@@ -666,6 +678,91 @@ def create_app(
         chat_requests.cancel(normalized)
         logger.info("chat.cancel.requested request_id=%s", normalized)
         return {"request_id": normalized, "status": "cancellation_requested"}
+
+    @app.post("/api/reports/runs", status_code=202)
+    async def start_report(payload: ReportRunRequest) -> dict:
+        run = report_run_manager.start(payload.request)
+        logger.info("report.run.started run_id=%s request=%s", run.run_id, payload.request)
+        return run.model_dump(mode="json")
+
+    @app.post("/api/reports/runs/{run_id}/cancel", status_code=202)
+    async def cancel_report(run_id: str) -> dict[str, str]:
+        report_run_manager.cancel(run_id)
+        logger.info("report.run.cancel.requested run_id=%s", run_id)
+        return {"run_id": run_id, "status": "cancellation_requested"}
+
+    @app.get("/api/reports/runs/{run_id}")
+    async def get_report_run(run_id: str) -> dict:
+        try:
+            return report_run_manager.get(run_id).model_dump(mode="json")
+        except ReportRunNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_report_run"}) from exc
+
+    @app.get("/api/reports/runs/{run_id}/events")
+    async def report_events(run_id: str, request: Request) -> StreamingResponse:
+        try:
+            report_run_manager.get(run_id)
+        except ReportRunNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_report_run"}) from exc
+        try:
+            cursor = max(0, int(request.headers.get("last-event-id", "0")))
+        except ValueError:
+            cursor = 0
+
+        async def stream():
+            nonlocal cursor
+            while True:
+                events, terminal = report_run_manager.events_after(run_id, cursor)
+                for event in events:
+                    cursor = event.sequence
+                    payload = json.dumps(event.model_dump(mode="json"), separators=(",", ":"))
+                    yield f"id: {event.sequence}\nevent: progress\ndata: {payload}\n\n"
+                if terminal:
+                    run_payload = json.dumps(
+                        report_run_manager.get(run_id).model_dump(mode="json"), separators=(",", ":")
+                    )
+                    yield f"event: complete\ndata: {run_payload}\n\n"
+                    break
+                if await request.is_disconnected():
+                    break
+                await asyncio.sleep(0.15)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/reports/runs/{run_id}/document")
+    async def get_report_document(run_id: str) -> dict:
+        try:
+            return report_run_manager.document(run_id).model_dump(mode="json")
+        except ReportRunNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_report_run"}) from exc
+        except ReportNotReady as exc:
+            raise HTTPException(status_code=409, detail={"code": "report_not_ready"}) from exc
+
+    @app.get("/api/reports/runs/{run_id}/pdf")
+    async def get_report_pdf(run_id: str) -> Response:
+        try:
+            run = report_run_manager.get(run_id)
+        except ReportRunNotFound as exc:
+            raise HTTPException(status_code=404, detail={"code": "unknown_report_run"}) from exc
+        if run.status == "running":
+            raise HTTPException(status_code=409, detail={"code": "report_not_ready"})
+        if run.status == "cancelled":
+            raise HTTPException(status_code=409, detail={"code": "report_cancelled", "message": "Report generation was cancelled."})
+        if run.status == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "report_failed", "message": run.error or "Report generation failed."},
+            )
+        pdf_bytes = report_run_manager.pdf(run_id)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="report-{run_id}.pdf"'},
+        )
 
     @app.post("/api/generation/runs", status_code=202)
     async def start_generation(payload: GenerationStartRequest | None = None) -> dict:

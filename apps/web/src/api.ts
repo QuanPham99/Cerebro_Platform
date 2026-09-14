@@ -1,4 +1,4 @@
-import type { BundleActivation, BundleInfo, BundleVersionCatalog, ChatResponse, DefinitionContext, DefinitionPayload, DefinitionRevision, DefinitionScope, DefinitionTranslation, GenerationRun, GenerationTrace, GraphResponse, ReviewRecord, RuntimeStatus, SavedChart, SemanticObject } from './types'
+import type { BundleActivation, BundleInfo, BundleVersionCatalog, ChatResponse, DefinitionContext, DefinitionPayload, DefinitionRevision, DefinitionScope, DefinitionTranslation, GenerationRun, GenerationTrace, GraphResponse, ReportDocument, ReportRun, ReviewRecord, RuntimeStatus, SavedChart, SemanticObject } from './types'
 
 type SemanticApiErrorPayload = {
   detail?: string | { message?: string; code?: string }
@@ -98,6 +98,21 @@ export const getGenerationGraph = (runId: string, signal?: AbortSignal) =>
 export const getGenerationConcept = (runId: string, id: string, signal?: AbortSignal) =>
   request<SemanticObject>(`/api/generation/runs/${encodeURIComponent(runId)}/concepts/${encodeURIComponent(id)}`, signal)
 export const generationEventsUrl = (runId: string) => `/api/generation/runs/${encodeURIComponent(runId)}/events`
+
+export const startReport = (reportRequest: string, signal?: AbortSignal) =>
+  request<ReportRun>('/api/reports/runs', signal, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request: reportRequest }),
+  })
+export const getReportRun = (runId: string, signal?: AbortSignal) =>
+  request<ReportRun>(`/api/reports/runs/${encodeURIComponent(runId)}`, signal)
+export const getReportDocument = (runId: string, signal?: AbortSignal) =>
+  request<ReportDocument>(`/api/reports/runs/${encodeURIComponent(runId)}/document`, signal)
+export const cancelReport = (runId: string, signal?: AbortSignal) =>
+  request<{ run_id: string; status: string }>(`/api/reports/runs/${encodeURIComponent(runId)}/cancel`, signal, { method: 'POST' })
+export const reportEventsUrl = (runId: string) => `/api/reports/runs/${encodeURIComponent(runId)}/events`
+export const reportPdfUrl = (runId: string) => `/api/reports/runs/${encodeURIComponent(runId)}/pdf`
 export const reviewGeneration = (
   runId: string,
   payload: { decision: 'approve' | 'reject'; reviewer: string; comment: string; acknowledge_ai_risk: boolean },

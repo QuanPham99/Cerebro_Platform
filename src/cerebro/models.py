@@ -560,6 +560,69 @@ class SavedChart(BaseModel):
     created_at: str
 
 
+class ReportPlanSection(BaseModel):
+    title: str
+    question: str
+
+
+class ReportPlan(BaseModel):
+    title: str = ""
+    sections: list[ReportPlanSection] = Field(default_factory=list)
+
+
+class ReportOverview(BaseModel):
+    summary: str
+
+
+class ReportSectionResult(BaseModel):
+    id: str
+    title: str
+    question: str
+    status: Literal["answered", "clarification", "blocked"]
+    answer: str
+    sql: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+    evidence_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ReportDocument(BaseModel):
+    run_id: str
+    request: str
+    title: str
+    overview: str = ""
+    generated_at: str
+    semantic_version: str
+    status: Literal["completed", "partial", "failed"]
+    sections: list[ReportSectionResult] = Field(default_factory=list)
+
+
+class ReportRunRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=2000)
+
+
+class ReportEvent(BaseModel):
+    sequence: int
+    stage: str
+    status: Literal["started", "completed", "clarification", "blocked", "failed"]
+    summary: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReportRun(BaseModel):
+    run_id: str
+    request: str
+    status: Literal["running", "completed", "partial", "failed", "cancelled"]
+    started_at: str
+    completed_at: str | None = None
+    current_stage: str | None = None
+    error: str | None = None
+    events: list[ReportEvent] = Field(default_factory=list)
+
+
 class SemanticObject(BaseModel):
     model_config = ConfigDict(extra="allow")
 

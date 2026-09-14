@@ -24,8 +24,13 @@ RUN uv sync --frozen --no-dev --extra ai --no-install-project
 
 FROM python:3.12-slim-bookworm AS runtime
 
+# libpango/libpangocairo + a font package are native (non-pip) requirements of WeasyPrint,
+# used by the report agent (specs/023-executive-report-agent.md) to render PDFs; without a
+# font package installed, WeasyPrint has nothing to shape text with and PDFs render blank.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl tini \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates curl tini \
+        libpango-1.0-0 libpangocairo-1.0-0 fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 cerebro \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /app --shell /usr/sbin/nologin cerebro

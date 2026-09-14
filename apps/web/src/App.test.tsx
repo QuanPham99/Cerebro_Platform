@@ -264,7 +264,10 @@ describe('workspace navigation', () => {
     expect(within(chatTools).getByText('Preset questions').closest('details')).toHaveAttribute('open')
     expect(within(chatTools).getByText('Database tables').closest('details')).not.toHaveAttribute('open')
     expect(document.querySelector('.setup-rail .schema-overview')).not.toBeInTheDocument()
-    expect(document.querySelectorAll('.chat-panel')).toHaveLength(1)
+    // One chat-panel for the active Text-to-SQL workspace, one for the Report agent workspace
+    // kept mounted-but-hidden (same pattern each workspace already uses for the other).
+    expect(document.querySelectorAll('.chat-panel')).toHaveLength(2)
+    expect(document.querySelectorAll('.agent-workspace:not([hidden]) .chat-panel')).toHaveLength(1)
     expect(document.querySelector('.chat-dock')).not.toBeInTheDocument()
     expect(screen.queryByText(/Governed database chat/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Every question is grounded/i)).not.toBeInTheDocument()
