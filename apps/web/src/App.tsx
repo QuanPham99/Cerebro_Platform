@@ -280,12 +280,15 @@ const PENDING_STAGES: { after: number; label: string }[] = [
 ]
 const PENDING_EXPECTED_SECONDS = 24
 
-function QueryProgress({ elapsed }: { elapsed: number }) {
+function QueryProgress({ elapsed, onStop }: { elapsed: number; onStop: () => void }) {
   const stage = [...PENDING_STAGES].reverse().find((entry) => elapsed >= entry.after) ?? PENDING_STAGES[0]
   const percent = Math.min(94, (elapsed / PENDING_EXPECTED_SECONDS) * 100)
   return (
     <article className="chat-message assistant pending">
-      <span>Cerebro</span>
+      <div className="chat-message-head">
+        <span>Cerebro</span>
+        <button type="button" className="stop-query" onClick={onStop}><Square size={10} />Stop query</button>
+      </div>
       <div className="query-progress">
         <p><Clock size={13} /> {stage.label}…</p>
         <div className="progress-bar" role="progressbar" aria-valuenow={Math.round(percent)} aria-valuemin={0} aria-valuemax={100}>
@@ -509,7 +512,6 @@ function AgentSetupWorkspace({
           <div className="chat-heading">
             <div className="chat-heading-title"><Bot size={16} /><span>Cerebro Agent</span></div>
             <div className="chat-heading-actions">
-              {pending && <button type="button" className="stop-query" onClick={() => cancelActiveRequest(false)}><Square size={10} />Stop query</button>}
               {entries.length > 0 && <button type="button" onClick={() => cancelActiveRequest(true)}>Clear chat</button>}
             </div>
           </div>
@@ -545,11 +547,11 @@ function AgentSetupWorkspace({
                 {entry.response.trace.length > 0 && <details className="chat-detail"><summary><Waypoints size={13} /> Agent trace</summary><ol className="trace-list">{entry.response.trace.map((item, traceIndex) => <li className={item.status} key={`${item.agent}-${traceIndex}`}><strong>{item.agent.replaceAll('_', ' ')}</strong><span>{item.summary}</span></li>)}</ol></details>}
               </article>
             ))}
-            {pending && <QueryProgress elapsed={pendingElapsed} />}
+            {pending && <QueryProgress elapsed={pendingElapsed} onStop={() => cancelActiveRequest(false)} />}
           </div>
           <form className="chat-composer" onSubmit={submit}>
             <label><span className="sr-only">Ask about the database</span><textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Ask a question about the database…" rows={2} /></label>
-            <button type="submit" disabled={!input.trim() || pending} aria-label="Send question"><Send size={17} /></button>
+            {!pending && <button type="submit" disabled={!input.trim()} aria-label="Send question"><Send size={17} /></button>}
           </form>
         </section>
 

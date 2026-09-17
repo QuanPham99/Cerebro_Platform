@@ -128,6 +128,7 @@ class ReportOrchestrator:
             "planning",
             "completed",
             f"Đã lên kế hoạch {len(plan.sections)} phần: " + ", ".join(section.title for section in plan.sections),
+            {"sections": [{"id": f"s{index}", **section.model_dump()} for index, section in enumerate(plan.sections, start=1)]},
         )
 
         sections: list[ReportSectionResult] = []

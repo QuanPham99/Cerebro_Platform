@@ -695,16 +695,7 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 .report-section-empty { margin: 10px 0 0; padding: 8px 10px; color: #8694a9; border: 1px dashed #35415a; border-radius: 7px; font-size: 10px; }
 
 /* Horizontal run stepper */
-.report-stepper { display: flex; flex-wrap: wrap; align-items: center; margin: 10px 0 0; padding: 0; list-style: none; }
-.report-step { display: flex; align-items: center; gap: 6px; padding-right: 10px; margin-right: 10px; border-right: 1px solid #29354b; }
-.report-step:last-child { margin-right: 0; padding-right: 0; border-right: 0; }
-.report-step-dot { width: 16px; height: 16px; display: grid; flex: 0 0 auto; place-items: center; border: 1px solid #35415a; border-radius: 50%; color: #647289; background: #101a2c; }
-.report-step.active .report-step-dot { color: #a78bfa; border-color: #a78bfa; }
-.report-step.done .report-step-dot { color: #6ee7b7; border-color: #6ee7b7; background: #6ee7b71a; }
-.report-step.warn .report-step-dot { color: #f2b56b; border-color: #f2b56b; }
-.report-step.bad .report-step-dot { color: #f17b91; border-color: #f17b91; }
-.report-step-label { color: #8694a9; font: 9px 'JetBrains Mono'; }
-.report-step.active .report-step-label, .report-step.done .report-step-label { color: #b7c1d0; }
+
 
 .saved-charts { min-width: 0; overflow: hidden; border: 1px solid #344058; border-radius: 14px; background: #11192bd9; box-shadow: 0 22px 70px #03061055; }
 .saved-charts-heading { display: flex; align-items: center; gap: 7px; padding: 14px 15px 12px; color: #cbd3df; background: #151d2f; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; }
@@ -964,3 +955,21 @@ details[open] > summary.rail-toggle .chevron-icon { transform: rotate(90deg); }
 }
 
 .top-actions button.active { color: #7fa6ff; border-color: #3d4c68; }
+
+/* Shared response controls and report progress. */
+.chat-message-head button.stop-query { display: flex; gap: 6px; width: auto; align-items: center; padding: 6px 10px; border-radius: 6px; cursor: pointer; color: #ffc0cc; border: 1px solid #f17b9155; background: #f17b910c; font: inherit; font-size: 11px; }
+.chat-message-head button.stop-query:hover { background: #f17b9118; border-color: #f17b9190; }
+.report-header-actions { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+.report-header-actions .report-download, .report-header-actions .report-copy { padding: 6px 9px; font: inherit; font-size: 10px; }
+.report-plan { margin-top: 12px; color: #b7c1d0; }
+.report-plan ul { padding-left: 20px; display: grid; gap: 12px; }
+.report-plan li::marker { color: var(--violet); }
+.report-plan li p { margin: 4px 0; }
+.report-plan li small { color: #8694a9; }
+.report-plan li[data-status="active"] small { color: var(--violet); }
+.report-plan li[data-status="done"] small { color: #6ee7b7; }
+.report-progress-indeterminate .progress-bar-fill { animation: report-progress-slide 1.5s ease-in-out infinite alternate; }
+@keyframes report-progress-slide { from { transform: translateX(0); } to { transform: translateX(230%); } }
+@media (prefers-reduced-motion: reduce) { .report-progress-indeterminate .progress-bar-fill { animation: none; } }
+
+.chat-message-head button.stop-query:disabled { opacity: .5; cursor: not-allowed; }
