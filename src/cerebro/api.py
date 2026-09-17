@@ -37,6 +37,7 @@ from .chat import (
     ChatRequestRegistry,
     DuplicateChatRequest,
 )
+from .customer_scope import filter_graph_for_customer_scope
 from .definitions import (
     DefinitionConflictError,
     DefinitionProviderUnavailable,
@@ -47,6 +48,7 @@ from .definitions import (
 from .enrichment import provider_from_environment
 from .generation import ActivationError, ReviewConflictError, ReviewValidationError
 from .generation_runs import GenerationRunConflict, GenerationRunManager, GenerationRunNotFound, GenerationRunNotReady
+from .graph_projection import project_graph
 from .models import (
     AgentTrace,
     BundleDefaultRequest,
@@ -111,8 +113,7 @@ async def _run_chat_in_thread(
         daemon=True,
         name=f"cerebro-chat-{request_id}",
     ).start()
-    while not completed.is_set():
-        await asyncio.sleep(0.01)
+    await asyncio.get_running_loop().run_in_executor(None, completed.wait)
     error = outcome.get("error")
     if isinstance(error, BaseException):
         raise error
@@ -541,8 +542,40 @@ def create_app(
             ) from exc
 
     @app.get("/api/graph")
-    async def graph() -> dict:
-        return runtime["retriever"].graph().model_dump(mode="json")
+    async def graph(
+        scope: str | None = Query(default=None),
+        tier: str | None = Query(default=None),
+        node_id: str | None = Query(default=None),
+        depth: int = Query(default=1, ge=0, le=settings.graph_max_expand_depth),
+    ) -> dict:
+        if tier is not None and tier not in {"overview", "all"}:
+            raise HTTPException(status_code=422, detail={"code": "unknown_tier", "tier": tier})
+        resolved_tier = tier if tier is not None else (None if node_id is not None else settings.graph_default_tier)
+        result_graph = runtime["retriever"].graph(tier=resolved_tier, node_id=node_id, depth=depth)
+        if scope == "customer":
+            result_graph = filter_graph_for_customer_scope(result_graph)
+        elif scope is not None:
+            raise HTTPException(status_code=422, detail={"code": "unknown_scope", "scope": scope})
+        return result_graph.model_dump(mode="json")
+
+    @app.get("/api/graph/path")
+    async def graph_path(
+        from_id: str = Query(alias="from"),
+        to_id: str = Query(alias="to"),
+        scope: str | None = Query(default=None),
+    ) -> dict:
+        retriever = runtime["retriever"]
+        if from_id not in retriever.by_id or to_id not in retriever.by_id:
+            raise HTTPException(status_code=404, detail={"code": "unknown_concept"})
+        route = retriever.path(from_id, to_id) or []
+        route_graph = project_graph(retriever.graph(), set(route))
+        if scope == "customer":
+            route_graph = filter_graph_for_customer_scope(route_graph)
+        elif scope is not None:
+            raise HTTPException(status_code=422, detail={"code": "unknown_scope", "scope": scope})
+        visible_ids = {node.id for node in route_graph.nodes}
+        visible_route = [object_id for object_id in route if object_id in visible_ids]
+        return {"path": visible_route, **route_graph.model_dump(mode="json")}
 
     @app.get("/api/concepts/{concept_id}")
     async def get_concept(concept_id: str) -> SemanticObject:

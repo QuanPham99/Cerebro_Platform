@@ -17,6 +17,7 @@ def test_golden_bundle_contract(bundle):
         for kind in {obj.profile_kind for obj in bundle.objects}
     }
     assert counts == {
+        "domain": 4,
         "dataset": 1,
         "physical_table": 10,
         "entity": 10,
@@ -24,7 +25,7 @@ def test_golden_bundle_contract(bundle):
         "metric": 11,
         "business_rule": 11,
         "relationship": 11,
-        "policy": 1,
+        "policy": 3,
     }
     tables = [obj for obj in bundle.objects if obj.profile_kind == "physical_table"]
     assert sum(len(obj.cerebro["columns"]) for obj in tables) == 75
@@ -57,6 +58,9 @@ def test_golden_bundle_contract(bundle):
         ("entity.customer", lambda obj: setattr(obj, "id", "metric.customer"), "invalid_profile_id"),
         ("entity.customer", lambda obj: obj.cerebro.update(classification="secretish"), "invalid_classification"),
         ("entity.customer", lambda obj: obj.provenance.update(origin="model-ish"), "invalid_provenance"),
+        ("entity.customer", lambda obj: obj.cerebro.update(domain="domain.missing"), "invalid_entity_domain"),
+        ("domain.retail-banking", lambda obj: setattr(obj, "description", ""), "invalid_domain_contract"),
+        ("domain.retail-banking", lambda obj: setattr(obj, "id", "entity.retail-banking"), "invalid_profile_id"),
     ],
 )
 def test_invalid_semantic_contracts_are_rejected(bundle, object_id, mutation, code):
@@ -65,3 +69,13 @@ def test_invalid_semantic_contracts_are_rejected(bundle, object_id, mutation, co
     report = BundleValidator().validate(invalid)
     assert not report.valid
     assert code in {issue.code for issue in report.issues}
+
+
+def test_entity_without_a_declared_domain_still_validates(bundle):
+    """Domain is optional (spec 026): an entity not yet tagged must not fail validation."""
+    valid = bundle.model_copy(deep=True)
+    entity = valid.by_id()["entity.customer"]
+    entity.cerebro.pop("domain", None)
+    entity.links = [link for link in entity.links if not link.startswith("domain.")]
+    report = BundleValidator().validate(valid)
+    assert report.valid, report.issues

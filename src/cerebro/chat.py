@@ -15,17 +15,23 @@ from typing import Any
 import duckdb
 from sqlglot import exp, parse
 
+from .customer_scope import (
+    CUSTOMER_ROW_FILTER_TABLES,
+    CUSTOMER_SCOPE_BLOCKED_TABLES,
+    CUSTOMER_SCOPE_OBJECT_IDS,
+)
 from .enrichment import GenerationProvider
 from .models import (
     AgentTrace,
     AnswerPayload,
     ChatRequest,
     ChatResponse,
-    QueryPlan,
+    QueryPlanAndSQL,
     SQLProposal,
     SemanticBundle,
     SemanticObject,
 )
+from .provenance import canonicalize_question
 from .retrieval import SemanticRetriever
 from .settings import Settings
 
@@ -166,7 +172,7 @@ class SQLGuardrail:
                 if source and target and source_column and target_column:
                     self.approved_joins.add(frozenset({f"{source}.{source_column}", f"{target}.{target_column}"}))
 
-    def validate(self, sql: str) -> str:
+    def validate(self, sql: str, customer_id: str | None = None) -> str:
         try:
             statements = parse(sql, read="duckdb")
         except Exception as exc:
@@ -192,6 +198,8 @@ class SQLGuardrail:
                 raise SQLSafetyError(f"Only the configured {self.schema} schema is allowed")
             if table_name not in self.columns:
                 raise SQLSafetyError(f"Table is not in the active semantic bundle: {table_name}")
+            if customer_id is not None and table_name in CUSTOMER_SCOPE_BLOCKED_TABLES:
+                raise SQLSafetyError(f"Table is not available in the customer workspace: {table_name}")
             used_tables.add(table_name)
             aliases[table.alias_or_name] = table_name
             aliases[table_name] = table_name
@@ -258,7 +266,34 @@ class SQLGuardrail:
                     tree.set("limit", exp.Limit(expression=exp.Literal.number(self.row_limit)))
             else:
                 raise SQLSafetyError("LIMIT must be a fixed integer")
+        if customer_id is not None:
+            tree = self._apply_customer_row_filter(tree, customer_id, cte_names)
         return tree.sql(dialect="duckdb")
+
+    @staticmethod
+    def _apply_customer_row_filter(
+        tree: exp.Expression, customer_id: str, cte_names: set[str]
+    ) -> exp.Expression:
+        """Rewrite every customer-owned base table into a subquery filtered to
+        ``customer_id``'s own rows, applied at the base-table scan before any join or
+        aggregation. This is the actual security boundary for the customer workspace —
+        it holds regardless of what SQL shape the LLM proposed. See
+        ``policy.customer-self-service-row-level-security``.
+        """
+        literal = (
+            exp.Literal.number(customer_id) if customer_id.isdigit() else exp.Literal.string(customer_id)
+        )
+        for table_node in list(tree.find_all(exp.Table)):
+            table_name = table_node.name
+            if table_name in cte_names or table_name not in CUSTOMER_ROW_FILTER_TABLES:
+                continue
+            alias = table_node.alias_or_name
+            filter_sql = CUSTOMER_ROW_FILTER_TABLES[table_name].replace(
+                ":cid", literal.sql(dialect="duckdb")
+            )
+            derived = parse(f"SELECT * FROM {table_name} WHERE {filter_sql}", read="duckdb")[0]
+            table_node.replace(derived.subquery(alias))
+        return tree
 
     @staticmethod
     def _endpoint(column: exp.Column, aliases: dict[str, str]) -> str:
@@ -299,94 +334,197 @@ class SQLGuardrail:
         return names
 
 
+def suggest_indexes(bundle: SemanticBundle, schema: str = "main") -> list[str]:
+    """Read-only advice: one `CREATE INDEX` statement per governed join column.
+
+    Every source DuckDB connection Cerebro opens is read-only by design (see
+    specs/README.md "Shared constraints"), so this never runs against the
+    database itself — it only reads the bundle's declared relationships (the
+    same set `SQLGuardrail` uses to approve joins) and prints statements for an
+    operator to review and run against their own writable copy of the file.
+    """
+    guardrail = SQLGuardrail(bundle, schema=schema)
+    columns: set[tuple[str, str]] = set()
+    for join in guardrail.approved_joins:
+        for endpoint in join:
+            table, _, column = endpoint.partition(".")
+            if table and column:
+                columns.add((table, column))
+    return [
+        f'CREATE INDEX IF NOT EXISTS "idx_{table}_{column}" ON "{schema}"."{table}" ("{column}");'
+        for table, column in sorted(columns)
+    ]
+
+
 class DuckDBQueryExecutor:
-    def __init__(self, database_path: Path, row_limit: int = 100, timeout_seconds: int = 10):
+    """One reused, lock-serialized read-only connection per orchestrator instance.
+
+    A fresh `duckdb.connect()` per call is unnecessary connect/close overhead paid on
+    every chat turn; this pools a single connection instead, recovering it after any
+    interrupt or engine error so one bad query never poisons the next request. The
+    connection is serialized behind `_lock` because one `ChatOrchestrator` (and thus
+    one executor) is shared across concurrent FastAPI requests.
+    """
+
+    def __init__(
+        self,
+        database_path: Path,
+        row_limit: int = 100,
+        timeout_seconds: int = 10,
+        duckdb_threads: int = 4,
+        duckdb_memory_limit: str = "1GB",
+    ):
         self.database_path = database_path
         self.row_limit = row_limit
         self.timeout_seconds = timeout_seconds
+        self._tuning = {"threads": str(duckdb_threads), "memory_limit": duckdb_memory_limit}
+        self._lock = threading.Lock()
+        # Opened lazily, on first use: an orchestrator (and thus this executor) is
+        # constructed during `create_app()` startup, and a database that is briefly
+        # missing or invalid at that point must still let the app boot in a degraded
+        # state (surfaced by the `/api/health/ready` check) rather than crash startup.
+        self._connection: duckdb.DuckDBPyConnection | None = None
+        self._schema_cache: list[list[Any]] | None = None
+
+    def _connect(self) -> duckdb.DuckDBPyConnection:
+        # No `config=` override here: DuckDB requires every simultaneous connection to
+        # one database file to share identical config, and this connection now lives
+        # for the orchestrator's whole lifetime (unlike the old per-call connection),
+        # so any mismatched config would permanently break every other same-process
+        # reader (the readiness check, `DuckDBSource`, the offline `DuckDBExecutor`
+        # inside `cerebro serve --authorization-scope`) with "Can't open a connection
+        # to same database file with a different configuration than existing
+        # connections". `SQLGuardrail.BLOCKED_FUNCTIONS` already blocks external-access
+        # functions (read_csv, httpfs, ...) at the SQL-parse layer before anything
+        # reaches this connection, so `enable_external_access=false` here was only
+        # defense-in-depth, matching the bare `duckdb.connect(path, read_only=True)`
+        # every other persistent/short-lived reader in this codebase already uses
+        # (`executor.py`'s `DuckDBExecutor`, `api.py`'s `database_component`,
+        # `source.py`'s `DuckDBSource`).
+        connection = duckdb.connect(str(self.database_path), read_only=True)
+        for name, value in self._tuning.items():
+            try:
+                connection.execute(f"SET {name}='{value}'")
+            except duckdb.Error:
+                pass
+        return connection
+
+    def _connection_locked(self) -> duckdb.DuckDBPyConnection:
+        """Return the pooled connection, opening it on first use, under the held lock."""
+        if self._connection is None:
+            self._connection = self._connect()
+        return self._connection
+
+    def _recover_locked(self) -> None:
+        """Replace the connection after an interruption or error, under the held lock."""
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except duckdb.Error:
+                pass
+        self._connection = self._connect()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
 
     def execute(
         self,
         sql: str,
         cancellation: ChatCancellation | None = None,
     ) -> tuple[list[str], list[list[Any]], bool]:
-        connection = duckdb.connect(
-            str(self.database_path),
-            read_only=True,
-            config={"enable_external_access": "false"},
-        )
-        timer = threading.Timer(self.timeout_seconds, connection.interrupt)
-        unregister = (
-            cancellation.register_interrupt(connection.interrupt)
-            if cancellation is not None
-            else lambda: None
-        )
-        try:
-            if cancellation is not None:
-                cancellation.checkpoint()
-            timer.start()
-            cursor = connection.execute(sql)
-            columns = [item[0] for item in (cursor.description or [])]
-            raw_rows = cursor.fetchmany(self.row_limit + 1)
-            if cancellation is not None:
-                cancellation.checkpoint()
-            truncated = len(raw_rows) > self.row_limit
-            rows = [[self._json_value(value) for value in row] for row in raw_rows[: self.row_limit]]
-            return columns, rows, truncated
-        except duckdb.InterruptException as exc:
-            if cancellation is not None and cancellation.cancelled:
-                raise ChatCancelled from exc
-            raise SQLSafetyError(f"Query exceeded the {self.timeout_seconds}-second limit") from exc
-        finally:
-            unregister()
-            timer.cancel()
-            connection.close()
+        with self._lock:
+            connection = self._connection_locked()
+            timer = threading.Timer(self.timeout_seconds, connection.interrupt)
+            unregister = (
+                cancellation.register_interrupt(connection.interrupt)
+                if cancellation is not None
+                else lambda: None
+            )
+            try:
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                timer.start()
+                cursor = connection.execute(sql)
+                columns = [item[0] for item in (cursor.description or [])]
+                raw_rows = cursor.fetchmany(self.row_limit + 1)
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                truncated = len(raw_rows) > self.row_limit
+                rows = [
+                    [self._json_value(value) for value in row] for row in raw_rows[: self.row_limit]
+                ]
+                return columns, rows, truncated
+            except duckdb.InterruptException as exc:
+                self._recover_locked()
+                if cancellation is not None and cancellation.cancelled:
+                    raise ChatCancelled from exc
+                raise SQLSafetyError(f"Query exceeded the {self.timeout_seconds}-second limit") from exc
+            except duckdb.Error:
+                self._recover_locked()
+                raise
+            finally:
+                unregister()
+                timer.cancel()
 
     def table_schemas(
         self,
         cancellation: ChatCancellation | None = None,
     ) -> list[list[Any]]:
-        """Return every live catalog schema without reading source rows."""
-        connection = duckdb.connect(
-            str(self.database_path),
-            read_only=True,
-            config={"enable_external_access": "false"},
-        )
-        unregister = (
-            cancellation.register_interrupt(connection.interrupt)
-            if cancellation is not None
-            else lambda: None
-        )
-        try:
-            if cancellation is not None:
-                cancellation.checkpoint()
-            catalog_rows = connection.execute(
-                "SELECT table_schema, table_name, column_name, data_type, is_nullable "
-                "FROM information_schema.columns "
-                "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
-                "ORDER BY table_schema, table_name, ordinal_position"
-            ).fetchall()
-            if cancellation is not None:
-                cancellation.checkpoint()
-        except duckdb.InterruptException as exc:
-            if cancellation is not None and cancellation.cancelled:
-                raise ChatCancelled from exc
-            raise
-        finally:
-            unregister()
-            connection.close()
+        """Return every live catalog schema without reading source rows.
 
-        columns_by_table: dict[tuple[str, str], list[str]] = {}
-        for schema_name, table_name, column_name, data_type, is_nullable in catalog_rows:
-            table_key = (str(schema_name), str(table_name))
-            nullability = "NULL" if str(is_nullable).upper() == "YES" else "NOT NULL"
-            columns_by_table.setdefault(table_key, []).append(
-                f"{column_name} {data_type} {nullability}"
+        Cached after the first call: the catalog of a fixed `database_path` does not
+        change across a `ChatOrchestrator`'s lifetime (a bundle swap builds a new
+        orchestrator instance, `api.py:prepare_runtime`), so re-scanning
+        `information_schema` on every turn buys nothing.
+        """
+        if self._schema_cache is not None:
+            return self._schema_cache
+        with self._lock:
+            if self._schema_cache is not None:
+                return self._schema_cache
+            connection = self._connection_locked()
+            unregister = (
+                cancellation.register_interrupt(connection.interrupt)
+                if cancellation is not None
+                else lambda: None
             )
-        return [
-            [schema, table, "\n".join(columns_by_table[(schema, table)])]
-            for schema, table in sorted(columns_by_table)
-        ]
+            try:
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                catalog_rows = connection.execute(
+                    "SELECT table_schema, table_name, column_name, data_type, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+                    "ORDER BY table_schema, table_name, ordinal_position"
+                ).fetchall()
+                if cancellation is not None:
+                    cancellation.checkpoint()
+            except duckdb.InterruptException as exc:
+                self._recover_locked()
+                if cancellation is not None and cancellation.cancelled:
+                    raise ChatCancelled from exc
+                raise
+            except duckdb.Error:
+                self._recover_locked()
+                raise
+            finally:
+                unregister()
+
+            columns_by_table: dict[tuple[str, str], list[str]] = {}
+            for schema_name, table_name, column_name, data_type, is_nullable in catalog_rows:
+                table_key = (str(schema_name), str(table_name))
+                nullability = "NULL" if str(is_nullable).upper() == "YES" else "NOT NULL"
+                columns_by_table.setdefault(table_key, []).append(
+                    f"{column_name} {data_type} {nullability}"
+                )
+            self._schema_cache = [
+                [schema, table, "\n".join(columns_by_table[(schema, table)])]
+                for schema, table in sorted(columns_by_table)
+            ]
+            return self._schema_cache
 
     @staticmethod
     def _json_value(value: Any) -> Any:
@@ -409,8 +547,19 @@ class ChatOrchestrator:
         self.bundle = bundle
         self.retriever = retriever
         self.provider = provider
+        # Question-text-keyed cache for the merged query_plan+SQL call, scoped to
+        # customer-scoped, first-turn requests only (spec 027) — see chat() for the
+        # eligibility gate. Wiped for free whenever a new bundle activation constructs a
+        # fresh ChatOrchestrator instance.
+        self._plan_cache: dict[tuple[str, str], QueryPlanAndSQL] = {}
         self.guardrail = SQLGuardrail(bundle, settings.query_row_limit, settings.database_schema)
-        self.executor = DuckDBQueryExecutor(database_path, settings.query_row_limit, settings.query_timeout_seconds)
+        self.executor = DuckDBQueryExecutor(
+            database_path,
+            settings.query_row_limit,
+            settings.query_timeout_seconds,
+            settings.duckdb_threads,
+            settings.duckdb_memory_limit,
+        )
 
     def _generate(
         self,
@@ -467,7 +616,10 @@ class ChatOrchestrator:
         checkpoint = cancellation.checkpoint if cancellation is not None else lambda: None
         checkpoint()
         conversation_id = request.conversation_id or str(uuid.uuid4())
-        if self._is_metadata_exploration_question(request.message):
+        # Metadata exploration bypasses grounding/guardrail scoping entirely (it dumps every
+        # live table schema and bundle object id), so it must never run for a customer-scoped
+        # request — those always go through the normal grounding + SQL-guardrail path below.
+        if request.customer_id is None and self._is_metadata_exploration_question(request.message):
             rows, table_count = self._exploration_inventory(cancellation)
             checkpoint()
             evidence_ids = sorted(obj.id for obj in self.bundle.objects)
@@ -505,7 +657,10 @@ class ChatOrchestrator:
                     ),
                 ],
             )
-        grounding = self.retriever.grounding(request.message)
+        grounding = self.retriever.grounding(
+            request.message,
+            allowed_object_ids=CUSTOMER_SCOPE_OBJECT_IDS if request.customer_id else None,
+        )
         checkpoint()
         evidence_ids = [item.id for item in grounding.ranking_evidence]
         trace: list[AgentTrace] = [
@@ -525,24 +680,73 @@ class ChatOrchestrator:
             )
         history = [{"role": message.role, "content": message.content} for message in request.history[-10:]]
         context = grounding.model_dump(mode="json")
-        inventory_rows, live_table_count = self._exploration_inventory(cancellation)
-        checkpoint()
-        context["available_metadata"] = {
-            "live_table_schema_count": live_table_count,
-            "objects": [
-                dict(zip(("kind", "id", "name", "details"), row, strict=True))
-                for row in inventory_rows
-            ],
-        }
-        checkpoint()
-        plan = self._generate(
-            "query_plan",
-            "Plan this DuckDB question using only the supplied semantic grounding. Ask for clarification "
-            "when the intent cannot be safely resolved.\n"
-            + json.dumps({"question": request.message, "history": history, "grounding": context}, default=str),
-            QueryPlan,
-            cancellation,
+        # available_metadata only feeds the metadata-exploration shortcut above, which is
+        # already unconditionally disabled for customer requests — building and injecting
+        # a full unfiltered bundle dump into the customer's prompts would cost tokens/latency
+        # for a feature that never runs on this path (spec 027).
+        if request.customer_id is None:
+            inventory_rows, live_table_count = self._exploration_inventory(cancellation)
+            checkpoint()
+            context["available_metadata"] = {
+                "live_table_schema_count": live_table_count,
+                "objects": [
+                    dict(zip(("kind", "id", "name", "details"), row, strict=True))
+                    for row in inventory_rows
+                ],
+            }
+        # The row-level filter is applied transparently by SQLGuardrail after this stage (see
+        # customer_scope.CUSTOMER_ROW_FILTER_TABLES) — the model must never ask for or filter by
+        # customer_id itself, or it will produce a confusing clarification request instead of an
+        # answer for a question the platform can already resolve.
+        customer_scope_note = (
+            "You are answering on behalf of an already-authenticated customer in the customer "
+            "self-service workspace. Every customer-owned table is automatically scoped server-side "
+            "to that customer's own rows before execution — never ask the user for their customer_id "
+            "and never filter by customer_id yourself; write the query exactly as you would for any "
+            "other question (e.g. SELECT SUM(balance) FROM accounts). If the question asks about a "
+            "named or implied different customer, about bank staff or branch records, or about a "
+            "bank-wide/population-level metric that is not among the concepts grounded for you here, "
+            "it is out of scope: set requires_query to false and, in the same language as the "
+            "question, politely decline and invite them to ask about their own account instead.\n"
+            if request.customer_id else ""
         )
+        checkpoint()
+        # One combined call produces both the plan and the SQL it implies (spec 025):
+        # the plan never changes what grounding the SQL step sees, so a separate
+        # sql_proposal round-trip bought nothing but latency for every query-requiring
+        # turn. sql_repair (below) still runs as its own single-purpose call, since it
+        # repairs one already-planned query rather than re-planning from scratch.
+        planning_prompt = (
+            customer_scope_note
+            + "Plan this DuckDB question using only the supplied semantic grounding, then in the same "
+            "response generate the one DuckDB SELECT needed to answer it. Ask for clarification when "
+            "the intent cannot be safely resolved, or when the question does not require a database "
+            "query set requires_query to false; in either case leave sql empty. Otherwise generate one "
+            "DuckDB SELECT using only approved tables, explicit columns, approved joins, and the plan "
+            "you just made. Never use SELECT *, DDL, DML, PRAGMA, COPY, ATTACH, INSTALL, LOAD, external "
+            "functions, restricted columns, or raw confidential columns.\n"
+            + json.dumps({"question": request.message, "history": history, "grounding": context}, default=str)
+        )
+        # The customer workspace is a closed set of preset questions, and the row-level
+        # filter is applied deterministically after generation (never by the model), so a
+        # repeated first-turn customer question always yields the same plan+SQL (spec
+        # 027). Scope the cache strictly to that property: never for the open-ended
+        # internal path, and never when history could change what the question means.
+        cache_key: tuple[str, str] | None = None
+        if request.customer_id is not None and not request.history:
+            cache_key = (self.bundle.version, canonicalize_question(request.message))
+        cached_plan = self._plan_cache.get(cache_key) if cache_key is not None else None
+        if cached_plan is not None:
+            plan = cached_plan.model_copy()
+            logger.info(
+                "chat.plan_cache.hit request_id=%s cache_key=%s",
+                threading.current_thread().name.removeprefix("cerebro-chat-"),
+                cache_key,
+            )
+        else:
+            plan = self._generate("query_plan", planning_prompt, QueryPlanAndSQL, cancellation)
+            if cache_key is not None:
+                self._plan_cache[cache_key] = plan.model_copy()
         checkpoint()
         trace.append(AgentTrace(agent="query_planner", status="completed", summary=plan.intent))
         if plan.clarification:
@@ -577,24 +781,14 @@ class ChatOrchestrator:
                 warnings=grounding.warnings,
                 trace=trace,
             )
-        checkpoint()
-        proposal = self._generate(
-            "sql_proposal",
-            "Generate one DuckDB SELECT using only approved tables, explicit columns, approved joins, and "
-            "the supplied plan and grounding. Never use SELECT *, DDL, DML, PRAGMA, COPY, ATTACH, INSTALL, "
-            "LOAD, external functions, restricted columns, or raw confidential columns.\n"
-            + json.dumps({"question": request.message, "plan": plan.model_dump(), "grounding": context}, default=str),
-            SQLProposal,
-            cancellation,
-        )
-        checkpoint()
-        trace.append(AgentTrace(agent="sql_generation", status="completed", summary=proposal.explanation or "Generated SQL"))
+        trace.append(AgentTrace(agent="sql_generation", status="completed", summary=plan.explanation or "Generated SQL"))
+        candidate_sql = plan.sql or ""
         safe_sql: str | None = None
         validation_error: SQLSafetyError | None = None
         for attempt in range(2):
             checkpoint()
             try:
-                safe_sql = self.guardrail.validate(proposal.sql)
+                safe_sql = self.guardrail.validate(candidate_sql, customer_id=request.customer_id)
                 validation_error = None
                 break
             except SQLSafetyError as exc:
@@ -602,23 +796,36 @@ class ChatOrchestrator:
                 if attempt == 1:
                     break
                 checkpoint()
-                proposal = self._generate(
+                repaired = self._generate(
                     "sql_repair",
-                    "Repair this SQL once. Return a safe DuckDB SELECT only.\n"
-                    + json.dumps({"sql": proposal.sql, "validation_error": str(exc), "plan": plan.model_dump(), "grounding": context}, default=str),
+                    customer_scope_note
+                    + "Repair this SQL once. Return a safe DuckDB SELECT only.\n"
+                    + json.dumps({"sql": candidate_sql, "validation_error": str(exc), "plan": plan.model_dump(), "grounding": context}, default=str),
                     SQLProposal,
                     cancellation,
                 )
+                candidate_sql = repaired.sql
                 checkpoint()
         if validation_error or safe_sql is None:
             checkpoint()
             reason = str(validation_error or "SQL validation failed")
             trace.append(AgentTrace(agent="validation", status="blocked", summary=reason))
+            if request.customer_id is not None:
+                # Never surface internal table/column names or SQL to a retail customer — the
+                # reason still lands in the trace above for operators.
+                answer = (
+                    "Rất tiếc, câu hỏi này nằm ngoài phạm vi câu trả lời của tôi. Bạn có muốn hỏi "
+                    "một câu hỏi khác liên quan đến tài khoản của chính mình không?"
+                )
+                sql = None
+            else:
+                answer = f"The generated query was blocked: {reason}"
+                sql = candidate_sql
             return ChatResponse(
                 conversation_id=conversation_id,
                 status="blocked",
-                answer=f"The generated query was blocked: {reason}",
-                sql=proposal.sql,
+                answer=answer,
+                sql=sql,
                 semantic_version=self.bundle.version,
                 evidence_ids=evidence_ids,
                 warnings=grounding.warnings,

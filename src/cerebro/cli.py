@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from .bundle import BundleLoader, BundleValidator
-from .chat import ChatOrchestrator
+from .chat import ChatOrchestrator, suggest_indexes
 from .enrichment import provider_from_environment
 from .generation import activate_bundle, review_bundle, run_generation_workflow
 from .models import ChatRequest
@@ -134,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="Check local configuration without making a model call")
     doctor.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     doctor.add_argument("--database", type=Path)
+    suggest_indexes_parser = commands.add_parser(
+        "suggest-indexes",
+        help="Print CREATE INDEX statements for governed join columns; never executed by Cerebro",
+    )
+    suggest_indexes_parser.add_argument("--bundle", type=Path, default=None)
     serve.add_argument(
         "--authorization-scope",
         type=Path,
@@ -324,6 +329,7 @@ def _run_serve(args) -> int:
     runtime = None
     if args.authorization_scope is not None:
         scope = load_authorization_scope(args.authorization_scope)
+        settings = Settings.from_environment()
         # Built here, not on the first request: a missing credential or database
         # should stop the server rather than turn every chat message into a 500.
         runtime = build_agent(
@@ -331,6 +337,8 @@ def _run_serve(args) -> int:
             "organizer",
             scope,
             bundle_path=args.bundle or DEFAULT_BUNDLE,
+            duckdb_threads=settings.duckdb_threads,
+            duckdb_memory_limit=settings.duckdb_memory_limit,
         )
         attach_agent(app, runtime)
 
@@ -437,6 +445,17 @@ def main(argv: list[str] | None = None) -> int:
             return _run_baseline(args)
         elif args.command == "serve":
             return _run_serve(args)
+        elif args.command == "suggest-indexes":
+            settings = Settings.from_environment()
+            bundle = BundleLoader().load(resolve_active_bundle(args.bundle))
+            statements = suggest_indexes(bundle, schema=settings.database_schema)
+            if not statements:
+                print("-- No governed relationships found; nothing to index.")
+                return 0
+            print("-- Review and run these yourself against a writable copy of your DuckDB file.")
+            print("-- Cerebro never opens a write connection to the source database.")
+            for statement in statements:
+                print(statement)
         elif args.command == "doctor":
             settings = Settings.from_environment()
             source = DuckDBSource(args.config, args.database or settings.database_path)

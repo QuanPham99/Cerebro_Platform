@@ -6,6 +6,7 @@ description: Business entity for branch records.
 status: stable
 links:
 - table.branches
+- domain.operations
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +17,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.operations
   physical_mapping:
     table: table.branches
     key:

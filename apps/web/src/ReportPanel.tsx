@@ -451,11 +451,6 @@ export function ReportPanel({ active }: { active: boolean }) {
           <div className="chat-heading">
             <div className="chat-heading-title"><FileText size={16} /><span>Report Agent</span></div>
             <div className="chat-heading-actions">
-              {pending && (
-                <button type="button" className="stop-query" onClick={stopActiveRun} disabled={cancelling}>
-                  <Square size={10} />{cancelling ? 'Đang dừng…' : 'Dừng'}
-                </button>
-              )}
               {entries.length > 0 && <button type="button" onClick={() => setEntries([])} disabled={pending}>Xóa</button>}
             </div>
           </div>
@@ -470,7 +465,12 @@ export function ReportPanel({ active }: { active: boolean }) {
             {entries.map((entry, index) => entry.role === 'user' ? (
               <article className="chat-message user" key={index}><span>Bạn</span><p>{entry.content}</p></article>
             ) : (
-              <ReportAssistantMessage key={entry.localId ?? index} entry={entry} />
+              <div className="pending-row" key={entry.localId ?? index}>
+                <ReportAssistantMessage entry={entry} />
+                {pending && index === entries.length - 1 && (
+                  <button type="button" className="stop-query" onClick={stopActiveRun} disabled={cancelling} aria-label={cancelling ? 'Đang dừng…' : 'Dừng'}><Square size={12} /></button>
+                )}
+              </div>
             ))}
           </div>
           <form className="chat-composer" onSubmit={submit}>

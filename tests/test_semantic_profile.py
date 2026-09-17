@@ -146,6 +146,7 @@ def test_golden_semantic_profile_contract_and_grounding():
     for obj in bundle.objects:
         counts[obj.profile_kind] = counts.get(obj.profile_kind, 0) + 1
     assert counts == {
+        "domain": 4,
         "dataset": 1,
         "physical_table": 10,
         "entity": 10,
@@ -153,9 +154,9 @@ def test_golden_semantic_profile_contract_and_grounding():
         "metric": 11,
         "business_rule": 11,
         "relationship": 11,
-        "policy": 1,
+        "policy": 3,
     }
-    assert len(bundle.objects) == 66
+    assert len(bundle.objects) == 72
     assert sum(
         len(obj.cerebro.get("columns", []))
         for obj in bundle.objects

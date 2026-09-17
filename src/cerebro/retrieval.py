@@ -30,6 +30,7 @@ from .models import (
     SnapshotRelationship,
     SnapshotWarning,
 )
+from .graph_projection import project_graph
 from .provenance import (
     authorization_scope_sha256,
     canonicalize_question,
@@ -37,6 +38,8 @@ from .provenance import (
 )
 from .semantic.linker import profile_edges
 from .semantic.profile import normalize_profile_kind
+
+GRAPH_OVERVIEW_TIER_KINDS = frozenset({"domain", "entity"})
 
 TOKEN = re.compile(r"[a-z0-9]+")
 STOP_WORDS = {
@@ -59,6 +62,12 @@ class SemanticRetriever:
         self.by_id = bundle.by_id()
         self.embedder = embedder
         self.documents = {obj.id: self._search_text(obj) for obj in bundle.objects}
+        self._tokenized_documents: dict[str, list[str]] = {
+            object_id: _tokens(text) for object_id, text in self.documents.items()
+        }
+        self._tokenized_names: dict[str, list[list[str]]] = {
+            obj.id: [_tokens(name) for name in (obj.name, *obj.aliases)] for obj in bundle.objects
+        }
         self.adjacency: dict[str, set[str]] = defaultdict(set)
         self.edges = self._build_edges()
         self._vectors: dict[str, list[float]] = {}
@@ -136,16 +145,16 @@ class SemanticRetriever:
         normalized_query = " ".join(terms)
         ranked = []
         for obj in self.bundle.objects:
-            haystack = _tokens(self.documents[obj.id])
+            haystack = self._tokenized_documents[obj.id]
             counts = {term: haystack.count(term) for term in set(terms)}
             matched = [term for term in terms if counts.get(term, 0)]
             if not matched:
                 continue
             score = sum(1.0 + math.log1p(counts[term]) for term in set(matched))
-            if any(term in _tokens(obj.name) for term in terms):
+            name_tokens = self._tokenized_names[obj.id]
+            if any(term in name_tokens[0] for term in terms):
                 score += 2.0
-            names = [obj.name, *obj.aliases]
-            if any(" ".join(_tokens(name)) == normalized_query for name in names):
+            if any(" ".join(tokens) == normalized_query for tokens in name_tokens):
                 score += 4.0
             ranked.append((obj.id, score, [f"lexical:{term}" for term in sorted(set(matched))]))
         return sorted(ranked, key=lambda item: (-item[1], item[0]))
@@ -242,7 +251,46 @@ class SemanticRetriever:
             visited.update(frontier)
         return sorted(visited)
 
-    def graph(self) -> GraphResponse:
+    def path(self, from_id: str, to_id: str) -> list[str] | None:
+        """Shortest node-id path between two objects over the graph adjacency, or
+        ``None`` if either id is unknown or no connecting path exists (Find Path)."""
+        if from_id not in self.by_id or to_id not in self.by_id:
+            return None
+        if from_id == to_id:
+            return [from_id]
+        parents: dict[str, str] = {from_id: from_id}
+        frontier = [from_id]
+        while frontier:
+            next_frontier: list[str] = []
+            for item in frontier:
+                for neighbor in self.adjacency.get(item, set()):
+                    if neighbor in parents:
+                        continue
+                    parents[neighbor] = item
+                    if neighbor == to_id:
+                        route = [to_id]
+                        while route[-1] != from_id:
+                            route.append(parents[route[-1]])
+                        route.reverse()
+                        return route
+                    next_frontier.append(neighbor)
+            frontier = next_frontier
+        return None
+
+    def graph(
+        self,
+        tier: str | None = None,
+        node_id: str | None = None,
+        depth: int = 1,
+    ) -> GraphResponse:
+        """Project the full semantic graph, optionally scoped for progressive disclosure.
+
+        ``node_id`` (with ``depth``) takes precedence and returns that node's BFS
+        neighborhood via :meth:`expand`, reusing the same adjacency used by MCP's
+        ``expand_neighborhood`` and chat grounding. Otherwise ``tier="overview"``
+        restricts the result to :data:`GRAPH_OVERVIEW_TIER_KINDS` (domain + entity) —
+        the default, bounded view. ``tier=None``/``"all"`` returns everything.
+        """
         nodes = [
             GraphNode(
                 id=obj.id,
@@ -254,10 +302,26 @@ class SemanticRetriever:
             )
             for obj in self.bundle.objects
         ]
-        return GraphResponse(version=self.bundle.version, nodes=nodes, edges=self.edges)
+        full_graph = GraphResponse(version=self.bundle.version, nodes=nodes, edges=self.edges)
+        if node_id is not None:
+            allowed_ids = set(self.expand([node_id], depth=depth))
+            return project_graph(full_graph, allowed_ids)
+        if tier == "overview":
+            allowed_ids = {
+                obj.id for obj in self.bundle.objects if obj.profile_kind in GRAPH_OVERVIEW_TIER_KINDS
+            }
+            return project_graph(full_graph, allowed_ids)
+        return full_graph
 
-    def grounding(self, question: str, limit: int = 10) -> GroundingResponse:
+    def grounding(
+        self,
+        question: str,
+        limit: int = 10,
+        allowed_object_ids: frozenset[str] | None = None,
+    ) -> GroundingResponse:
         ranked = self.search(question, limit=limit)
+        if allowed_object_ids is not None:
+            ranked = [item for item in ranked if item.id in allowed_object_ids]
         selected_ids = self._progressive_grounding_ids(question, ranked)
         selected = [self.by_id[item] for item in selected_ids]
         tables = [obj for obj in selected if obj.profile_kind == "physical_table"]

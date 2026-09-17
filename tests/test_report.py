@@ -15,7 +15,7 @@ from cerebro.models import (
     AnswerPayload,
     ChatRequest,
     ChatResponse,
-    QueryPlan,
+    QueryPlanAndSQL,
     ReportDocument,
     ReportOverview,
     ReportPlan,
@@ -69,10 +69,26 @@ class ReportChatProvider(GenerationProvider):
             return self.plan
         if output_model is ReportOverview:
             return ReportOverview(summary=self.overview)
-        if output_model is QueryPlan:
+        if output_model is QueryPlanAndSQL:
             if self.clarify_marker and self.clarify_marker in prompt:
-                return QueryPlan(intent="unclear", requires_query=False, clarification="Bạn muốn xem theo tiêu chí nào?")
-            return QueryPlan(intent="Count customers by gender", tables=["customers"], group_by=["gender"])
+                return QueryPlanAndSQL(
+                    intent="unclear", requires_query=False, clarification="Bạn muốn xem theo tiêu chí nào?"
+                )
+            if self.unsafe_sql:
+                return QueryPlanAndSQL(
+                    intent="Count customers by gender",
+                    tables=["customers"],
+                    group_by=["gender"],
+                    sql="SELECT name FROM customers",
+                    explanation="unsafe on purpose",
+                )
+            return QueryPlanAndSQL(
+                intent="Count customers by gender",
+                tables=["customers"],
+                group_by=["gender"],
+                sql="SELECT gender, COUNT(*) AS customer_count FROM customers GROUP BY gender",
+                explanation="Safe aggregate",
+            )
         if output_model is SQLProposal:
             if self.unsafe_sql:
                 return SQLProposal(sql="SELECT name FROM customers", explanation="unsafe on purpose")

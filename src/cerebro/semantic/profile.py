@@ -6,6 +6,7 @@ import re
 SEMANTIC_PROFILE_VERSION = "0.1"
 
 PROFILE_KINDS = frozenset({
+    "domain",
     "dataset",
     "physical_table",
     "entity",
@@ -25,6 +26,7 @@ TYPE_ALIASES = {
 }
 
 REFERENCE_PREFIXES = {
+    "domain": "domain",
     "dataset": "dataset",
     "physical_table": "table",
     "entity": "entity",

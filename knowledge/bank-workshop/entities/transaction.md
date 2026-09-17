@@ -6,6 +6,7 @@ description: Business entity for transaction records.
 status: stable
 links:
 - table.transactions
+- domain.retail-banking
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +17,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.retail-banking
   physical_mapping:
     table: table.transactions
     key:

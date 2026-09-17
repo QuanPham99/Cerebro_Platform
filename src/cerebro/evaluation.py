@@ -258,6 +258,8 @@ def build_agent(
     cassette_path: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
     gateway_options: Mapping[str, Any] | None = None,
+    duckdb_threads: int | None = None,
+    duckdb_memory_limit: str | None = None,
 ) -> AgentRuntime:
     """Compose the single authorized runtime for one process.
 
@@ -296,7 +298,12 @@ def build_agent(
         semantic_version=bundle.version,
         policy_version=authorization_scope.policy_version,
     )
-    engine = DuckDBExecutor(str(database_path))
+    duckdb_settings: dict[str, Any] = {}
+    if duckdb_threads is not None:
+        duckdb_settings["threads"] = str(duckdb_threads)
+    if duckdb_memory_limit is not None:
+        duckdb_settings["memory_limit"] = duckdb_memory_limit
+    engine = DuckDBExecutor(str(database_path), settings=duckdb_settings or None)
     cache = Text2SQLCache()
     agent = Text2SQLAgent(
         resolver=resolver,

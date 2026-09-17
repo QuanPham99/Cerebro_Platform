@@ -21,7 +21,7 @@ from cerebro.chat import (
     SQLSafetyError,
 )
 from cerebro.enrichment import GenerationProvider
-from cerebro.models import AnswerPayload, ChatRequest, ChatResponse, QueryPlan, SQLProposal
+from cerebro.models import AnswerPayload, ChatRequest, ChatResponse, QueryPlanAndSQL, SQLProposal
 from cerebro.paths import DEFAULT_BUNDLE
 from cerebro.retrieval import SemanticRetriever
 from cerebro.settings import Settings
@@ -36,8 +36,14 @@ class ChatProvider(GenerationProvider):
 
     def generate(self, schema_name, prompt, output_model):
         self.prompts.append((schema_name, prompt))
-        if output_model is QueryPlan:
-            return QueryPlan(intent="Count customers by gender", tables=["customers"], group_by=["gender"])
+        if output_model is QueryPlanAndSQL:
+            return QueryPlanAndSQL(
+                intent="Count customers by gender",
+                tables=["customers"],
+                group_by=["gender"],
+                sql="SELECT gender, COUNT(*) AS customer_count FROM customers GROUP BY gender",
+                explanation="Safe aggregate",
+            )
         if output_model is SQLProposal:
             return SQLProposal(sql="SELECT gender, COUNT(*) AS customer_count FROM customers GROUP BY gender", explanation="Safe aggregate")
         if output_model is AnswerPayload:
@@ -93,6 +99,18 @@ def test_sql_guardrail_allows_order_by_referencing_a_select_alias():
         guardrail.validate("SELECT COUNT(*) AS total FROM customers ORDER BY not_a_real_alias")
 
 
+def test_suggest_indexes_emits_one_statement_per_governed_join_column():
+    from cerebro.chat import suggest_indexes
+
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    statements = suggest_indexes(bundle)
+    assert statements == sorted(statements)
+    assert 'CREATE INDEX IF NOT EXISTS "idx_accounts_customer_id" ON "main"."accounts" ("customer_id");' in statements
+    assert 'CREATE INDEX IF NOT EXISTS "idx_customers_customer_id" ON "main"."customers" ("customer_id");' in statements
+    # Never touches the database: statements are derived purely from bundle relationships.
+    assert all(statement.startswith("CREATE INDEX IF NOT EXISTS") for statement in statements)
+
+
 def test_chat_runs_validated_read_only_query(bank_database: Path, caplog: pytest.LogCaptureFixture):
     bundle = load_validated_bundle(DEFAULT_BUNDLE)
     provider = ChatProvider()
@@ -107,6 +125,10 @@ def test_chat_runs_validated_read_only_query(bank_database: Path, caplog: pytest
     assert [item.agent for item in response.trace] == [
         "knowledge_retrieval", "query_planner", "sql_generation", "validation", "orchestrator"
     ]
+    # Spec 025: the plan and SQL proposal are now one merged call, so a query-requiring
+    # turn makes exactly 2 model calls total (merged query_plan, then database_answer)
+    # instead of 3.
+    assert [schema for schema, _ in provider.prompts] == ["query_plan", "database_answer"]
     planning_prompt = provider.prompts[0][1]
     assert '"available_metadata"' in planning_prompt
     assert '"live_table_schema_count": 10' in planning_prompt
@@ -142,6 +164,128 @@ def test_chat_cancellation_stops_after_an_in_flight_provider_call(bank_database:
     assert [schema for schema, _ in provider.prompts] == ["query_plan"]
 
 
+def test_chat_sql_repair_runs_once_after_guardrail_rejection(bank_database: Path):
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+
+    class RepairingProvider(ChatProvider):
+        def generate(self, schema_name, prompt, output_model):
+            self.prompts.append((schema_name, prompt))
+            if output_model is QueryPlanAndSQL:
+                return QueryPlanAndSQL(
+                    intent="Count customers by gender",
+                    tables=["customers"],
+                    group_by=["gender"],
+                    sql="SELECT * FROM customers",
+                    explanation="Draft",
+                )
+            if output_model is SQLProposal:
+                return SQLProposal(
+                    sql="SELECT gender, COUNT(*) AS customer_count FROM customers GROUP BY gender",
+                    explanation="Repaired",
+                )
+            if output_model is AnswerPayload:
+                return AnswerPayload(answer="There are two female customers and one male customer.")
+            raise AssertionError(schema_name)
+
+    provider = RepairingProvider()
+    response = ChatOrchestrator(
+        bundle, SemanticRetriever(bundle), bank_database, _settings(bank_database), provider
+    ).chat(ChatRequest(message="How many customers are there by gender?"))
+    assert response.status == "answered"
+    assert [schema for schema, _ in provider.prompts] == ["query_plan", "sql_repair", "database_answer"]
+
+
+def test_chat_clarification_makes_exactly_one_model_call(bank_database: Path):
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+
+    class ClarifyingProvider(ChatProvider):
+        def generate(self, schema_name, prompt, output_model):
+            self.prompts.append((schema_name, prompt))
+            if output_model is QueryPlanAndSQL:
+                return QueryPlanAndSQL(intent="Unclear", clarification="Which time period do you mean?")
+            raise AssertionError(schema_name)
+
+    provider = ClarifyingProvider()
+    response = ChatOrchestrator(
+        bundle, SemanticRetriever(bundle), bank_database, _settings(bank_database), provider
+    ).chat(ChatRequest(message="How many are there recently?"))
+    assert response.status == "clarification"
+    assert [schema for schema, _ in provider.prompts] == ["query_plan"]
+
+
+def test_chat_no_query_answer_skips_sql_generation_call(bank_database: Path):
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+
+    class SemanticOnlyProvider(ChatProvider):
+        def generate(self, schema_name, prompt, output_model):
+            self.prompts.append((schema_name, prompt))
+            if output_model is QueryPlanAndSQL:
+                return QueryPlanAndSQL(intent="Explain a metric", requires_query=False)
+            if output_model is AnswerPayload:
+                return AnswerPayload(answer="Customer net cash flow is defined as inflows minus outflows.")
+            raise AssertionError(schema_name)
+
+    provider = SemanticOnlyProvider()
+    response = ChatOrchestrator(
+        bundle, SemanticRetriever(bundle), bank_database, _settings(bank_database), provider
+    ).chat(ChatRequest(message="What does customer net cash flow mean?"))
+    assert response.status == "answered"
+    assert response.sql is None
+    assert [schema for schema, _ in provider.prompts] == ["query_plan", "semantic_answer"]
+
+
+def test_duckdb_query_executor_reuses_one_connection(bank_database: Path, monkeypatch):
+    real_connect = duckdb.connect
+    connect_calls: list[object] = []
+
+    def counting_connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("cerebro.chat.duckdb.connect", counting_connect)
+    executor = DuckDBQueryExecutor(bank_database)
+    assert len(connect_calls) == 0  # opened lazily, not at construction
+    executor.table_schemas()
+    assert len(connect_calls) == 1
+    executor.table_schemas()
+    executor.execute("SELECT COUNT(*) AS total FROM customers")
+    executor.execute("SELECT COUNT(*) AS total FROM accounts")
+    assert len(connect_calls) == 1
+
+
+def test_duckdb_query_executor_caches_table_schemas(bank_database: Path):
+    executor = DuckDBQueryExecutor(bank_database)
+    first = executor.table_schemas()
+    second = executor.table_schemas()
+    assert first is second
+
+
+def test_duckdb_query_executor_recovers_after_engine_error(bank_database: Path):
+    executor = DuckDBQueryExecutor(bank_database)
+    executor.table_schemas()  # force the lazy connection open before swapping it out
+    original_connection = executor._connection
+
+    class FailingConnection:
+        def execute(self, sql):
+            raise duckdb.Error("boom")
+
+        def interrupt(self):
+            pass
+
+        def close(self):
+            pass
+
+    executor._connection = FailingConnection()
+    with pytest.raises(duckdb.Error):
+        executor.execute("SELECT 1")
+    assert executor._connection is not original_connection
+
+    columns, rows, truncated = executor.execute("SELECT COUNT(*) AS total FROM customers")
+    assert columns == ["total"]
+    assert rows == [[3]]
+    assert truncated is False
+
+
 def test_duckdb_execution_is_interrupted_by_chat_cancellation(monkeypatch, tmp_path):
     started = threading.Event()
     interrupted = threading.Event()
@@ -150,7 +294,11 @@ def test_duckdb_execution_is_interrupted_by_chat_cancellation(monkeypatch, tmp_p
     class BlockingConnection:
         description = [("total",)]
 
-        def execute(self, _sql):
+        def execute(self, sql):
+            # Only the real query blocks; a real DuckDB connection applies a `SET`
+            # tuning pragma synchronously/instantly, so the mock should too.
+            if sql.strip().upper().startswith("SET "):
+                return self
             started.set()
             interrupted.wait(2)
             raise duckdb.InterruptException("cancelled")
@@ -316,11 +464,11 @@ def test_chat_returns_all_live_schemas_and_semantic_objects_without_model(
 
     assert response.status == "answered"
     assert response.answer == (
-        "66 metadata objects are available to explore, including 10 live DuckDB "
+        "72 metadata objects are available to explore, including 10 live DuckDB "
         "table schemas and every object in the active semantic bundle."
     )
     assert response.columns == ["kind", "id", "name", "details"]
-    assert response.row_count == 66
+    assert response.row_count == 72
     assert response.truncated is False
     kinds = {row[0] for row in response.rows}
     assert kinds >= {"dataset", "physical_table", "metric", "business_rule"}

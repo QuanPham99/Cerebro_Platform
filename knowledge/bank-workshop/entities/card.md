@@ -6,6 +6,7 @@ description: Business entity for card records.
 status: stable
 links:
 - table.cards
+- domain.cards
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +17,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.cards
   physical_mapping:
     table: table.cards
     key:

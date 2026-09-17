@@ -31,6 +31,8 @@ class Settings:
     embedding_model: str | None
     query_row_limit: int = 100
     query_timeout_seconds: int = 10
+    duckdb_threads: int = 4
+    duckdb_memory_limit: str = "1GB"
     llm_provider_id: str = "openai-compatible"
     llm_provider_name: str = "OpenAI-compatible"
     llm_timeout_seconds: int = 120
@@ -40,6 +42,8 @@ class Settings:
     llm_timeout_backoff_multiplier: float = 1.5
     basic_auth_user: str | None = None
     basic_auth_password: str | None = None
+    graph_default_tier: str = "overview"
+    graph_max_expand_depth: int = 3
 
     @property
     def llm_configured(self) -> bool:
@@ -56,6 +60,9 @@ class Settings:
         response_mode = _clean(os.getenv("CEREBRO_LLM_RESPONSE_MODE")) or "auto"
         if response_mode not in {"auto", "json_schema", "json_object"}:
             raise ValueError("CEREBRO_LLM_RESPONSE_MODE must be auto, json_schema, or json_object")
+        graph_default_tier = _clean(os.getenv("CEREBRO_GRAPH_DEFAULT_TIER")) or "overview"
+        if graph_default_tier not in {"overview", "all"}:
+            raise ValueError("CEREBRO_GRAPH_DEFAULT_TIER must be overview or all")
         return cls(
             database_path=Path(database).expanduser() if database else None,
             database_schema=_clean(os.getenv("CEREBRO_DATABASE_SCHEMA")) or "main",
@@ -66,6 +73,8 @@ class Settings:
             embedding_model=_clean(os.getenv("CEREBRO_EMBEDDING_MODEL")),
             query_row_limit=max(1, min(int(os.getenv("CEREBRO_QUERY_ROW_LIMIT", "100")), 1000)),
             query_timeout_seconds=max(1, min(int(os.getenv("CEREBRO_QUERY_TIMEOUT_SECONDS", "10")), 60)),
+            duckdb_threads=max(1, min(int(os.getenv("CEREBRO_DUCKDB_THREADS", "4")), 64)),
+            duckdb_memory_limit=_clean(os.getenv("CEREBRO_DUCKDB_MEMORY_LIMIT")) or "1GB",
             llm_provider_id=_clean(os.getenv("CEREBRO_LLM_PROVIDER_ID")) or "openai-compatible",
             llm_provider_name=_clean(os.getenv("CEREBRO_LLM_PROVIDER_NAME")) or "OpenAI-compatible",
             llm_timeout_seconds=max(10, min(int(os.getenv("CEREBRO_LLM_TIMEOUT_SECONDS", "120")), 600)),
@@ -77,6 +86,8 @@ class Settings:
             ),
             basic_auth_user=_clean(os.getenv("CEREBRO_BASIC_AUTH_USER")),
             basic_auth_password=_clean(os.getenv("CEREBRO_BASIC_AUTH_PASSWORD")),
+            graph_default_tier=graph_default_tier,
+            graph_max_expand_depth=max(0, min(int(os.getenv("CEREBRO_GRAPH_MAX_EXPAND_DEPTH", "3")), 10)),
         )
 
     def public_status(self) -> dict[str, object]:
@@ -105,6 +116,10 @@ class Settings:
             "database_schema": self.database_schema,
             "query_row_limit": self.query_row_limit,
             "query_timeout_seconds": self.query_timeout_seconds,
+            "duckdb_threads": self.duckdb_threads,
+            "duckdb_memory_limit": self.duckdb_memory_limit,
+            "graph_default_tier": self.graph_default_tier,
+            "graph_max_expand_depth": self.graph_max_expand_depth,
         }
 
 

@@ -9,10 +9,11 @@ afterEach(cleanup)
 describe('profile presentation', () => {
   it('defines every profile kind with its canonical layer, color, and shape', () => {
     expect(PROFILE_KINDS).toEqual([
-      'dataset', 'physical_table', 'entity', 'dimension', 'business_rule', 'metric',
+      'domain', 'dataset', 'physical_table', 'entity', 'dimension', 'business_rule', 'metric',
       'relationship', 'policy', 'legacy_concept', 'generic',
     ])
     expect(PROFILE_PRESENTATION).toMatchObject({
+      domain: { layer: 'Domain', color: '#E0B34D', shape: 'star' },
       dataset: { layer: 'Physical', color: '#58C7D9', shape: 'round-rectangle' },
       physical_table: { layer: 'Physical', color: '#3EA6B8', shape: 'rectangle' },
       entity: { layer: 'Semantic', color: '#A78BFA', shape: 'ellipse' },
@@ -48,6 +49,7 @@ describe('physical relationship notation', () => {
 
 describe('semantic edge grammar', () => {
   const expected: Array<[Exclude<GraphEdgeType, 'physical_fk'>, string, string, string]> = [
+    ['domain_membership', '#E0B34D', 'solid', 'triangle'],
     ['semantic_mapping', '#A78BFA', 'solid', 'triangle'],
     ['entity_mapping', '#A78BFA', 'solid', 'triangle'],
     ['dimension_entity', '#60A5FA', 'solid', 'triangle'],

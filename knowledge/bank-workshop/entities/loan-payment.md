@@ -6,6 +6,7 @@ description: Business entity for loan payment records.
 status: stable
 links:
 - table.loan_payments
+- domain.lending
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +17,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.lending
   physical_mapping:
     table: table.loan_payments
     key:
