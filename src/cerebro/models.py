@@ -144,6 +144,17 @@ class RatioMeasure(BaseModel):
 MetricMeasure = Annotated[AggregateMeasure | RatioMeasure, Field(discriminator="kind")]
 
 
+class DomainCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    classification: Classification
+    owner: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class EntityCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -503,6 +514,24 @@ class SQLProposal(BaseModel):
     explanation: str = ""
 
 
+class QueryPlanAndSQL(BaseModel):
+    """One-call merge of `QueryPlan` and `SQLProposal` (spec 025).
+
+    Used only for the combined `query_plan` chat stage; `sql_repair` still returns a
+    plain `SQLProposal` since it repairs one already-planned query.
+    """
+
+    intent: str
+    requires_query: bool = True
+    tables: list[str] = Field(default_factory=list)
+    metrics: list[str] = Field(default_factory=list)
+    filters: list[str] = Field(default_factory=list)
+    group_by: list[str] = Field(default_factory=list)
+    clarification: str | None = None
+    sql: str | None = None
+    explanation: str = ""
+
+
 class AnswerPayload(BaseModel):
     answer: str
 
@@ -517,6 +546,8 @@ class ChatRequest(BaseModel):
     request_id: UUID | None = None
     conversation_id: str | None = None
     history: list[ChatMessage] = Field(default_factory=list, max_length=10)
+    # Set only by the customer workspace's simulated login; triggers row-level filtering in SQLGuardrail.
+    customer_id: str | None = Field(default=None, max_length=64)
 
 
 class AgentTrace(BaseModel):

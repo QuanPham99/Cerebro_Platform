@@ -3,9 +3,12 @@ type: Entity
 id: entity.customer
 title: Customer
 description: Business entity for customer records.
+aliases:
+- "khách hàng"
 status: stable
 links:
 - table.customers
+- domain.retail-banking
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +19,7 @@ provenance:
 cerebro:
   kind: entity
   classification: restricted
+  domain: domain.retail-banking
   physical_mapping:
     table: table.customers
     key:

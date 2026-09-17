@@ -64,8 +64,38 @@ async function request<T>(path: string, signal?: AbortSignal, init: RequestInit 
   return parsedBody as T
 }
 
+export interface GraphQuery {
+  /** 'overview' = domain+entity only (the bounded default); 'all' explicitly opts into the full graph. */
+  tier?: 'overview' | 'all'
+  /** Fetch the 1-hop (or `depth`-hop) neighborhood of one node instead of a tier. */
+  nodeId?: string
+  depth?: number
+}
+
+function graphSearchParams(query?: GraphQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  if (query?.tier) params.set('tier', query.tier)
+  if (query?.nodeId) params.set('node_id', query.nodeId)
+  if (query?.depth !== undefined) params.set('depth', String(query.depth))
+  return params
+}
+
 export const getBundle = (signal?: AbortSignal) => request<BundleInfo>('/api/bundles/active', signal)
-export const getGraph = (signal?: AbortSignal) => request<GraphResponse>('/api/graph', signal)
+export const getGraph = (query?: GraphQuery, signal?: AbortSignal) => {
+  const params = graphSearchParams(query)
+  const qs = params.toString()
+  return request<GraphResponse>(`/api/graph${qs ? `?${qs}` : ''}`, signal)
+}
+export const getCustomerGraph = (query?: GraphQuery, signal?: AbortSignal) => {
+  const params = graphSearchParams(query)
+  params.set('scope', 'customer')
+  return request<GraphResponse>(`/api/graph?${params.toString()}`, signal)
+}
+export const getGraphPath = (fromId: string, toId: string, scope?: 'customer', signal?: AbortSignal) => {
+  const params = new URLSearchParams({ from: fromId, to: toId })
+  if (scope) params.set('scope', scope)
+  return request<{ path: string[] } & GraphResponse>(`/api/graph/path?${params.toString()}`, signal)
+}
 export const getGoldenBundle = (signal?: AbortSignal) => request<BundleInfo>('/api/bundles/golden', signal)
 export const getGoldenGraph = (signal?: AbortSignal) => request<GraphResponse>('/api/golden/graph', signal)
 export const getGoldenObject = (id: string, signal?: AbortSignal) =>
@@ -165,7 +195,13 @@ export const activateDefinitionRevision = (revisionId: string, signal?: AbortSig
     `/api/definition-revisions/${encodeURIComponent(revisionId)}/activate`, signal, { method: 'POST' },
   )
 export const postChat = async (
-  payload: { message: string; request_id?: string; conversation_id?: string; history: Array<{ role: 'user' | 'assistant'; content: string }> },
+  payload: {
+    message: string
+    request_id?: string
+    conversation_id?: string
+    history: Array<{ role: 'user' | 'assistant'; content: string }>
+    customer_id?: string
+  },
   signal?: AbortSignal,
 ) => {
   const startedAt = performance.now()

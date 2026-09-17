@@ -434,7 +434,6 @@ export function ReportPanel({ active }: { active: boolean }) {
           <div className="chat-heading">
             <div className="chat-heading-title"><FileText size={16} /><span>Report Agent</span></div>
             <div className="chat-heading-actions">
-
               {entries.length > 0 && <button type="button" onClick={() => setEntries([])} disabled={pending}>Clear chat</button>}
             </div>
           </div>

@@ -3,6 +3,9 @@ type: Metric
 id: metric.account-balance
 title: Account Balance
 description: Average current account balance within the requested dimensional scope.
+aliases:
+- "số dư"
+- "số dư tài khoản"
 status: stable
 links:
 - dimension.account-type

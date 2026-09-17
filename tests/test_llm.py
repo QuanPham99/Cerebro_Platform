@@ -213,3 +213,25 @@ def test_settings_loads_provider_identity_from_environment(monkeypatch):
     assert settings.llm_model == "custom-model"
     assert settings.llm_timeout_seconds == 180
     assert settings.llm_max_output_tokens == 4096
+
+
+def test_settings_loads_duckdb_tuning_from_environment(monkeypatch):
+    monkeypatch.setenv("CEREBRO_DUCKDB_THREADS", "8")
+    monkeypatch.setenv("CEREBRO_DUCKDB_MEMORY_LIMIT", "2GB")
+
+    settings = Settings.from_environment()
+
+    assert settings.duckdb_threads == 8
+    assert settings.duckdb_memory_limit == "2GB"
+
+
+def test_settings_defaults_and_clamps_duckdb_threads(monkeypatch):
+    monkeypatch.delenv("CEREBRO_DUCKDB_THREADS", raising=False)
+    monkeypatch.delenv("CEREBRO_DUCKDB_MEMORY_LIMIT", raising=False)
+    default_settings = Settings.from_environment()
+    assert default_settings.duckdb_threads == 4
+    assert default_settings.duckdb_memory_limit == "1GB"
+
+    monkeypatch.setenv("CEREBRO_DUCKDB_THREADS", "999")
+    clamped_settings = Settings.from_environment()
+    assert clamped_settings.duckdb_threads == 64

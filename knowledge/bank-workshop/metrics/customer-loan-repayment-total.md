@@ -4,6 +4,9 @@ id: metric.customer-loan-repayment-total
 title: Customer Loan Repayment Total
 description: Total loan-payment amount by customer, loan attributes, and originating
   branch.
+aliases:
+- "tổng số tiền đã trả"
+- "tổng thanh toán khoản vay"
 status: stable
 links:
 - dimension.branch

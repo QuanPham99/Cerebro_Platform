@@ -1,4 +1,5 @@
 export type ProfileKind =
+  | 'domain'
   | 'dataset'
   | 'physical_table'
   | 'entity'
@@ -13,6 +14,7 @@ export type ProfileKind =
 export type NodeType = ProfileKind
 
 export type GraphEdgeType =
+  | 'domain_membership'
   | 'physical_fk'
   | 'relationship_endpoint'
   | 'semantic_mapping'

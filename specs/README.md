@@ -39,6 +39,12 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 5. [021 — Saved-version deletion and review-form affordances](021-saved-version-delete-and-review-affordances.md)
 6. [022 — Chat result dashboard visualization and saved charts](022-chat-result-visualization.md)
 7. [023 — Executive report agent (dynamic multi-SQL, PDF export)](023-executive-report-agent.md)
+8. [024 — Customer self-service workspace (row-level scoped chat + restricted graph)](024-customer-self-service-workspace.md)
+9. [025 — Combine the chat query-plan and SQL-proposal LLM calls](025-chat-combined-plan-and-sql.md)
+10. [026 — Scalable semantic graph navigation (domain tier, progressive disclosure, focus mode, find path)](026-scalable-semantic-graph-navigation.md)
+11. [027 — Trim and cache the customer self-service chat query-plan step](027-customer-chat-plan-cache.md)
+12. [028 — Make every customer self-service preset question answerable](028-customer-question-answerability.md)
+13. [029 — Vietnamese-aware lexical retrieval for the customer workspace](029-vietnamese-lexical-retrieval.md)
 
 ### Operations and deployment
 

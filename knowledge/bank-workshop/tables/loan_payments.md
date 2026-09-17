@@ -3,6 +3,10 @@ type: Table
 id: table.loan_payments
 title: Loan Payments
 description: Loan repayment events and late-payment outcomes.
+aliases:
+- "thanh toán khoản vay"
+- "kỳ thanh toán"
+- "lịch sử thanh toán"
 status: stable
 links:
 - dataset.bank-workshop

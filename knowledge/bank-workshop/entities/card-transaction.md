@@ -3,9 +3,12 @@ type: Entity
 id: entity.card-transaction
 title: Card Transaction
 description: Business entity for card transaction records.
+aliases:
+- "giao dịch thẻ"
 status: stable
 links:
 - table.card_transactions
+- domain.cards
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +19,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.cards
   physical_mapping:
     table: table.card_transactions
     key:

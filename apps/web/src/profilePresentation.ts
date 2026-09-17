@@ -1,7 +1,7 @@
 import type cytoscape from 'cytoscape'
 import type { ProfileKind } from './types'
 
-export type ProfileLayer = 'Physical' | 'Semantic' | 'Metrics' | 'Governance' | 'Other'
+export type ProfileLayer = 'Domain' | 'Physical' | 'Semantic' | 'Metrics' | 'Governance' | 'Other'
 export type LayerPreset = 'All' | Exclude<ProfileLayer, 'Other'>
 
 export interface ProfilePresentation {
@@ -14,6 +14,7 @@ export interface ProfilePresentation {
 }
 
 export const PROFILE_PRESENTATION: Record<ProfileKind, ProfilePresentation> = {
+  domain: { kind: 'domain', label: 'Domain', plural: 'Domains', layer: 'Domain', color: '#E0B34D', shape: 'star' },
   dataset: { kind: 'dataset', label: 'Dataset', plural: 'Datasets', layer: 'Physical', color: '#58C7D9', shape: 'round-rectangle' },
   physical_table: { kind: 'physical_table', label: 'Physical table', plural: 'Physical tables', layer: 'Physical', color: '#3EA6B8', shape: 'rectangle' },
   entity: { kind: 'entity', label: 'Entity', plural: 'Entities', layer: 'Semantic', color: '#A78BFA', shape: 'ellipse' },
@@ -27,7 +28,7 @@ export const PROFILE_PRESENTATION: Record<ProfileKind, ProfilePresentation> = {
 }
 
 export const PROFILE_KINDS = Object.keys(PROFILE_PRESENTATION) as ProfileKind[]
-export const LAYER_PRESETS: LayerPreset[] = ['All', 'Physical', 'Semantic', 'Metrics', 'Governance']
+export const LAYER_PRESETS: LayerPreset[] = ['All', 'Domain', 'Physical', 'Semantic', 'Metrics', 'Governance']
 
 export function kindsForLayer(layer: LayerPreset): ProfileKind[] {
   if (layer === 'All') return PROFILE_KINDS

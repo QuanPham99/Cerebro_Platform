@@ -13,7 +13,10 @@ def profile_edges(obj: Any) -> list[tuple[str, str, str]]:
         return [(str(target), "semantic_mapping", "maps to") for target in spec.get("maps_to", obj.links)]
     if kind == "entity":
         mapping = spec.get("physical_mapping", {})
-        return [(str(mapping.get("table", "")), "entity_mapping", "maps to")]
+        edges = [(str(mapping.get("table", "")), "entity_mapping", "maps to")]
+        if spec.get("domain"):
+            edges.append((str(spec.get("domain", "")), "domain_membership", "belongs to"))
+        return edges
     if kind == "dimension":
         edges = [(str(spec.get("entity", "")), "dimension_entity", "describes")]
         edges.extend(

@@ -83,12 +83,48 @@ def test_graph_edges_are_canonical_and_directional():
     assert ("table.accounts", "table.customers", "physical_fk", "many-to-one") in edges
     assert ("relationship.account_customer", "table.accounts", "relationship_endpoint", "endpoint") in edges
     assert ("entity.card-transaction", "entity.card", "semantic_relationship", "many-to-one") in edges
+    assert ("entity.account", "domain.retail-banking", "domain_membership", "belongs to") in edges
     assert not any(source == "table.card_transactions" and target == "entity.card-transaction" for source, target, _, _ in edges)
     assert not any(
         source == "relationship.account_customer" and target == "table.accounts" and kind == "semantic_mapping"
         for source, target, kind, _ in edges
     )
     assert len(edges) == len(graph.edges)
+
+
+def test_graph_overview_tier_returns_only_domain_and_entity_nodes():
+    retriever = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE))
+    overview = retriever.graph(tier="overview")
+    kinds = {node.profile_kind for node in overview.nodes}
+    assert kinds == {"domain", "entity"}
+    assert len(overview.nodes) == 14  # 4 domains + 10 entities
+    # every edge must still resolve to two overview-tier nodes
+    node_ids = {node.id for node in overview.nodes}
+    assert all(edge.source in node_ids and edge.target in node_ids for edge in overview.edges)
+    full = retriever.graph(tier="all")
+    assert len(full.nodes) == len(retriever.bundle.objects)
+    assert retriever.graph().nodes == full.nodes  # tier=None/omitted defaults to unrestricted at the retriever layer
+
+
+def test_graph_node_id_depth_expansion_reuses_adjacency_bfs():
+    retriever = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE))
+    one_hop = retriever.graph(node_id="entity.account", depth=1)
+    one_hop_ids = {node.id for node in one_hop.nodes}
+    assert one_hop_ids == set(retriever.expand(["entity.account"], depth=1))
+    assert "entity.account" in one_hop_ids
+    assert "domain.retail-banking" in one_hop_ids
+    two_hop = retriever.graph(node_id="entity.account", depth=2)
+    assert one_hop_ids <= {node.id for node in two_hop.nodes}
+
+
+def test_retriever_path_finds_shortest_route_and_handles_unreachable_or_unknown_ids():
+    retriever = SemanticRetriever(load_validated_bundle(DEFAULT_BUNDLE))
+    route = retriever.path("entity.account", "entity.customer")
+    assert route is not None
+    assert route[0] == "entity.account"
+    assert route[-1] == "entity.customer"
+    assert retriever.path("entity.account", "entity.account") == ["entity.account"]
+    assert retriever.path("entity.account", "missing.id") is None
 
 
 def test_all_golden_questions_pass():
@@ -111,7 +147,7 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
         ))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             health = (await client.get("/api/health")).json()
-            assert health["objects"] == 66
+            assert health["objects"] == 74
             runtime = (await client.get("/api/runtime/status")).json()
             assert runtime["bundle"] == "bank-workshop"
             assert "api_key" not in runtime
@@ -124,14 +160,30 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
             )
             assert schema_chat.status_code == 200
             assert schema_chat.json()["status"] == "answered"
-            assert schema_chat.json()["row_count"] == 66
+            assert schema_chat.json()["row_count"] == 74
             assert {row[1] for row in schema_chat.json()["rows"]} >= {
                 "table.accounts",
                 "table.customers",
                 "table.transactions",
                 "dataset.bank-workshop",
             }
-            assert len((await client.get("/api/graph")).json()["nodes"]) == 66
+            default_graph = (await client.get("/api/graph")).json()
+            assert {node["profile_kind"] for node in default_graph["nodes"]} <= {"domain", "entity"}
+            assert len(default_graph["nodes"]) == 14  # 4 domains + 10 entities, the default overview tier
+            assert len((await client.get("/api/graph", params={"tier": "all"})).json()["nodes"]) == 74
+            assert (await client.get("/api/graph", params={"tier": "unknown"})).status_code == 422
+            expanded = (
+                await client.get("/api/graph", params={"node_id": "entity.account", "depth": 1})
+            ).json()
+            expanded_ids = {node["id"] for node in expanded["nodes"]}
+            assert "entity.account" in expanded_ids
+            assert "domain.retail-banking" in expanded_ids
+            path = (
+                await client.get("/api/graph/path", params={"from": "entity.account", "to": "entity.customer"})
+            ).json()
+            assert path["path"][0] == "entity.account"
+            assert path["path"][-1] == "entity.customer"
+            assert (await client.get("/api/graph/path", params={"from": "entity.account", "to": "missing"})).status_code == 404
             assert (await client.get("/api/concepts/table.accounts")).status_code == 200
             assert (await client.get("/api/concepts/missing")).status_code == 404
             search = await client.get(

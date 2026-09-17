@@ -3,6 +3,9 @@ type: Table
 id: table.accounts
 title: Accounts
 description: Bank accounts owned by customers and serviced by branches.
+aliases:
+- "tài khoản"
+- "danh sách tài khoản"
 status: stable
 links:
 - dataset.bank-workshop

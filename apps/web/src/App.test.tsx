@@ -75,6 +75,7 @@ vi.mock('./api', () => ({
   getGraph: vi.fn().mockResolvedValue({
     version: '0.1.0',
     nodes: [
+      { id: 'domain.retail', type: 'Domain', profile_kind: 'domain', label: 'Retail', description: 'Retail domain', classification: 'internal' },
       { id: 'dataset.bank', type: 'Dataset', profile_kind: 'dataset', label: 'Bank', description: 'Bank dataset', classification: 'internal' },
       { id: 'table.customers', type: 'Table', profile_kind: 'physical_table', label: 'Customers', description: 'Customer records', classification: 'restricted' },
       { id: 'entity.customer', type: 'Entity', profile_kind: 'entity', label: 'Customer', description: 'Customer meaning', classification: 'restricted' },
@@ -168,6 +169,7 @@ vi.mock('./GraphView', async () => {
   return {
     GraphView: React.forwardRef(({ graph, visibleIds }: { graph: { version: string }; visibleIds: Set<string> }, _ref) => <div data-testid="graph-view"><span>{graph.version}</span><span data-testid="visible-ids">{[...visibleIds].join(' ')}</span></div>),
     GraphLegend: () => <div aria-label="Graph edge legend">Graph legend</div>,
+    ALL_EDGE_TYPES: ['domain_membership', 'physical_fk', 'semantic_mapping', 'entity_mapping', 'dimension_entity', 'dimension_binding', 'metric_entity', 'metric_dimension', 'metric_dependency', 'rule_entity', 'rule_dependency', 'semantic_relationship', 'policy_coverage', 'relationship_endpoint'],
   }
 })
 
@@ -223,7 +225,10 @@ describe('workspace navigation', () => {
   it('filters canonical profile kinds with presets, checkboxes, search, and reset', async () => {
     render(<App />)
     await selectWorkspace(/Semantic constellation/i)
-    expect(await screen.findByTestId('visible-ids')).toHaveTextContent('custom.note')
+    // Default view is the bounded domain/entity overview tier (spec 026), not every kind.
+    expect(await screen.findByTestId('visible-ids')).toHaveTextContent('domain.retail')
+    expect(screen.getByTestId('visible-ids')).toHaveTextContent('entity.customer')
+    expect(screen.getByTestId('visible-ids')).not.toHaveTextContent('custom.note')
     const legend = screen.getByLabelText('Graph edge legend')
     expect(legend.closest('.canvas-wrap')).not.toBeNull()
     expect(legend.closest('.discovery-rail')).toBeNull()
@@ -241,7 +246,14 @@ describe('workspace navigation', () => {
     expect(screen.getByTestId('visible-ids')).toHaveTextContent('dimension.gender')
     expect(screen.getByTestId('visible-ids')).not.toHaveTextContent('entity.customer')
 
+    fireEvent.click(screen.getByText('Relationship types'))
+    const relationshipEdgeType = screen.getByRole('checkbox', { name: 'semantic relationship' })
+    expect(relationshipEdgeType).toBeChecked()
+    fireEvent.click(relationshipEdgeType)
+    expect(relationshipEdgeType).not.toBeChecked()
+
     fireEvent.click(screen.getByTitle('Reset view'))
+    expect(screen.getByRole('checkbox', { name: 'semantic relationship' })).toBeChecked()
     expect(screen.getByTestId('visible-ids')).toHaveTextContent('custom.note')
     expect(screen.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true')
   })
@@ -264,9 +276,10 @@ describe('workspace navigation', () => {
     expect(within(chatTools).getByText('Preset questions').closest('details')).toHaveAttribute('open')
     expect(within(chatTools).getByText('Database tables').closest('details')).not.toHaveAttribute('open')
     expect(document.querySelector('.setup-rail .schema-overview')).not.toBeInTheDocument()
-    // One chat-panel for the active Text-to-SQL workspace, one for the Report agent workspace
-    // kept mounted-but-hidden (same pattern each workspace already uses for the other).
-    expect(document.querySelectorAll('.chat-panel')).toHaveLength(2)
+    // One chat-panel for the active Text-to-SQL workspace, one each for the Report agent and
+    // Customer self-service workspaces kept mounted-but-hidden (same pattern each workspace
+    // already uses for the others).
+    expect(document.querySelectorAll('.chat-panel')).toHaveLength(3)
     expect(document.querySelectorAll('.agent-workspace:not([hidden]) .chat-panel')).toHaveLength(1)
     expect(document.querySelector('.chat-dock')).not.toBeInTheDocument()
     expect(screen.queryByText(/Governed database chat/i)).not.toBeInTheDocument()
@@ -288,7 +301,7 @@ describe('workspace navigation', () => {
   it('collapses the right details rail without moving the graph legend', async () => {
     render(<App />)
     await selectWorkspace(/Semantic constellation/i)
-    expect(await screen.findByTestId('visible-ids')).toHaveTextContent('custom.note')
+    expect(await screen.findByTestId('visible-ids')).toHaveTextContent('entity.customer')
 
     fireEvent.click(screen.getByRole('button', { name: 'Collapse details panel' }))
     const expand = screen.getByRole('button', { name: 'Expand details panel' })
@@ -485,7 +498,7 @@ describe('workspace navigation', () => {
     render(<App />)
     await selectWorkspace(/Semantic constellation/i)
 
-    const liveTab = await screen.findByRole('tab', { name: /Default graph: Bank workshop/i })
+    const liveTab = await screen.findByRole('tab', { name: /Default graph: Bank Database/i })
     const generationTab = screen.getByRole('tab', { name: /Semantic generation/i })
     expect(liveTab).toHaveAttribute('aria-selected', 'true')
     expect(generationTab).toHaveAttribute('aria-selected', 'false')

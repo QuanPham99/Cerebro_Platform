@@ -3,9 +3,12 @@ type: Entity
 id: entity.account
 title: Account
 description: Business entity for account records.
+aliases:
+- "tài khoản"
 status: stable
 links:
 - table.accounts
+- domain.retail-banking
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +19,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.retail-banking
   physical_mapping:
     table: table.accounts
     key:

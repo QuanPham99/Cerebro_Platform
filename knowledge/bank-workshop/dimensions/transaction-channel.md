@@ -3,6 +3,9 @@ type: Dimension
 id: dimension.transaction-channel
 title: Transaction Channel
 description: Governed transaction channel dimension.
+aliases:
+- "kênh giao dịch"
+- "kênh"
 status: stable
 links:
 - entity.transaction

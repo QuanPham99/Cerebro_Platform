@@ -3,9 +3,14 @@ type: Entity
 id: entity.loan-payment
 title: Loan Payment
 description: Business entity for loan payment records.
+aliases:
+- "thanh toán khoản vay"
+- "kỳ thanh toán"
+- "kỳ trả nợ"
 status: stable
 links:
 - table.loan_payments
+- domain.lending
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +21,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.lending
   physical_mapping:
     table: table.loan_payments
     key:

@@ -1,4 +1,5 @@
-import { AlertTriangle, Braces, Database, ExternalLink, ShieldCheck } from 'lucide-react'
+import { AlertTriangle, Braces, Database, ExternalLink, Search, ShieldCheck } from 'lucide-react'
+import { useState } from 'react'
 import { PROFILE_PRESENTATION } from './profilePresentation'
 import type { SemanticObject } from './types'
 
@@ -35,6 +36,36 @@ function Contract({ title, rows }: { title: string; rows: Array<[string, unknown
   const visible = rows.filter(([, value]) => values(value).length > 0)
   if (visible.length === 0) return null
   return <section><h3>{title}</h3><dl>{visible.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{values(value).join(', ')}</dd></div>)}</dl></section>
+}
+
+/** A table's column list, with inline search once there are enough columns for
+ * one to matter (real banking schemas can put 50+ columns on a single table -
+ * spec 026's "Table -> Column" tier is this list, not literal graph nodes). */
+function FieldList({ columns }: { columns: Array<Record<string, unknown>> }) {
+  const [query, setQuery] = useState('')
+  if (columns.length === 0) return null
+  const needle = query.trim().toLowerCase()
+  const filtered = needle
+    ? columns.filter((column) => `${column.name} ${column.data_type}`.toLowerCase().includes(needle))
+    : columns
+  return (
+    <section>
+      <h3><Braces size={14} /> Fields <span>{columns.length}</span></h3>
+      {columns.length > 8 && (
+        <label className="field-search"><Search size={12} /><input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search columns…"
+          aria-label="Search columns"
+        /></label>
+      )}
+      <div className="field-list">
+        {filtered.length > 0
+          ? filtered.map((column) => <div className="field" key={String(column.name)}><code>{String(column.name)}</code><span>{String(column.data_type)}</span><em>{String(column.classification)}</em></div>)
+          : <p className="field-empty">No columns match "{query}".</p>}
+      </div>
+    </section>
+  )
 }
 
 function ProfileContract({ object }: { object: SemanticObject }) {
@@ -121,7 +152,7 @@ function ProfileContract({ object }: { object: SemanticObject }) {
         ['Primary key', c.primary_key],
         ['Classification', c.classification],
       ]} />
-      {columns.length > 0 && <section><h3><Braces size={14} /> Fields <span>{columns.length}</span></h3><div className="field-list">{columns.map((column) => <div className="field" key={String(column.name)}><code>{String(column.name)}</code><span>{String(column.data_type)}</span><em>{String(column.classification)}</em></div>)}</div></section>}
+      <FieldList columns={columns} />
     </>
   }
 

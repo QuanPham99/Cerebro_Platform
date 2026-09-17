@@ -4,6 +4,9 @@ id: rule.relative-time-anchor
 title: Relative Time Anchor
 description: Interpret relative account-transaction periods from MAX(transactions.txn_date),
   not wall-clock time.
+aliases:
+- "gần đây"
+- "khoảng thời gian gần đây"
 status: stable
 links:
 - dimension.transaction-date

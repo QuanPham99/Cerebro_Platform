@@ -3,9 +3,13 @@ type: Entity
 id: entity.loan
 title: Loan
 description: Business entity for loan records.
+aliases:
+- "khoản vay"
+- "vay"
 status: stable
 links:
 - table.loans
+- domain.lending
 sources:
 - id: semantic-definition
   resource: docs/semantic-layer-definition.md
@@ -16,6 +20,7 @@ provenance:
 cerebro:
   kind: entity
   classification: internal
+  domain: domain.lending
   physical_mapping:
     table: table.loans
     key:

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Inspector } from './Inspector'
 import type { ProfileKind, SemanticObject } from './types'
@@ -124,6 +124,24 @@ describe('Inspector', () => {
     expect(screen.getByText('customer_id')).toBeInTheDocument()
     expect(screen.getByText('email')).toBeInTheDocument()
     expect(screen.getByText('VARCHAR')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Search columns')).not.toBeInTheDocument()
+  })
+
+  it('offers column search once a table has enough fields for it to matter, and narrows the list', () => {
+    const columns = Array.from({ length: 12 }, (_, index) => ({ name: `field_${index}`, data_type: 'VARCHAR', classification: 'internal' }))
+    render(<Inspector object={object('physical_table', {
+      schema: 'main', grain: 'One row', primary_key: 'key_column', classification: 'internal', columns,
+    })} loading={false} sourceBase={null} />)
+    const fieldList = screen.getByText('12').closest('section') as HTMLElement
+    expect(screen.getByText('12')).toBeInTheDocument()
+    columns.forEach((column) => expect(within(fieldList).getByText(column.name)).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText('Search columns'), { target: { value: 'field_3' } })
+    expect(within(fieldList).getByText('field_3')).toBeInTheDocument()
+    expect(within(fieldList).queryByText('field_0')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Search columns'), { target: { value: 'nope' } })
+    expect(within(fieldList).getByText('No columns match "nope".')).toBeInTheDocument()
   })
 
   it('renders policy rule, scope, confidence, evidence, warnings, and provenance', () => {

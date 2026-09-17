@@ -3,6 +3,9 @@ type: Table
 id: table.customers
 title: Customers
 description: Customer profile, demographics, income, and credit attributes.
+aliases:
+- "khách hàng"
+- "danh sách khách hàng"
 status: stable
 links:
 - dataset.bank-workshop

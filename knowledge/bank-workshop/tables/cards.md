@@ -3,6 +3,9 @@ type: Table
 id: table.cards
 title: Cards
 description: Cards issued to customers and linked to bank accounts.
+aliases:
+- "thẻ"
+- "danh sách thẻ"
 status: stable
 links:
 - dataset.bank-workshop

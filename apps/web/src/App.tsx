@@ -8,17 +8,20 @@ import {
   ChevronRight,
   ChevronsUpDown,
   Clock,
+  Crosshair,
   Database,
   FileText,
   Filter,
   Focus,
   ListChecks,
+  Loader2,
   Network,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
   RefreshCw,
+  Route,
   Search,
   Send,
   ShieldCheck,
@@ -26,24 +29,27 @@ import {
   Square,
   Terminal,
   Trash2,
+  User,
   Waypoints,
   X,
 } from 'lucide-react'
-import { cancelChat, deleteBundleVersion, deleteSavedChart, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, listSavedCharts, postChat, reviewGeneration, saveChart, SemanticApiError, setDefaultBundle, startGeneration } from './api'
+import { cancelChat, deleteBundleVersion, deleteSavedChart, generationEventsUrl, getBundle, getBundleVersionGraph, getBundleVersionObject, getBundleVersions, getConcept, getCustomerGraph, getDefinitionContext, getDefinitionGraph, getDefinitionObject, getDefinitionRevision, getGeneration, getGenerationGraph, getGenerationTrace, getGraph, getRuntimeStatus, listSavedCharts, postChat, reviewGeneration, saveChart, SemanticApiError, setDefaultBundle, startGeneration } from './api'
+import { CustomerWorkspace } from './CustomerWorkspace'
 import { DefinitionComposer } from './DefinitionComposer'
 import { GenerationPanel, GenerationProgressTab, GenerationWorkspace, type GenerationReviewDraft } from './GenerationPanel'
-import { GraphLegend, GraphView, type GraphHandle } from './GraphView'
+import { ALL_EDGE_TYPES, GraphLegend, GraphView, type GraphHandle } from './GraphView'
 import { Inspector } from './Inspector'
 import { NodeNavigator, nodeTypes } from './NodeNavigator'
 import { kindsForLayer, LAYER_PRESETS, PROFILE_PRESENTATION, type LayerPreset } from './profilePresentation'
+import { useGraphExplorer } from './useGraphExplorer'
 import presetQuestionLevels from './presetQuestions.json'
 import { ReportPanel } from './ReportPanel'
 import { ResultPanel } from './ResultPanel'
 import { SavedCharts } from './SavedCharts'
-import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphResponse, ProfileKind, RuntimeStatus, SavedChart, SemanticObject } from './types'
+import type { BundleInfo, BundleVersionCatalog, BundleVersionSummary, ChatResponse, DefinitionContext, DefinitionRevision, GenerationEvent, GenerationRun, GenerationStage, GenerationTrace, GraphEdgeType, GraphResponse, ProfileKind, RuntimeStatus, SavedChart, SemanticObject } from './types'
 import { VersionLibrary } from './VersionLibrary'
 
-type Workspace = 'semantic' | 'text-to-sql' | 'report'
+type Workspace = 'semantic' | 'text-to-sql' | 'report' | 'customer'
 const GENERATION_RUN_STORAGE_KEY = 'cerebro.semanticGenerationRunId'
 const DEFINITION_REVISION_STORAGE_KEY = 'cerebro.definitionRevisionId'
 
@@ -63,7 +69,20 @@ const workspaceDetails = {
     description: 'Multi-SQL reports, exported as PDF',
     icon: FileText,
   },
+  customer: {
+    label: 'Customer self-service',
+    description: 'Simulated login, own-data-only Q&A',
+    icon: User,
+  },
 } satisfies Record<Workspace, { label: string; description: string; icon: typeof Network }>
+
+// Which role sees which workspaces in the menu: Internal Engineers are unrestricted and share
+// the semantic constellation, text-to-sql agents, and report agents; External Customers only
+// ever see the row-scoped self-service workspace.
+const workspaceRoleGroups: Array<{ role: string; workspaces: Workspace[] }> = [
+  { role: 'Internal Engineers', workspaces: ['semantic', 'text-to-sql', 'report'] },
+  { role: 'External Customers', workspaces: ['customer'] },
+]
 
 function WorkspaceMenu({
   active,
@@ -122,26 +141,31 @@ function WorkspaceMenu({
 
       {open && (
         <div className="workspace-menu" role="menu" aria-label="Switch workspace">
-          <div className="workspace-menu-heading"><span>Workspaces</span><kbd>3</kbd></div>
-          {(Object.keys(workspaceDetails) as Workspace[]).map((workspace) => {
-            const detail = workspaceDetails[workspace]
-            const Icon = detail.icon
-            const selected = active === workspace
-            return (
-              <button
-                key={workspace}
-                className={selected ? 'active' : ''}
-                onClick={() => { onSelect(workspace); setOpen(false) }}
-                role="menuitemradio"
-                aria-checked={selected}
-              >
-                <span className={`workspace-option-icon ${workspace}`}><Icon size={17} /></span>
-                <span><strong>{detail.label}</strong><small>{detail.description}</small></span>
-                {selected && <Check size={15} />}
-              </button>
-            )
-          })}
-          <div className="workspace-menu-foot">One knowledge layer. Three ways to work.</div>
+          <div className="workspace-menu-heading"><span>Workspaces</span><kbd>4</kbd></div>
+          {workspaceRoleGroups.map((group) => (
+            <div className="workspace-menu-group" key={group.role}>
+              <div className="workspace-menu-group-label">{group.role}</div>
+              {group.workspaces.map((workspace) => {
+                const detail = workspaceDetails[workspace]
+                const Icon = detail.icon
+                const selected = active === workspace
+                return (
+                  <button
+                    key={`${group.role}-${workspace}`}
+                    className={selected ? 'active' : ''}
+                    onClick={() => { onSelect(workspace); setOpen(false) }}
+                    role="menuitemradio"
+                    aria-checked={selected}
+                  >
+                    <span className={`workspace-option-icon ${workspace}`}><Icon size={17} /></span>
+                    <span><strong>{detail.label}</strong><small>{detail.description}</small></span>
+                    {selected && <Check size={15} />}
+                  </button>
+                )
+              })}
+            </div>
+          ))}
+          <div className="workspace-menu-foot">Two teams. Four ways to work.</div>
         </div>
       )}
     </div>
@@ -579,13 +603,17 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
-  const [types, setTypes] = useState<Set<ProfileKind>>(new Set(nodeTypes))
+  // Default view is the bounded domain/entity overview tier (spec 026); "All" (or
+  // any other layer preset / checkbox) is an explicit user request for more.
+  const [types, setTypes] = useState<Set<ProfileKind>>(new Set<ProfileKind>(['domain', 'entity']))
+  const [edgeTypes, setEdgeTypes] = useState<Set<GraphEdgeType>>(new Set(ALL_EDGE_TYPES))
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selected, setSelected] = useState<SemanticObject | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
   const [sidePanel, setSidePanel] = useState<'inspect' | 'define'>('inspect')
-  const [graphMode, setGraphMode] = useState<'active' | 'candidate' | 'definition' | 'version'>('active')
-  const [semanticTab, setSemanticTab] = useState<'default' | 'versions' | 'generation'>('default')
+  const [graphMode, setGraphMode] = useState<'active' | 'candidate' | 'definition' | 'version' | 'customer'>('active')
+  const [semanticTab, setSemanticTab] = useState<'default' | 'versions' | 'generation' | 'customer'>('default')
+  const [customerGraph, setCustomerGraph] = useState<GraphResponse | null>(null)
   const [generationRun, setGenerationRun] = useState<GenerationRun | null>(null)
   const [generationEvents, setGenerationEvents] = useState<GenerationEvent[]>([])
   const [generationTrace, setGenerationTrace] = useState<GenerationTrace | null>(null)
@@ -624,7 +652,11 @@ export default function App() {
   const load = useCallback(() => {
     const controller = new AbortController()
     setError('')
-    Promise.all([getGraph(controller.signal), getBundle(controller.signal), getRuntimeStatus(controller.signal)])
+    // tier: 'all' - this workspace fetches the full graph once and applies the
+    // domain/entity default (and every other filter/search/grounding feature)
+    // client-side; the backend's own tier default is for future bounded-fetch
+    // consumers, not this one (see spec 026's Non-Goals).
+    Promise.all([getGraph({ tier: 'all' }, controller.signal), getBundle(controller.signal), getRuntimeStatus(controller.signal)])
       .then(([nextGraph, nextBundle, nextRuntime]) => {
         setGraph(nextGraph); setBundle(nextBundle); setRuntime(nextRuntime)
       })
@@ -782,7 +814,7 @@ export default function App() {
     try {
       await setDefaultBundle(version.id)
       committed = true
-      const [nextGraph, nextBundle, nextRuntime] = await Promise.all([getGraph(), getBundle(), getRuntimeStatus()])
+      const [nextGraph, nextBundle, nextRuntime] = await Promise.all([getGraph({ tier: 'all' }), getBundle(), getRuntimeStatus()])
       setGraph(nextGraph)
       setBundle(nextBundle)
       setRuntime(nextRuntime)
@@ -932,6 +964,20 @@ export default function App() {
     if (generationRun?.candidate && !candidateGraph) void previewCandidate()
   }
 
+  const openCustomerGraph = async () => {
+    setSemanticTab('customer')
+    setGraphMode('customer')
+    setSidePanel('inspect')
+    setSelectedId(null)
+    setSelected(null)
+    if (customerGraph) return
+    try {
+      setCustomerGraph(await getCustomerGraph({ tier: 'all' }))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load the customer-centric graph.')
+    }
+  }
+
   const showCandidateGraph = semanticTab === 'generation' && graphMode === 'candidate' && generationSurface === 'graph' && Boolean(candidateGraph)
   const showVersionLibrary = semanticTab === 'versions' && !versionGraph && graphMode !== 'definition'
   const displayedGraph = graphMode === 'definition' && definitionGraph
@@ -940,9 +986,38 @@ export default function App() {
       ? graph
       : semanticTab === 'versions'
         ? versionGraph
-        : showCandidateGraph ? candidateGraph : null
+        : semanticTab === 'customer'
+          ? customerGraph
+          : showCandidateGraph ? candidateGraph : null
+
+  const explorer = useGraphExplorer(displayedGraph)
+  // Transient "arming" state for the two-click Find Path flow; not part of the
+  // hook because it's pure UI sequencing, not resolved graph state.
+  const [pathPickStage, setPathPickStage] = useState<'idle' | 'from' | 'to'>('idle')
+  const [pathFrom, setPathFrom] = useState<string | null>(null)
+
+  const startFindPath = () => {
+    explorer.clearPath()
+    setPathFrom(null)
+    setPathPickStage('from')
+  }
+  const cancelFindPath = () => {
+    setPathPickStage('idle')
+    setPathFrom(null)
+  }
 
   const select = useCallback((id: string) => {
+    if (pathPickStage === 'from') {
+      setPathFrom(id)
+      setPathPickStage('to')
+      return
+    }
+    if (pathPickStage === 'to') {
+      if (pathFrom) explorer.findPath(pathFrom, id)
+      setPathPickStage('idle')
+      setPathFrom(null)
+      return
+    }
     setUsedIds(new Set())
     setSelectedId(id)
     if (semanticTab === 'generation') return
@@ -954,15 +1029,24 @@ export default function App() {
         ? getDefinitionObject(definitionRevision.id, id)
         : getConcept(id)
     request.then(setSelected).catch((reason: Error) => setError(reason.message)).finally(() => setInspectorLoading(false))
-  }, [definitionRevision, graphMode, selectedVersion, semanticTab])
+  }, [definitionRevision, explorer, graphMode, pathFrom, pathPickStage, selectedVersion, semanticTab])
 
   const visibleIds = useMemo(() => {
     if (!displayedGraph) return new Set<string>()
     const needle = query.trim().toLowerCase()
-    return new Set(displayedGraph.nodes.filter((node) => types.has(node.profile_kind) && (!needle || `${node.label} ${node.id} ${node.description} ${PROFILE_PRESENTATION[node.profile_kind].label}`.toLowerCase().includes(needle))).map((node) => node.id))
-  }, [displayedGraph, query, types])
+    const ids = new Set(displayedGraph.nodes.filter((node) => types.has(node.profile_kind) && (!needle || `${node.label} ${node.id} ${node.description} ${PROFILE_PRESENTATION[node.profile_kind].label}`.toLowerCase().includes(needle))).map((node) => node.id))
+    for (const id of explorer.expandedIds) ids.add(id)
+    if (explorer.pathIds) for (const id of explorer.pathIds) ids.add(id)
+    return ids
+  }, [displayedGraph, query, types, explorer.expandedIds, explorer.pathIds])
 
   const toggleType = (type: ProfileKind) => setTypes((current) => {
+    const next = new Set(current)
+    if (next.has(type)) next.delete(type); else next.add(type)
+    return next
+  })
+
+  const toggleEdgeType = (type: GraphEdgeType) => setEdgeTypes((current) => {
     const next = new Set(current)
     if (next.has(type)) next.delete(type); else next.add(type)
     return next
@@ -982,9 +1066,14 @@ export default function App() {
   const reset = () => {
     setQuery('')
     setTypes(new Set(nodeTypes))
+    setEdgeTypes(new Set(ALL_EDGE_TYPES))
     setSelectedId(null)
     setSelected(null)
     setUsedIds(new Set())
+    explorer.resetExpansion()
+    explorer.setFocusMode(false)
+    explorer.clearPath()
+    cancelFindPath()
     graphHandle.current?.reset()
   }
 
@@ -1008,9 +1097,13 @@ export default function App() {
         </div>
         {workspace === 'semantic'
           ? <nav className="bundle-tabs" role="tablist" aria-label="Semantic versions">
-              <button type="button" className={`semantic-version-tab live ${semanticTab === 'default' ? 'active' : ''}`} role="tab" aria-selected={semanticTab === 'default'} aria-label={`Default graph: ${bundle?.name || 'loading'}`} onClick={returnToActive}>
-                <span className="version-tab-copy"><strong>{bundle?.name || 'Default graph'}</strong><small>Workspace default</small></span>
+              <button type="button" className={`semantic-version-tab live ${semanticTab === 'default' ? 'active' : ''}`} role="tab" aria-selected={semanticTab === 'default'} aria-label="Default graph: Bank Database" onClick={returnToActive}>
+                <span className="version-tab-copy"><strong>Bank Database</strong><small>Workspace default</small></span>
                 <span className="version-tab-status"><i className="live-status" aria-hidden="true" /><code>v{bundle?.version || '—'}</code></span>
+              </button>
+              <button type="button" className={`semantic-version-tab customer ${semanticTab === 'customer' ? 'active' : ''}`} role="tab" aria-selected={semanticTab === 'customer'} aria-label="Customer-centric graph" onClick={() => { void openCustomerGraph() }}>
+                <span className="version-tab-copy"><strong>Customer graph</strong><small>Restricted, own-data scope</small></span>
+                <span className="version-tab-status"><User size={13} /></span>
               </button>
               <button type="button" className={`semantic-version-tab versions ${semanticTab === 'versions' ? 'active' : ''}`} role="tab" aria-selected={semanticTab === 'versions'} aria-label={`Saved graph versions: ${versionCatalog?.versions.length || 0} versions`} onClick={() => { void showSavedVersions() }}>
                 <span className="version-tab-copy"><strong>Versions</strong><small>Approved graph history</small></span>
@@ -1023,7 +1116,7 @@ export default function App() {
           ? showVersionLibrary
             ? <div className="top-actions generation-status"><span>{versionCatalog?.versions.length || 0} approved versions</span><code>Immutable history</code></div>
             : displayedGraph
-            ? <div className="top-actions"><span>{visibleIds.size} / {displayedGraph.nodes.length} objects</span><button title="Fit graph" onClick={() => graphHandle.current?.fit()}><Focus size={17} /></button><button title="Reset view" onClick={reset}><RefreshCw size={17} /></button>{graphMode === 'candidate' && <button title="View pipeline trace" onClick={() => setGenerationSurface('trace')}><Terminal size={17} /></button>}{graphMode === 'version' && <button title="Back to versions" onClick={() => { void showSavedVersions(selectedVersion?.id || null) }}><ListChecks size={17} /></button>}</div>
+            ? <div className="top-actions"><span>{visibleIds.size} / {displayedGraph.nodes.length} objects</span><button title="Fit graph" onClick={() => graphHandle.current?.fit()}><Focus size={17} /></button><button title={explorer.focusMode ? 'Exit focus mode' : 'Focus mode: isolate the selected node'} aria-pressed={explorer.focusMode} className={explorer.focusMode ? 'active' : ''} onClick={() => explorer.setFocusMode(!explorer.focusMode)}><Crosshair size={17} /></button><button title={pathPickStage === 'idle' ? 'Find path between two nodes' : 'Cancel find path'} aria-pressed={pathPickStage !== 'idle'} className={pathPickStage !== 'idle' ? 'active' : ''} onClick={() => (pathPickStage === 'idle' ? startFindPath() : cancelFindPath())}><Route size={17} /></button><button title="Reset view" onClick={reset}><RefreshCw size={17} /></button>{graphMode === 'candidate' && <button title="View pipeline trace" onClick={() => setGenerationSurface('trace')}><Terminal size={17} /></button>}{graphMode === 'version' && <button title="Back to versions" onClick={() => { void showSavedVersions(selectedVersion?.id || null) }}><ListChecks size={17} /></button>}</div>
             : <div className="top-actions generation-status"><span>{generationRun ? generationRun.status : 'Ready for raw catalog'}</span><code>{generationRun?.id || 'No run'}</code></div>
           : <div className="top-actions setup-actions"><span>{runtime?.model || 'Model not configured'}</span><span className="setup-phase">{runtime?.chat_ready ? 'Ready' : 'Setup'}</span></div>}
       </header>
@@ -1039,6 +1132,12 @@ export default function App() {
           <div className="type-filters">
             {nodeTypes.map((type) => <label key={type}><input type="checkbox" checked={types.has(type)} onChange={() => toggleType(type)} /><span className={`type-symbol ${type}`} /><span>{PROFILE_PRESENTATION[type].label}</span><em>{displayedGraph.nodes.filter((node) => node.profile_kind === type).length}</em></label>)}
           </div>
+          <details className="edge-type-filters">
+            <summary><Waypoints size={13} /> Relationship types</summary>
+            <div className="type-filters">
+              {ALL_EDGE_TYPES.map((type) => <label key={type}><input type="checkbox" checked={edgeTypes.has(type)} onChange={() => toggleEdgeType(type)} aria-label={type.replace(/_/g, ' ')} /><span>{type.replace(/_/g, ' ')}</span><em>{displayedGraph.edges.filter((edge) => edge.type === type).length}</em></label>)}
+            </div>
+          </details>
           <div className="navigator-heading"><Box size={13} /> Keyboard navigator</div>
           <NodeNavigator nodes={displayedGraph.nodes} visibleIds={visibleIds} selectedId={selectedId} onSelect={select} />
         </aside>
@@ -1048,8 +1147,8 @@ export default function App() {
         ? <VersionLibrary catalog={versionCatalog} loading={versionLoading} error={versionError} focusId={versionFocusId} actioning={generationActioning} onPreview={previewSavedVersion} onSetDefault={selectWorkspaceDefault} onDelete={(version) => { void deleteSavedVersion(version) }} onRetry={() => { void refreshVersions().catch(() => undefined) }} onGenerate={openGeneration} />
         : <>
         {displayedGraph ? <section className="canvas-wrap">
-          <div className="canvas-label"><span>{graphMode === 'candidate' ? 'Candidate build' : graphMode === 'definition' ? 'Definition draft' : graphMode === 'version' ? `${selectedVersion?.name || 'Saved graph'} · v${selectedVersion?.version || displayedGraph.version}` : 'Workspace default'}</span><small>{graphMode === 'candidate' || graphMode === 'definition' || graphMode === 'version' ? 'Validated preview · runtime unchanged' : 'Drag to pan · Scroll to zoom · Select to trace'}</small></div>
-          <GraphView ref={graphHandle} graph={displayedGraph} visibleIds={visibleIds} selectedId={selectedId} usedIds={usedIds} onSelect={select} />
+          <div className="canvas-label"><span>{graphMode === 'candidate' ? 'Candidate build' : graphMode === 'definition' ? 'Definition draft' : graphMode === 'version' ? `${selectedVersion?.name || 'Saved graph'} · v${selectedVersion?.version || displayedGraph.version}` : graphMode === 'customer' ? 'Customer-centric view' : 'Workspace default'}</span><small>{pathPickStage === 'from' ? 'Find path: click the starting node…' : pathPickStage === 'to' ? 'Find path: now click the destination node…' : graphMode === 'candidate' || graphMode === 'definition' || graphMode === 'version' ? 'Validated preview · runtime unchanged' : graphMode === 'customer' ? 'Restricted to customer-owned entities · same scope the customer workspace grounds on' : 'Drag to pan · Scroll to zoom · Select to trace · Double-click to expand'}</small></div>
+          <GraphView ref={graphHandle} graph={displayedGraph} visibleIds={visibleIds} selectedId={selectedId} usedIds={usedIds} onSelect={select} expandedIds={explorer.expandedIds} focusMode={explorer.focusMode} pathIds={explorer.pathIds} onExpand={explorer.expand} visibleEdgeTypes={edgeTypes} />
           <div className="layer-caption"><span>Physical structures</span><i /><span>Business meaning</span><i /><span>Governed metrics</span></div>
           <GraphLegend />
         </section> : <GenerationWorkspace run={generationRun} trace={generationTrace} selectedStage={selectedGenerationStage} />}
@@ -1097,6 +1196,7 @@ export default function App() {
 
       <AgentSetupWorkspace runtime={runtime} onEvidence={onChatEvidence} active={workspace === 'text-to-sql'} />
       <ReportPanel active={workspace === 'report'} />
+      <CustomerWorkspace active={workspace === 'customer'} />
 
       {error && <div className="toast">{error}<button onClick={() => setError('')}><X size={14} /></button></div>}
     </main>

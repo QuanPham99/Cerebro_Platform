@@ -3,6 +3,9 @@ type: Dimension
 id: dimension.loan-status
 title: Loan Status
 description: Governed loan status dimension.
+aliases:
+- "trạng thái khoản vay"
+- "tình trạng khoản vay"
 status: stable
 links:
 - entity.loan

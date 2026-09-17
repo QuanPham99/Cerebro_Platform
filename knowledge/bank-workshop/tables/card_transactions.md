@@ -3,6 +3,8 @@ type: Table
 id: table.card_transactions
 title: Card Transactions
 description: Card-level payment activity with fraud outcomes.
+aliases:
+- "giao dịch thẻ"
 status: stable
 links:
 - dataset.bank-workshop

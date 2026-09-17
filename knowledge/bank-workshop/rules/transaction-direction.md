@@ -4,6 +4,10 @@ id: rule.transaction-direction
 title: Transaction Direction
 description: Deposit, Transfer In, and Interest Credit are inflows; Withdrawal, Transfer
   Out, and Fee Debit are outflows.
+aliases:
+- "tiền vào"
+- "tiền ra"
+- "chiều giao dịch"
 status: stable
 links:
 - dimension.transaction-type

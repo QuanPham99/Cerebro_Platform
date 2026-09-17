@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from ..models import (
     BusinessRuleCandidate,
     DimensionCandidate,
+    DomainCandidate,
     EntityCandidate,
     SemanticObject,
     StructuredMetricCandidate,
@@ -89,12 +90,22 @@ def validate_profile_object(
         issues.append(_issue(obj, "profile_kind_mismatch", f"{obj.id} type and cerebro.kind disagree"))
 
     prefixes = {
-        "dataset": "dataset.", "physical_table": "table.", "entity": "entity.",
+        "domain": "domain.", "dataset": "dataset.", "physical_table": "table.", "entity": "entity.",
         "dimension": "dimension.", "metric": "metric.", "business_rule": "rule.",
         "relationship": "relationship.", "policy": "policy.", "legacy_concept": "concept.",
     }
     if kind in prefixes and not obj.id.startswith(prefixes[kind]):
         issues.append(_issue(obj, "invalid_profile_id", f"{obj.id} has the wrong prefix for {kind}"))
+
+    if kind == "domain":
+        try:
+            DomainCandidate.model_validate({
+                "id": obj.id, "name": obj.name, "description": obj.description,
+                "classification": spec.get("classification"), "owner": spec.get("owner"),
+                "warnings": spec.get("warnings", []),
+            })
+        except ValidationError:
+            issues.append(_issue(obj, "invalid_domain_contract", f"{obj.id} does not match the typed domain contract"))
 
     if kind == "entity":
         try:
@@ -119,6 +130,8 @@ def validate_profile_object(
                         issues.append(_issue(obj, "undeclared_entity_key", f"{obj.id} references missing key {table}.{key}"))
         if not isinstance(spec.get("grain"), dict):
             issues.append(_issue(obj, "missing_entity_grain", f"{obj.id} has no typed grain"))
+        if spec.get("domain"):
+            issues.extend(_require_refs(obj, spec.get("domain"), by_id, {"domain"}, "invalid_entity_domain"))
 
     elif kind == "dimension":
         try:
@@ -217,6 +230,8 @@ def validate_profile_object(
         expected_links: set[str] = set()
         if kind == "entity":
             expected_links.add(str(spec.get("physical_mapping", {}).get("table", "")))
+            if spec.get("domain"):
+                expected_links.add(str(spec.get("domain", "")))
         elif kind == "dimension":
             expected_links.add(str(spec.get("entity", "")))
             expected_links.update(str(item.get("table", "")) for item in spec.get("physical_mappings", []) if isinstance(item, dict))
