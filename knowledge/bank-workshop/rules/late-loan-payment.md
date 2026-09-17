@@ -3,6 +3,10 @@ type: Business Rule
 id: rule.late-loan-payment
 title: Late Loan Payment
 description: A loan payment is late when loan_payments.late_payment_flag equals 1.
+aliases:
+- "thanh toán trễ hạn"
+- "trả nợ trễ hạn"
+- "trễ hạn"
 status: stable
 links:
 - entity.loan-payment

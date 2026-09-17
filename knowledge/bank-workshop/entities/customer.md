@@ -3,6 +3,8 @@ type: Entity
 id: entity.customer
 title: Customer
 description: Business entity for customer records.
+aliases:
+- "khách hàng"
 status: stable
 links:
 - table.customers

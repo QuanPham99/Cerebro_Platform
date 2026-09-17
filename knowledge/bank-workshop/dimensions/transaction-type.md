@@ -3,6 +3,8 @@ type: Dimension
 id: dimension.transaction-type
 title: Transaction Type
 description: Governed transaction type dimension.
+aliases:
+- "loại giao dịch"
 status: stable
 links:
 - entity.transaction

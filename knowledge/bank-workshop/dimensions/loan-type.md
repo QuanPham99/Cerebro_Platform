@@ -3,6 +3,8 @@ type: Dimension
 id: dimension.loan-type
 title: Loan Type
 description: Governed loan type dimension.
+aliases:
+- "loại khoản vay"
 status: stable
 links:
 - entity.loan

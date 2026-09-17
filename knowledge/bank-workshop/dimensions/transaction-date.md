@@ -3,6 +3,8 @@ type: Dimension
 id: dimension.transaction-date
 title: Transaction Date
 description: Governed transaction date dimension.
+aliases:
+- "ngày giao dịch"
 status: stable
 links:
 - entity.transaction

@@ -3,6 +3,8 @@ type: Dimension
 id: dimension.account-type
 title: Account Type
 description: Governed account type dimension.
+aliases:
+- "loại tài khoản"
 status: stable
 links:
 - entity.account

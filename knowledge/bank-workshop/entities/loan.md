@@ -3,6 +3,9 @@ type: Entity
 id: entity.loan
 title: Loan
 description: Business entity for loan records.
+aliases:
+- "khoản vay"
+- "vay"
 status: stable
 links:
 - table.loans

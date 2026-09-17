@@ -3,6 +3,9 @@ type: Entity
 id: entity.transaction
 title: Transaction
 description: Business entity for transaction records.
+aliases:
+- "giao dịch"
+- "giao dịch tài khoản"
 status: stable
 links:
 - table.transactions

@@ -1,5 +1,5 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, ChevronRight, ListChecks, Network, Send, User } from 'lucide-react'
+import { AlertTriangle, ChevronRight, Clock, ListChecks, Network, Send, Square, User } from 'lucide-react'
 import { cancelChat, postChat } from './api'
 import { ResultPanel } from './ResultPanel'
 import type { ChatResponse } from './types'
@@ -39,7 +39,7 @@ const CUSTOMER_USERS: CustomerUser[] = [
       'Lãi suất khoản vay của tôi là bao nhiêu?',
       'Khoản vay của tôi sẽ đáo hạn khi nào?',
       'Tôi đã thanh toán được bao nhiêu kỳ cho khoản vay?',
-      'Khoản thanh toán tiếp theo của tôi là bao nhiêu và khi nào đến hạn?',
+      'Lần thanh toán gần nhất của tôi là khi nào và tôi đã trả bao nhiêu?',
     ],
   },
   {
@@ -51,7 +51,7 @@ const CUSTOMER_USERS: CustomerUser[] = [
       'Tôi đã chi bao nhiêu qua thẻ theo từng danh mục trong tháng này?',
       'Thẻ của tôi có giao dịch nào bị nghi ngờ gian lận không?',
       'Thẻ của tôi có đang hoạt động không?',
-      'Tôi đã chi bao nhiêu qua thẻ trong 7 ngày qua?',
+      'Tổng số tiền giao dịch thẻ của tôi theo từng danh mục trong 7 ngày qua là bao nhiêu?',
       'Giao dịch thẻ nào của tôi có số tiền lớn nhất?',
     ],
   },
@@ -60,11 +60,11 @@ const CUSTOMER_USERS: CustomerUser[] = [
     label: 'Linda Patel',
     customerId: '52111',
     questions: [
-      'Khi nào tôi phải thanh toán khoản vay tiếp theo?',
+      'Lần thanh toán gần nhất của khoản vay của tôi là khi nào?',
       'Tôi có từng thanh toán trễ hạn khoản vay nào không?',
       'Tổng số tiền tôi đã trả cho khoản vay đến nay là bao nhiêu?',
-      'Số dư gốc còn lại của khoản vay của tôi là bao nhiêu?',
-      'Tôi đã thanh toán đúng hạn bao nhiêu kỳ liên tiếp?',
+      'Số tiền vay ban đầu của khoản vay của tôi là bao nhiêu?',
+      'Tôi đã thanh toán trễ hạn bao nhiêu kỳ trong tổng số các kỳ đã thanh toán?',
       'Khoản vay của tôi được giải ngân từ khi nào?',
     ],
   },
@@ -76,9 +76,9 @@ const CUSTOMER_USERS: CustomerUser[] = [
       'Tổng số dư của tất cả tài khoản của tôi là bao nhiêu?',
       'Tôi có bao nhiêu tài khoản đang hoạt động?',
       'Giao dịch nào của tôi có số tiền lớn nhất trong 90 ngày qua?',
-      'Tôi đã chi tiêu bao nhiêu trong tháng này theo từng tài khoản?',
+      'Số dư của từng tài khoản của tôi hiện tại là bao nhiêu?',
       'Giao dịch gần đây nhất trên mỗi tài khoản của tôi là gì?',
-      'Tôi đã chuyển bao nhiêu tiền giữa các tài khoản của mình trong 30 ngày qua?',
+      'Tôi có bao nhiêu giao dịch trong 30 ngày qua theo từng tài khoản?',
     ],
   },
 ]
@@ -101,11 +101,33 @@ type ConversationEntry =
 
 type ActiveChatRequest = { requestId: string; controller: AbortController }
 
+const CUSTOMER_PENDING_EXPECTED_SECONDS = 20
+
+function CustomerQueryProgress({ elapsed, onStop }: { elapsed: number; onStop: () => void }) {
+  const percent = Math.min(94, (elapsed / CUSTOMER_PENDING_EXPECTED_SECONDS) * 100)
+  return (
+    <article className="chat-message assistant pending">
+      <div className="chat-message-head">
+        <span>Cerebro</span>
+        <button type="button" className="stop-query" onClick={onStop}><Square size={10} />Stop query</button>
+      </div>
+      <div className="query-progress">
+        <p><Clock size={13} /> Looking up your own records…</p>
+        <div className="progress-bar" role="progressbar" aria-valuenow={Math.round(percent)} aria-valuemin={0} aria-valuemax={100}>
+          <div className="progress-bar-fill" style={{ width: `${percent}%` }} />
+        </div>
+        <small>{elapsed.toFixed(1)}s elapsed{elapsed > CUSTOMER_PENDING_EXPECTED_SECONDS ? ' · this one is taking longer than usual' : ''}</small>
+      </div>
+    </article>
+  )
+}
+
 export function CustomerWorkspace({ active }: { active: boolean }) {
   const [loggedInUser, setLoggedInUser] = useState<CustomerUser>(CUSTOMER_USERS[0])
   const [entries, setEntries] = useState<ConversationEntry[]>([])
   const [input, setInput] = useState('')
   const [pending, setPending] = useState(false)
+  const [pendingElapsed, setPendingElapsed] = useState(0)
   const [conversationId, setConversationId] = useState<string>()
   const transcriptRef = useRef<HTMLDivElement>(null)
   const activeRequestRef = useRef<ActiveChatRequest | null>(null)
@@ -114,6 +136,14 @@ export function CustomerWorkspace({ active }: { active: boolean }) {
     if (transcriptRef.current) transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
   }, [entries, pending])
 
+  useEffect(() => {
+    if (!pending) return
+    setPendingElapsed(0)
+    const start = Date.now()
+    const timer = window.setInterval(() => setPendingElapsed((Date.now() - start) / 1000), 200)
+    return () => window.clearInterval(timer)
+  }, [pending])
+
   useEffect(() => () => {
     const requestInFlight = activeRequestRef.current
     if (!requestInFlight) return
@@ -121,6 +151,15 @@ export function CustomerWorkspace({ active }: { active: boolean }) {
     void cancelChat(requestInFlight.requestId).catch(() => undefined)
     requestInFlight.controller.abort()
   }, [])
+
+  const stopActiveRequest = () => {
+    const requestInFlight = activeRequestRef.current
+    if (!requestInFlight) return
+    activeRequestRef.current = null
+    void cancelChat(requestInFlight.requestId).catch(() => undefined)
+    requestInFlight.controller.abort()
+    setPending(false)
+  }
 
   const sendMessage = async (message: string) => {
     if (!message || activeRequestRef.current) return
@@ -177,16 +216,10 @@ export function CustomerWorkspace({ active }: { active: boolean }) {
   const switchUser = (nextId: string) => {
     const next = CUSTOMER_USERS.find((user) => user.id === nextId)
     if (!next) return
-    const requestInFlight = activeRequestRef.current
-    if (requestInFlight) {
-      activeRequestRef.current = null
-      void cancelChat(requestInFlight.requestId).catch(() => undefined)
-      requestInFlight.controller.abort()
-    }
+    stopActiveRequest()
     setLoggedInUser(next)
     setEntries([])
     setConversationId(undefined)
-    setPending(false)
     setInput('')
   }
 
@@ -231,7 +264,7 @@ export function CustomerWorkspace({ active }: { active: boolean }) {
                 {entry.response.warnings.length > 0 && <details className="chat-detail warning-detail"><summary><AlertTriangle size={13} /> Warnings</summary><ul>{entry.response.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></details>}
               </article>
             ))}
-            {pending && <article className="chat-message assistant pending"><span>Cerebro</span><p>Looking up your own records…</p></article>}
+            {pending && <CustomerQueryProgress elapsed={pendingElapsed} onStop={stopActiveRequest} />}
           </div>
           <form className="chat-composer" onSubmit={submit}>
             <label><span className="sr-only">Ask about your own accounts and transactions</span><textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Ask about your own accounts, cards, loans, or transactions…" rows={2} /></label>

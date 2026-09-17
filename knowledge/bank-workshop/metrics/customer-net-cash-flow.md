@@ -3,6 +3,9 @@ type: Metric
 id: metric.customer-net-cash-flow
 title: Customer Net Cash Flow
 description: Net signed account-transaction amount by customer and servicing branch.
+aliases:
+- "dòng tiền ròng"
+- "tiền vào trừ tiền ra"
 status: stable
 links:
 - dimension.branch

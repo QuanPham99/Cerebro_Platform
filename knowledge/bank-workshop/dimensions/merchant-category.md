@@ -3,6 +3,10 @@ type: Dimension
 id: dimension.merchant-category
 title: Merchant Category
 description: Governed merchant category dimension.
+aliases:
+- "danh mục"
+- "danh mục chi tiêu"
+- "danh mục cửa hàng"
 status: stable
 links:
 - entity.card-transaction

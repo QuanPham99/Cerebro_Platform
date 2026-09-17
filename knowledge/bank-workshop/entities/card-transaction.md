@@ -3,6 +3,8 @@ type: Entity
 id: entity.card-transaction
 title: Card Transaction
 description: Business entity for card transaction records.
+aliases:
+- "giao dịch thẻ"
 status: stable
 links:
 - table.card_transactions

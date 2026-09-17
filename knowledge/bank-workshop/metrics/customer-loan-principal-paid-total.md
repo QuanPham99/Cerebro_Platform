@@ -1,12 +1,12 @@
 ---
 type: Metric
-id: metric.customer-loan-repayment-total
-title: Customer Loan Repayment Total
-description: Total loan-payment amount by customer, loan attributes, and originating
+id: metric.customer-loan-principal-paid-total
+title: Customer Loan Principal Paid Total
+description: Total loan principal repaid by customer, loan attributes, and originating
   branch.
 aliases:
-- "tổng số tiền đã trả"
-- "tổng thanh toán khoản vay"
+- "số tiền gốc đã trả"
+- "gốc đã thanh toán"
 status: stable
 links:
 - dimension.branch
@@ -35,14 +35,14 @@ cerebro:
     aggregation: sum
     source:
       table: table.loan_payments
-      column: amount_paid
+      column: principal_component
     predicates: []
   dependencies:
   - table.customers
   - table.loans
   - table.loan_payments
   - table.branches
-  formula: SUM(loan_payments.amount_paid) FROM customers JOIN loans ON customers.customer_id
+  formula: SUM(loan_payments.principal_component) FROM customers JOIN loans ON customers.customer_id
     = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id
     JOIN branches ON loans.branch_id = branches.branch_id
   metric_result_type: decimal
@@ -60,11 +60,15 @@ cerebro:
   relative_time_anchor: null
   warnings:
   - Aggregate from loan-payment grain; customer and branch are many-to-one lookup
-    joins.
+    joins. Remaining/outstanding loan balance is loans.loan_amount minus this metric,
+    computed per loan.
 ---
 
-# Customer Loan Repayment Total
+# Customer Loan Principal Paid Total
 
-Total loan-payment amount by customer, loan attributes, and originating branch.
+Total loan principal repaid by customer, loan attributes, and originating branch.
 
-Formula: `SUM(loan_payments.amount_paid) FROM customers JOIN loans ON customers.customer_id = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id JOIN branches ON loans.branch_id = branches.branch_id`
+Formula: `SUM(loan_payments.principal_component) FROM customers JOIN loans ON customers.customer_id = loans.customer_id JOIN loan_payments ON loans.loan_id = loan_payments.loan_id JOIN branches ON loans.branch_id = branches.branch_id`
+
+A loan's remaining/outstanding balance is `loans.loan_amount` minus this metric's value for
+that loan.

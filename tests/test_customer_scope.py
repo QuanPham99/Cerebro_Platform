@@ -370,3 +370,54 @@ def test_plan_cache_is_not_shared_across_orchestrator_instances(two_customer_dat
     second_orchestrator.chat(ChatRequest(message="What is my balance?", customer_id="2"))
 
     assert second_provider.calls.count("query_plan") == 1
+
+
+# --- Spec 028: loan balance/maturity grounding objects are customer-visible ------------
+
+
+def test_customer_scope_object_ids_include_loan_balance_and_maturity_grounding():
+    assert {
+        "metric.customer-loan-principal-paid-total",
+        "rule.loan-maturity-date",
+    } <= CUSTOMER_SCOPE_OBJECT_IDS
+
+
+def test_customer_scoped_grounding_surfaces_loan_principal_paid_metric():
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    retriever = SemanticRetriever(bundle)
+    grounding = retriever.grounding(
+        "How much principal have I paid off on my loan so far?",
+        allowed_object_ids=CUSTOMER_SCOPE_OBJECT_IDS,
+    )
+    assert "metric.customer-loan-principal-paid-total" in {item["id"] for item in grounding.metrics}
+
+
+def test_customer_scoped_grounding_surfaces_loan_maturity_rule():
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    retriever = SemanticRetriever(bundle)
+    grounding = retriever.grounding(
+        "When will my loan reach its maturity date?",
+        allowed_object_ids=CUSTOMER_SCOPE_OBJECT_IDS,
+    )
+    assert "rule.loan-maturity-date" in {item["id"] for item in grounding.rules}
+
+
+# --- Spec 029: Vietnamese-language customer questions retrieve real grounding ----------
+
+
+def test_vietnamese_customer_question_retrieves_grounding_via_lexical_aliases():
+    # No embedder configured (lexical-only), matching the dev-server environment where this
+    # was originally found empty (evidence_ids: []) before the tokenizer fix + Vietnamese
+    # aliases were added.
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    retriever = SemanticRetriever(bundle)
+    grounding = retriever.grounding(
+        "Tôi có bao nhiêu tài khoản đang hoạt động?",
+        allowed_object_ids=CUSTOMER_SCOPE_OBJECT_IDS,
+    )
+    selected_ids = {
+        item["id"]
+        for group in (grounding.entities, grounding.tables, grounding.rules)
+        for item in group
+    }
+    assert selected_ids & {"table.accounts", "entity.account", "rule.active-customer"}

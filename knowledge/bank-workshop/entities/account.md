@@ -3,6 +3,8 @@ type: Entity
 id: entity.account
 title: Account
 description: Business entity for account records.
+aliases:
+- "tài khoản"
 status: stable
 links:
 - table.accounts

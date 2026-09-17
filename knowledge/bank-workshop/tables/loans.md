@@ -3,6 +3,9 @@ type: Table
 id: table.loans
 title: Loans
 description: Customer loans, principal, terms, rates, and performance status.
+aliases:
+- "khoản vay"
+- "vay"
 status: stable
 links:
 - dataset.bank-workshop

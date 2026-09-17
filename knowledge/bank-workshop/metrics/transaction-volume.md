@@ -3,6 +3,10 @@ type: Metric
 id: metric.transaction-volume
 title: Transaction Volume
 description: Total positive account transaction amount for a defined period and scope.
+aliases:
+- "tổng số tiền giao dịch"
+- "khối lượng giao dịch"
+- "tổng chi tiêu"
 status: stable
 links:
 - dimension.branch

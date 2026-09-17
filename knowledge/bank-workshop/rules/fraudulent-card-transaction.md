@@ -4,6 +4,10 @@ id: rule.fraudulent-card-transaction
 title: Fraudulent Card Transaction
 description: A card transaction is fraudulent when card_transactions.is_fraud equals
   1.
+aliases:
+- "gian lận"
+- "nghi ngờ gian lận"
+- "giao dịch gian lận"
 status: stable
 links:
 - entity.card-transaction

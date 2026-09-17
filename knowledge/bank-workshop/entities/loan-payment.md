@@ -3,6 +3,10 @@ type: Entity
 id: entity.loan-payment
 title: Loan Payment
 description: Business entity for loan payment records.
+aliases:
+- "thanh toán khoản vay"
+- "kỳ thanh toán"
+- "kỳ trả nợ"
 status: stable
 links:
 - table.loan_payments

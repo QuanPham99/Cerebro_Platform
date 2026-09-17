@@ -4,6 +4,10 @@ id: rule.active-customer
 title: Active Customer
 description: Aggregate account and card activity independently to customer grain,
   combine the aggregates, and never union raw event rows.
+aliases:
+- "đang hoạt động"
+- "còn hoạt động"
+- "khách hàng đang hoạt động"
 status: stable
 links:
 - entity.card-transaction

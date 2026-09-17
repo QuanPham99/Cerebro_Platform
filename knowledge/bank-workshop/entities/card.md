@@ -3,6 +3,9 @@ type: Entity
 id: entity.card
 title: Card
 description: Business entity for card records.
+aliases:
+- "thẻ"
+- "thẻ ngân hàng"
 status: stable
 links:
 - table.cards

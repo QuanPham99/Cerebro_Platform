@@ -3,6 +3,9 @@ type: Table
 id: table.transactions
 title: Transactions
 description: Account-level money movement with positive unsigned amounts.
+aliases:
+- "giao dịch"
+- "giao dịch tài khoản"
 status: stable
 links:
 - dataset.bank-workshop

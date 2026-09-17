@@ -55,6 +55,7 @@ CUSTOMER_SCOPE_METRIC_IDS: frozenset[str] = frozenset({
     "metric.transaction-volume",
     "metric.customer-net-cash-flow",
     "metric.customer-loan-repayment-total",
+    "metric.customer-loan-principal-paid-total",
 })
 
 CUSTOMER_SCOPE_RULE_IDS: frozenset[str] = frozenset({
@@ -63,6 +64,7 @@ CUSTOMER_SCOPE_RULE_IDS: frozenset[str] = frozenset({
     "rule.transaction-direction",
     "rule.relative-time-anchor",
     "rule.fraudulent-card-transaction",
+    "rule.loan-maturity-date",
 })
 
 CUSTOMER_SCOPE_POLICY_IDS: frozenset[str] = frozenset({

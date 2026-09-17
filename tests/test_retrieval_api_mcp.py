@@ -147,7 +147,7 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
         ))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             health = (await client.get("/api/health")).json()
-            assert health["objects"] == 72
+            assert health["objects"] == 74
             runtime = (await client.get("/api/runtime/status")).json()
             assert runtime["bundle"] == "bank-workshop"
             assert "api_key" not in runtime
@@ -160,7 +160,7 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
             )
             assert schema_chat.status_code == 200
             assert schema_chat.json()["status"] == "answered"
-            assert schema_chat.json()["row_count"] == 72
+            assert schema_chat.json()["row_count"] == 74
             assert {row[1] for row in schema_chat.json()["rows"]} >= {
                 "table.accounts",
                 "table.customers",
@@ -170,7 +170,7 @@ def test_http_contracts_and_typed_errors(bank_source_config, tmp_path):
             default_graph = (await client.get("/api/graph")).json()
             assert {node["profile_kind"] for node in default_graph["nodes"]} <= {"domain", "entity"}
             assert len(default_graph["nodes"]) == 14  # 4 domains + 10 entities, the default overview tier
-            assert len((await client.get("/api/graph", params={"tier": "all"})).json()["nodes"]) == 72
+            assert len((await client.get("/api/graph", params={"tier": "all"})).json()["nodes"]) == 74
             assert (await client.get("/api/graph", params={"tier": "unknown"})).status_code == 422
             expanded = (
                 await client.get("/api/graph", params={"node_id": "entity.account", "depth": 1})

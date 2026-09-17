@@ -41,7 +41,10 @@ from .semantic.profile import normalize_profile_kind
 
 GRAPH_OVERVIEW_TIER_KINDS = frozenset({"domain", "entity"})
 
-TOKEN = re.compile(r"[a-z0-9]+")
+# Unicode-aware: matches runs of letters/digits (any script), excluding "_", so accented
+# text (e.g. Vietnamese customer questions) tokenizes into intact words instead of being
+# shredded at each diacritic the old ASCII-only `[a-z0-9]+` pattern couldn't match.
+TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
     "in", "is", "of", "on", "or", "the", "there", "to", "what", "who", "with",

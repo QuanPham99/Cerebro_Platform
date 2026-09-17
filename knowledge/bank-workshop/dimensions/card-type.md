@@ -3,6 +3,8 @@ type: Dimension
 id: dimension.card-type
 title: Card Type
 description: Governed card type dimension.
+aliases:
+- "loại thẻ"
 status: stable
 links:
 - entity.card

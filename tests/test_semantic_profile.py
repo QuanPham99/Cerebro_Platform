@@ -151,12 +151,12 @@ def test_golden_semantic_profile_contract_and_grounding():
         "physical_table": 10,
         "entity": 10,
         "dimension": 11,
-        "metric": 11,
-        "business_rule": 11,
+        "metric": 12,
+        "business_rule": 12,
         "relationship": 11,
         "policy": 3,
     }
-    assert len(bundle.objects) == 72
+    assert len(bundle.objects) == 74
     assert sum(
         len(obj.cerebro.get("columns", []))
         for obj in bundle.objects
@@ -306,7 +306,7 @@ def test_progressive_grounding_is_bounded_and_semantic_oracle_is_kind_aware():
 
     report = compare_semantic_oracle(DEFAULT_BUNDLE)
     assert report["precision"] == report["recall"] == 1.0
-    assert report["matched"] == 54
+    assert report["matched"] == 56
     assert all(item["recall"] == 1.0 for item in report["by_kind"].values())
 
     structural = compare_structural_oracle(DEFAULT_BUNDLE)
