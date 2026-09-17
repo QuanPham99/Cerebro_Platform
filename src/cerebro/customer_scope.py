@@ -56,6 +56,7 @@ CUSTOMER_SCOPE_METRIC_IDS: frozenset[str] = frozenset({
     "metric.customer-net-cash-flow",
     "metric.customer-loan-repayment-total",
     "metric.customer-loan-principal-paid-total",
+    "metric.card-transaction-amount-total",
 })
 
 CUSTOMER_SCOPE_RULE_IDS: frozenset[str] = frozenset({

@@ -77,7 +77,7 @@ const CUSTOMER_USERS: CustomerUser[] = [
       'Tôi có bao nhiêu tài khoản đang hoạt động?',
       'Giao dịch nào của tôi có số tiền lớn nhất trong 90 ngày qua?',
       'Số dư của từng tài khoản của tôi hiện tại là bao nhiêu?',
-      'Giao dịch gần đây nhất trên mỗi tài khoản của tôi là gì?',
+      'Những giao dịch gần đây nhất của tôi trên mỗi tài khoản, xét trong 30 ngày qua, là gì?',
       'Tôi có bao nhiêu giao dịch trong 30 ngày qua theo từng tài khoản?',
     ],
   },

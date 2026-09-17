@@ -464,11 +464,11 @@ def test_chat_returns_all_live_schemas_and_semantic_objects_without_model(
 
     assert response.status == "answered"
     assert response.answer == (
-        "74 metadata objects are available to explore, including 10 live DuckDB "
+        "75 metadata objects are available to explore, including 10 live DuckDB "
         "table schemas and every object in the active semantic bundle."
     )
     assert response.columns == ["kind", "id", "name", "details"]
-    assert response.row_count == 74
+    assert response.row_count == 75
     assert response.truncated is False
     kinds = {row[0] for row in response.rows}
     assert kinds >= {"dataset", "physical_table", "metric", "business_rule"}

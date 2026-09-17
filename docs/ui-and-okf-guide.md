@@ -17,8 +17,13 @@ Open <http://127.0.0.1:5173>. The FastAPI and MCP service runs at
 
 ## Workspace layout
 
-- The left rail selects the Semantic Constellation or Text-to-SQL workspace and
-  can collapse independently.
+- The workspace menu selects one of four role-gated workspaces — Semantic
+  Constellation, Text-to-SQL agents, Report agent, and Customer self-service —
+  and the left rail within Semantic Constellation can collapse independently.
+  This guide covers only the Semantic Constellation workspace's graph
+  projection; the customer workspace projects a restricted subset of the same
+  graph (`?scope=customer`) built on a fixed allowlist, described in
+  `src/cerebro/customer_scope.py`.
 - In the semantic workspace, layer presets and per-kind filters control the
   graph projection. Search matches titles, stable IDs, descriptions, and
   aliases.

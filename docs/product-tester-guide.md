@@ -11,7 +11,7 @@ git branch --show-current
 git status -sb
 ```
 
-Expected branch: `feature/okf-semantic-layer-sdd`. Do not clean or reset the tree; existing UI and documentation changes may be intentional.
+Expected branch: `main`. Do not clean or reset the tree; existing UI and documentation changes may be intentional.
 
 Install dependencies:
 
@@ -151,6 +151,23 @@ In **Semantic constellation**:
 6. Ask `Which group is the largest?` and confirm it uses the browser conversation context.
 7. Use **Clear chat** and confirm the conversation resets.
 
+### Report agent
+
+1. Select **Report agent** from the workspace menu.
+2. Submit a free-text request (or a preset) that decomposes into several sub-questions, e.g. `Summarize card fraud and loan repayment this quarter`.
+3. Confirm SSE progress events arrive live: planning, each section in order, then synthesizing.
+4. Confirm every number in the synthesized overview traces back to a section's own SQL result — the overview must never introduce a figure that isn't in one of the section answers.
+5. If a sub-question is blocked or unanswerable, confirm the section shows that status instead of failing the whole report, and the overall run status reflects `completed` / `partial` / `failed` correctly.
+6. Export the completed report as PDF and confirm it opens and matches the on-screen sections.
+
+### Customer self-service
+
+1. Select **Customer self-service** from the workspace menu and complete the simulated login.
+2. Confirm the graph view (`?scope=customer`) only shows the customer-facing allowlist — no `entity.branch`, `entity.employee`, or population-level risk/fraud metrics (`branch-fraud-exposure`, `non-performing-loan-rate`, etc.).
+3. Ask a preset question, including at least one Vietnamese-language preset, and confirm it retrieves grounding and returns an answer rather than silently returning zero results.
+4. Ask a question about another customer's data (e.g. referencing a different `customer_id`) and confirm the row-level filter in `customer_scope.py` restricts results to the logged-in customer only.
+5. Confirm a customer turn does not expose the internal metadata-exploration shortcut available in the Text-to-SQL workspace.
+
 ## 6. Test safety boundaries
 
 | Test question | Expected behavior |
@@ -199,6 +216,8 @@ If strict JSON Schema is rejected, `auto` retries once with JSON-object mode and
 | Semantic graph |  |  |
 | Governed database chat |  |  |
 | Follow-up conversation |  |  |
+| Report agent |  |  |
+| Customer self-service scoping |  |  |
 | SQL safety cases |  |  |
 | HTTP and MCP |  |  |
 | Model/key switch |  |  |

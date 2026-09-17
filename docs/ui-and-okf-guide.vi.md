@@ -17,8 +17,12 @@ Mở <http://127.0.0.1:5173>. Dịch vụ FastAPI và MCP chạy tại
 
 ## Bố cục workspace
 
-- Rail bên trái chọn Semantic Constellation hoặc Text-to-SQL và có thể thu gọn
-  độc lập.
+- Menu workspace chọn một trong bốn workspace theo vai trò — Semantic
+  Constellation, Text-to-SQL agents, Report agent, và Customer self-service —
+  còn rail bên trái trong Semantic Constellation có thể thu gọn độc lập. Tài
+  liệu này chỉ mô tả hình chiếu graph của Semantic Constellation; customer
+  workspace chiếu một tập con graph bị giới hạn (`?scope=customer`) dựa trên
+  allowlist cố định trong `src/cerebro/customer_scope.py`.
 - Trong semantic workspace, preset theo layer và bộ lọc theo từng kind điều
   khiển hình chiếu graph. Search tìm theo title, stable ID, mô tả và alias.
 - Canvas ở giữa hỗ trợ pan, zoom, fit, reset, chọn node và điều hướng bàn phím.

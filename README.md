@@ -15,9 +15,9 @@ This branch contains a working, spec-driven semantic-layer slice for the bank wo
 - The checked-in `knowledge/bank-workshop` golden bundle uses OKF v0.2 and Cerebro Semantic Profile v0.1. It describes 10 tables, 75 columns, 10 entities, 11 dimensions, 6 metrics, 6 business rules, 11 governed relationships, and 1 policy.
 - Three bounded specialist stages propose the semantic inventory, relationship semantics, and metric/rule semantics through one configurable OpenAI-compatible model gateway. They receive catalog metadata without source rows.
 - A deterministic linker, compiler, and validator reject invalid references before review. Approved copies become `stable`, record human verification, and remain separate from generated candidates.
-- The in-memory retriever uses type-aware lexical ranking, optional embeddings, reciprocal-rank fusion, progressive semantic expansion, and shortest governed join paths.
-- FastAPI serves semantic retrieval, runtime status, and governed database chat; MCP exposes the same grounding contract through local Streamable HTTP.
-- The React workspace combines the read-only semantic constellation with a conversational Text-to-SQL experience that discloses SQL, results, evidence, warnings, and agent trace.
+- The in-memory retriever uses type-aware lexical ranking, optional embeddings, reciprocal-rank fusion, progressive semantic expansion, and shortest governed join paths. Vietnamese-aware tokenization keeps non-ASCII questions from silently retrieving zero grounding under the lexical-only default.
+- FastAPI serves semantic retrieval, runtime status, governed database chat, an executive report agent, and saved-chart/bundle-version management; MCP exposes the same grounding contract through local Streamable HTTP.
+- The React workspace is four role-gated workspaces switched from one menu: **Semantic constellation** (graph), **Text-to-SQL agents** (conversational chat that discloses SQL, results, evidence, warnings, and agent trace), **Report agent** (multi-question report planning with PDF export), and **Customer self-service** (row-scoped, simulated-login Q&A over a fixed allowlist of customer-facing data) — the first three are for internal engineers, the last is the only workspace external customers see.
 
 The production code traces to the contracts in [`specs/`](specs/README.md), including the [Semantic Profile v0.1 contract](specs/011-semantic-profile-v0.1.md). Semantic definitions and design rationale remain in [`docs/semantic-layer-definition.md`](docs/semantic-layer-definition.md). The complete manual test procedure is [`docs/product-tester-guide.md`](docs/product-tester-guide.md).
 
@@ -135,9 +135,23 @@ Run `cerebro doctor` after changing configuration. Model and key changes require
 | `POST /api/definition-revisions` | Fork an approved graph into a validated authored revision |
 | `POST /api/definition-revisions/{id}/definitions` | Add another typed definition to the same draft revision |
 | `POST /api/definition-revisions/{id}/reviews` | Approve and save, or reject, an authored revision |
+| `POST /api/chat/requests/{request_id}/cancel` | Cancel an in-flight chat turn |
+| `GET /api/graph/path` | Shortest governed path between two graph objects (Find Path) |
+| `GET /api/bundles/golden` / `GET /api/golden/graph` / `GET /api/golden/objects/{id}` | Read the Golden bundle independent of the active/default pointer |
+| `DELETE /api/bundles/{bundle_id}` | Delete a saved graph version (raises, never silently no-ops, if it is Golden or the current default) |
+| `POST /api/saved-charts` / `GET /api/saved-charts` / `DELETE /api/saved-charts/{chart_id}` | Persist, list, and delete frozen chat-result chart snapshots |
+| `POST /api/reports/runs` / `POST /api/reports/runs/{run_id}/cancel` | Start or cancel an executive report run |
+| `GET /api/reports/runs/{run_id}` / `GET /api/reports/runs/{run_id}/events` | Report run state and live SSE progress |
+| `GET /api/reports/runs/{run_id}/document` / `GET /api/reports/runs/{run_id}/pdf` | Completed report document (JSON or rendered PDF) |
+| `GET /api/definition-revisions/{id}` / `GET /api/definition-revisions/{id}/graph` / `GET /api/definition-revisions/{id}/objects/{object_id}` | Inspect an authored definition revision before or after review |
+| `POST /api/definition-revisions/{id}/activate` | Activate an approved definition revision |
+| `GET /api/agent/scope` | Strict Text2SQLAgent's current `AuthorizationScope` (spec 008) |
+| `POST /api/agent/ask` | Strict Text2SQLAgent question endpoint, kept out of `api.py` since that module is advisory-metadata-only |
 | MCP `retrieve_grounding` | Entities, dimensions, metrics, rules, physical bindings, joins, warnings, classifications, and provenance |
 | MCP `get_concept` | Stable-ID lookup |
 | MCP `expand_neighborhood` | Typed graph expansion up to depth three |
+
+`GET /api/graph` and `POST /api/chat` additionally take a customer scope: `?scope=customer` projects the graph down to the fixed customer self-service allowlist (`src/cerebro/customer_scope.py`), and a chat request with `customer_id` set applies the matching row-level SQL filter before execution and skips the internal metadata-exploration shortcut for latency.
 
 In the Semantic Constellation workspace, approval saves an immutable copy without changing the runtime. Open **Versions** to compare Golden Bank Workshop v0.2.0 with approved generated graphs and Definition revisions, preview any graph, and explicitly set the workspace-wide default. Every graph preview has an **Inspect / Define** rail; Define can fork that exact approved version into a guided metric or business-rule revision. When an operator pins `CEREBRO_BUNDLE_PATH`, the version library remains available but default changes are disabled.
 
@@ -186,6 +200,8 @@ The architecture separates **knowledge production** from **knowledge consumption
 - The semantic pipeline creates an isolated, versioned candidate from the current catalog.
 - Review and activation are separate recorded actions; downstream consumers continue using the active bundle until activation.
 - The current chat runtime retrieves the active semantic contract, proposes one query, validates it, executes it read-only, and returns evidence-linked results.
+
+Two additional consumers sit on top of the same governed chat runtime without changing it: the **report agent** decomposes one free-text request into several governed sub-questions, runs each through the unmodified chat orchestrator, and synthesizes an overview that never invents a number absent from a query result; and **customer self-service** applies a fixed row-level scope (`src/cerebro/customer_scope.py`) on top of the same retrieval and execution path so a simulated-login customer only ever sees their own rows across a narrow allowlist of customer-facing entities.
 
 ### Future Text-to-SQL multi-agent target
 
@@ -256,6 +272,8 @@ The graph builder projects OKF entities and relations into a navigable model. Th
 The UI uses backend `profile_kind` for presentation and filtering while preserving raw OKF `type`. It supports All, Physical, Semantic, Metrics, and Governance presets plus per-kind filters for dataset, physical table, entity, dimension, metric, business rule, relationship, policy, legacy concept, and generic objects.
 
 The graph is not only a UI. It is a reasoning substrate for retrieving connected context, selecting join routes, analyzing impact, and explaining how an answer was produced.
+
+For bundles too large to force-layout synchronously, `GET /api/graph` defaults to a bounded domain-and-entity overview (`CEREBRO_GRAPH_DEFAULT_TIER`, `CEREBRO_GRAPH_MAX_EXPAND_DEPTH`) rather than rendering every object at once, with explicit one-hop expansion, a Focus Mode, a Find Path lookup between two objects, and an off-main-thread layout worker.
 
 ## 2. Future Text-to-SQL Agentic Platform
 
