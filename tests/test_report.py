@@ -155,7 +155,16 @@ def test_orchestrator_runs_sections_in_order_without_shared_history(bank_databas
 
     monkeypatch.setattr(ChatOrchestrator, "chat", spy)
 
-    document = ReportOrchestrator(chat).run("Phân tích khách hàng và số dư", "run-order")
+    emitted = []
+    document = ReportOrchestrator(chat).run(
+        "Phân tích khách hàng và số dư", "run-order",
+        on_event=lambda *event: emitted.append(event),
+    )
+    assert emitted[1][0:2] == ("planning", "completed")
+    assert emitted[1][3]["sections"] == [
+        {"id": f"s{index}", **section.model_dump()}
+        for index, section in enumerate(plan.sections, start=1)
+    ]
 
     assert [section.question for section in document.sections] == [s.question for s in plan.sections]
     assert [request.message for request in seen_requests] == [s.question for s in plan.sections]

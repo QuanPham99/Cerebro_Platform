@@ -304,28 +304,20 @@ const PENDING_STAGES: { after: number; label: string }[] = [
 ]
 const PENDING_EXPECTED_SECONDS = 24
 
-function QueryProgress({ elapsed }: { elapsed: number }) {
-  const activeIndex = PENDING_STAGES.reduce((idx, entry, index) => (elapsed >= entry.after ? index : idx), 0)
-  const stage = PENDING_STAGES[activeIndex]
+function QueryProgress({ elapsed, onStop }: { elapsed: number; onStop: () => void }) {
+  const stage = [...PENDING_STAGES].reverse().find((entry) => elapsed >= entry.after) ?? PENDING_STAGES[0]
+  const percent = Math.min(94, (elapsed / PENDING_EXPECTED_SECONDS) * 100)
   return (
     <article className="chat-message assistant pending">
-      <span>Cerebro</span>
-      <div className="query-progress report-progress">
+      <div className="chat-message-head">
+        <span>Cerebro</span>
+        <button type="button" className="stop-query" onClick={onStop}><Square size={10} />Stop query</button>
+      </div>
+      <div className="query-progress">
         <p><Clock size={13} /> {stage.label}…</p>
-        <ol className="report-stepper">
-          {PENDING_STAGES.map((entry, index) => {
-            const status = index < activeIndex ? 'done' : index === activeIndex ? 'active' : 'pending'
-            return (
-              <li className={`report-step ${status}`} key={entry.label}>
-                <span className="report-step-dot">
-                  {status === 'done' && <Check size={10} />}
-                  {status === 'active' && <Loader2 size={10} className="spin" />}
-                </span>
-                <span className="report-step-label">{entry.label}</span>
-              </li>
-            )
-          })}
-        </ol>
+        <div className="progress-bar" role="progressbar" aria-valuenow={Math.round(percent)} aria-valuemin={0} aria-valuemax={100}>
+          <div className="progress-bar-fill" style={{ width: `${percent}%` }} />
+        </div>
         <small>{elapsed.toFixed(1)}s elapsed{elapsed > PENDING_EXPECTED_SECONDS ? ' · this one is taking longer than usual' : ''}</small>
       </div>
     </article>
@@ -579,16 +571,11 @@ function AgentSetupWorkspace({
                 {entry.response.trace.length > 0 && <details className="chat-detail"><summary><Waypoints size={13} /> Agent trace</summary><ol className="trace-list">{entry.response.trace.map((item, traceIndex) => <li className={item.status} key={`${item.agent}-${traceIndex}`}><strong>{item.agent.replaceAll('_', ' ')}</strong><span>{item.summary}</span></li>)}</ol></details>}
               </article>
             ))}
-            {pending && (
-              <div className="pending-row">
-                <QueryProgress elapsed={pendingElapsed} />
-                <button type="button" className="stop-query" onClick={() => cancelActiveRequest(false)} aria-label="Stop query"><Square size={12} /></button>
-              </div>
-            )}
+            {pending && <QueryProgress elapsed={pendingElapsed} onStop={() => cancelActiveRequest(false)} />}
           </div>
           <form className="chat-composer" onSubmit={submit}>
             <label><span className="sr-only">Ask about the database</span><textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Ask a question about the database…" rows={2} /></label>
-            <button type="submit" disabled={!input.trim() || pending} aria-label="Send question"><Send size={17} /></button>
+            {!pending && <button type="submit" disabled={!input.trim()} aria-label="Send question"><Send size={17} /></button>}
           </form>
         </section>
 

@@ -1,5 +1,5 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Check, ChevronRight, Clock, Copy, Download, FileText, ListChecks, Loader2, Send, Sparkles, Square, Terminal, Waypoints } from 'lucide-react'
+import { AlertTriangle, Check, ChevronRight, Clock, Copy, Download, FileText, ListChecks, Send, Sparkles, Square, Terminal, Waypoints } from 'lucide-react'
 import { cancelReport, getReportDocument, reportEventsUrl, reportPdfUrl, startReport } from './api'
 import { ResultPanel } from './ResultPanel'
 import type { ReportDocument, ReportEvent, ReportRun, ReportSectionResult } from './types'
@@ -9,14 +9,14 @@ const TOC_MIN_SECTIONS = 3
 type StatusTone = 'good' | 'warn' | 'bad' | 'muted' | 'accent'
 
 const STATUS_META: Record<string, { label: string; tone: StatusTone }> = {
-  completed: { label: 'Hoàn thành', tone: 'good' },
-  answered: { label: 'Đã trả lời', tone: 'good' },
-  partial: { label: 'Một phần', tone: 'warn' },
-  clarification: { label: 'Cần làm rõ', tone: 'warn' },
-  failed: { label: 'Thất bại', tone: 'bad' },
-  blocked: { label: 'Không trả lời được', tone: 'bad' },
-  cancelled: { label: 'Đã dừng', tone: 'muted' },
-  running: { label: 'Đang chạy', tone: 'accent' },
+  completed: { label: 'Completed', tone: 'good' },
+  answered: { label: 'Answered', tone: 'good' },
+  partial: { label: 'Partial', tone: 'warn' },
+  clarification: { label: 'Needs clarification', tone: 'warn' },
+  failed: { label: 'Failed', tone: 'bad' },
+  blocked: { label: 'Blocked', tone: 'bad' },
+  cancelled: { label: 'Cancelled', tone: 'muted' },
+  running: { label: 'Running', tone: 'accent' },
 }
 
 function StatusBadge({ status, small }: { status: string; small?: boolean }) {
@@ -32,7 +32,7 @@ function formatReportDateTime(iso: string): string {
 
 function buildReportText(document: ReportDocument): string {
   const lines = [document.title, '']
-  if (document.overview) lines.push('Tóm tắt điều hành:', document.overview, '')
+  if (document.overview) lines.push('Executive summary:', document.overview, '')
   document.sections.forEach((section, index) => {
     lines.push(`${index + 1}. ${section.title}`, section.question, section.answer, '')
   })
@@ -46,33 +46,12 @@ interface ReportPreset {
 }
 
 const REPORT_PRESETS: ReportPreset[] = [
-  {
-    id: 'executive-summary',
-    label: 'Tổng quan điều hành',
-    request: 'Tạo báo cáo tổng quan điều hành bao quát khách hàng, tiền gửi, giao dịch, thẻ và gian lận, khoản vay và rủi ro, hiệu suất chi nhánh, và hỗ trợ khách hàng.',
-  },
-  {
-    id: 'credit-risk',
-    label: 'Rủi ro tín dụng & nợ xấu',
-    request: 'Tạo báo cáo rủi ro tín dụng: tỷ lệ nợ xấu, tỷ lệ trễ hạn thanh toán, và tổng dư nợ theo chi nhánh và loại khoản vay.',
-  },
-  {
-    id: 'card-fraud',
-    label: 'Gian lận thẻ',
-    request: 'Tạo báo cáo gian lận thẻ: tỷ lệ gian lận theo loại thẻ và merchant category, và mức độ thiệt hại gian lận theo chi nhánh.',
-  },
-  {
-    id: 'branch-performance',
-    label: 'Hiệu suất chi nhánh',
-    request: 'Tạo báo cáo hiệu suất chi nhánh: doanh thu ròng (TOI proxy), tổng số dư huy động, và tổng dư nợ theo từng chi nhánh.',
-  },
-]
-
-const SAMPLE_QUESTIONS: string[] = [
-  'Phân tích tình hình gian lận thẻ theo loại thẻ và merchant category',
-  'Khách hàng nào vừa trễ hạn khoản vay vừa đang mở ticket hỗ trợ?',
-  'So sánh hiệu suất các chi nhánh dựa trên số dư huy động và dư nợ',
-  'Tình hình dòng tiền và giao dịch của khách hàng gần đây thế nào?',
+  { id: 'executive-summary', label: 'Tổng quan điều hành', request: 'Tạo cho tôi báo cáo tổng quan điều hành' },
+  { id: 'credit-risk', label: 'Rủi ro tín dụng & nợ xấu', request: 'Tạo cho tôi báo cáo rủi ro tín dụng và nợ xấu' },
+  { id: 'card-fraud', label: 'Gian lận thẻ', request: 'Tạo cho tôi báo cáo gian lận thẻ' },
+  { id: 'branch-performance', label: 'Hiệu suất chi nhánh', request: 'Tạo cho tôi báo cáo hiệu suất chi nhánh' },
+  { id: 'customer-support', label: 'Hỗ trợ khách hàng', request: 'Tạo cho tôi báo cáo hỗ trợ khách hàng' },
+  { id: 'cash-flow', label: 'Dòng tiền khách hàng', request: 'Tạo cho tôi báo cáo dòng tiền khách hàng' },
 ]
 
 function ReportPresetPanel({ onSelect, disabled }: { onSelect: (text: string) => void; disabled: boolean }) {
@@ -81,26 +60,16 @@ function ReportPresetPanel({ onSelect, disabled }: { onSelect: (text: string) =>
       <summary className="preset-panel-heading rail-toggle">
         <ChevronRight size={12} className="chevron-icon" />
         <ListChecks size={14} />
-        <span>Preset reports & questions</span>
-        {disabled && <em className="preset-panel-status">Đang chạy…</em>}
+        <span>Preset Reports</span>
+        {disabled && <em className="preset-panel-status">Running…</em>}
       </summary>
       <div className="preset-levels">
-        <section className="preset-level" aria-label="Báo cáo mẫu">
-          <header><strong>Báo cáo mẫu</strong><span>{REPORT_PRESETS.length}</span></header>
-          <div className="preset-level-questions">
-            {REPORT_PRESETS.map((preset) => (
-              <button type="button" key={preset.id} disabled={disabled} onClick={() => onSelect(preset.request)}>{preset.label}</button>
-            ))}
-          </div>
-        </section>
-        <section className="preset-level" aria-label="Câu hỏi mẫu">
-          <header><strong>Câu hỏi mẫu</strong><span>{SAMPLE_QUESTIONS.length}</span></header>
-          <div className="preset-level-questions">
-            {SAMPLE_QUESTIONS.map((question) => (
-              <button type="button" key={question} disabled={disabled} onClick={() => onSelect(question)}>{question}</button>
-            ))}
-          </div>
-        </section>
+        <div className="preset-level-questions">
+          {REPORT_PRESETS.map((preset) => (
+            <button type="button" key={preset.id} disabled={disabled} onClick={() => onSelect(preset.request)}>{preset.label}</button>
+          ))}
+
+        </div>
       </div>
     </details>
   )
@@ -116,10 +85,10 @@ interface ReportTranscriptEntry {
 }
 
 function stageLabel(stage: string): string {
-  if (stage === 'planning') return 'Lên kế hoạch'
-  if (stage === 'synthesizing') return 'Tổng hợp báo cáo'
+  if (stage === 'planning') return 'Planning'
+  if (stage === 'synthesizing') return 'Synthesis'
   const match = /^s(\d+)$/.exec(stage)
-  return match ? `Câu hỏi con ${match[1]}` : stage
+  return match ? `Section ${match[1]}` : stage
 }
 
 function deriveTraceSteps(events: ReportEvent[]): Array<{ stage: string; status: string; summary: string }> {
@@ -146,51 +115,62 @@ function stepStatusFor(events: ReportEvent[], stage: string): StepStatus {
   return 'done'
 }
 
-function ReportStepper({ run, sectionStages }: { run: ReportRun; sectionStages: string[] }) {
-  const steps: Array<{ key: string; label: string; status: StepStatus }> = [
-    { key: 'planning', label: 'Lên kế hoạch', status: stepStatusFor(run.events, 'planning') },
-    ...sectionStages.map((stage, index) => ({ key: stage, label: `Phần ${index + 1}`, status: stepStatusFor(run.events, stage) })),
-    { key: 'synthesizing', label: 'Tổng hợp', status: stepStatusFor(run.events, 'synthesizing') },
-  ]
-  return (
-    <ol className="report-stepper">
-      {steps.map((step) => (
-        <li className={`report-step ${step.status}`} key={step.key}>
-          <span className="report-step-dot">
-            {step.status === 'done' && <Check size={10} />}
-            {step.status === 'active' && <Loader2 size={10} className="spin" />}
-          </span>
-          <span className="report-step-label">{step.label}</span>
-        </li>
-      ))}
-    </ol>
-  )
-}
-
-function ReportProgress({ run }: { run: ReportRun }) {
+function ReportProgress({ run, onStop, cancelling }: { run: ReportRun; onStop?: () => void; cancelling: boolean }) {
   const planningStarted = run.events.some((event) => event.stage === 'planning' && event.status === 'started')
   const planningEvent = [...run.events].reverse().find((event) => event.stage === 'planning' && event.status === 'completed')
   const sectionStages = [...new Set(run.events.filter((event) => /^s\d+$/.test(event.stage)).map((event) => event.stage))]
+  const planValue = planningEvent?.details.sections
+  const plan = Array.isArray(planValue) ? planValue.filter(
+    (item): item is { id: string; title: string; question: string } =>
+      typeof item === 'object' && item !== null && typeof item.id === 'string'
+      && typeof item.title === 'string' && typeof item.question === 'string',
+  ) : []
+  const stages = plan.length ? plan.map((section) => section.id) : sectionStages
+  const completedSections = stages.filter((stage) => ['done', 'warn', 'bad'].includes(stepStatusFor(run.events, stage))).length
   const synthesizing = run.events.some((event) => event.stage === 'synthesizing')
   const synthesizingDone = run.events.some((event) => event.stage === 'synthesizing' && event.status === 'completed')
 
   const headline = !planningStarted
-    ? 'Đang khởi động…'
+    ? 'Starting report…'
     : !planningEvent
-      ? 'Đang lên kế hoạch báo cáo…'
+      ? 'Planning report…'
       : synthesizingDone
-        ? 'Đã tổng hợp xong, đang tải báo cáo…'
+        ? 'Preparing report…'
         : synthesizing
-          ? 'Đang tổng hợp báo cáo…'
-          : 'Đang chạy các phần…'
+          ? 'Synthesizing report…'
+          : 'Running report sections…'
 
   return (
     <article className="chat-message assistant pending">
-      <span>Report Agent</span>
+      <div className="chat-message-head">
+        <span>Report Agent</span>
+        {onStop && <button type="button" className="stop-query" onClick={onStop} disabled={cancelling}>
+          <Square size={10} />{cancelling ? 'Stopping…' : 'Stop query'}
+        </button>}
+      </div>
       <div className="query-progress report-progress">
         <p><Clock size={13} /> {headline}</p>
-        {planningStarted && <ReportStepper run={run} sectionStages={sectionStages} />}
-        {planningEvent && <p className="report-plan-summary">{planningEvent.summary}</p>}
+        <div className={`progress-bar${!planningEvent ? ' report-progress-indeterminate' : ''}`}
+          role="progressbar" aria-label="Report progress" aria-valuemin={0} aria-valuemax={100}
+          aria-valuenow={planningEvent ? Math.round(((1 + completedSections + (synthesizingDone ? 1 : 0)) / (stages.length + 2)) * 100) : undefined}
+          aria-valuetext={headline}>
+          <div className="progress-bar-fill" style={{ width: planningEvent ? `${((1 + completedSections + (synthesizingDone ? 1 : 0)) / (stages.length + 2)) * 100}%` : '30%' }} />
+        </div>
+        {plan.length > 0 && (
+          <div className="report-plan">
+            <strong>Report plan</strong>
+            <ul aria-label="Report plan">
+              {plan.map((section) => (
+                <li key={section.id} data-status={stepStatusFor(run.events, section.id)}>
+                  <strong>{section.title}</strong>
+                  <p>{section.question}</p>
+                  <small>{({ pending: 'Pending', active: 'Running', done: 'Completed', warn: 'Needs clarification', bad: 'Blocked' })[stepStatusFor(run.events, section.id)]}</small>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {planningEvent && plan.length === 0 && <p className="report-plan-summary">{planningEvent.summary}</p>}
         {sectionStages.length > 0 && (
           <ul className="report-section-list">
             {sectionStages.map((stage) => {
@@ -200,9 +180,9 @@ function ReportProgress({ run }: { run: ReportRun }) {
               const done = latest.status !== 'started'
               return (
                 <li className={`report-section-item ${latest.status}`} key={stage}>
-                  {done ? <Check size={12} /> : <Loader2 size={12} className="spin" />}
+                  {done ? <Check size={12} /> : <Clock size={12} />}
                   <div>
-                    <strong>{started?.summary || stage}</strong>
+                    <strong>{plan.find((section) => section.id === stage)?.title || started?.summary || stage}</strong>
                     {done && <p>{latest.summary}</p>}
                   </div>
                 </li>
@@ -236,11 +216,11 @@ function ReportSection({ section, index, runId }: { section: ReportSectionResult
       <p className="report-section-answer">{section.answer}</p>
       {hasTable && (
         isEmpty ? (
-          <p className="report-section-empty">Không có dữ liệu phù hợp.</p>
+          <p className="report-section-empty">No matching data.</p>
         ) : (
           <>
             <p className="report-section-rowcount">
-              {section.row_count} dòng kết quả{section.truncated ? ' · đã cắt bớt theo giới hạn hiển thị' : ''}
+              {section.row_count} result rows{section.truncated ? ' · truncated to the display limit' : ''}
             </p>
             <ResultPanel columns={section.columns} rows={section.rows} rowCount={section.row_count} truncated={section.truncated} />
           </>
@@ -265,8 +245,8 @@ function ReportSection({ section, index, runId }: { section: ReportSectionResult
 function ReportToc({ sections, runId }: { sections: ReportSectionResult[]; runId: string }) {
   if (sections.length < TOC_MIN_SECTIONS) return null
   return (
-    <nav className="report-toc" aria-label="Mục lục báo cáo">
-      <span className="report-toc-label">Mục lục</span>
+    <nav className="report-toc" aria-label="Report contents">
+      <span className="report-toc-label">Contents</span>
       <ol>
         {sections.map((section, index) => (
           <li key={section.id}>
@@ -293,6 +273,19 @@ function ReportHeader({ document }: { document: ReportDocument }) {
 
   return (
     <header className="report-header">
+      <div className="chat-message-head">
+        <span>Report Agent</span>
+        <div className="report-header-actions">
+          {document.status !== 'failed' && (
+            <a className="report-download primary" href={reportPdfUrl(document.run_id)} download={`report-${document.run_id}.pdf`}>
+              <Download size={13} /> Export PDF
+            </a>
+          )}
+          <button type="button" className="report-copy" onClick={() => void copyReport()}>
+            {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+      </div>
       <div className="report-header-top">
         <div className="report-header-title">
           <FileText size={17} />
@@ -302,17 +295,7 @@ function ReportHeader({ document }: { document: ReportDocument }) {
       </div>
       <div className="report-header-meta">
         <span><Clock size={12} /> {formatReportDateTime(document.generated_at)}</span>
-        <span><ListChecks size={12} /> {document.sections.length} phần</span>
-      </div>
-      <div className="report-header-actions">
-        {document.status !== 'failed' && (
-          <a className="report-download primary" href={reportPdfUrl(document.run_id)} download={`report-${document.run_id}.pdf`}>
-            <Download size={13} /> Xuất PDF
-          </a>
-        )}
-        <button type="button" className="report-copy" onClick={() => void copyReport()}>
-          {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? 'Đã sao chép' : 'Sao chép'}
-        </button>
+        <span><ListChecks size={12} /> {document.sections.length} sections</span>
       </div>
     </header>
   )
@@ -325,7 +308,7 @@ function ReportResult({ document, run }: { document: ReportDocument; run?: Repor
       <ReportHeader document={document} />
       {document.overview && (
         <div className="report-overview">
-          <div className="report-overview-label"><Sparkles size={13} /> Tóm tắt điều hành</div>
+          <div className="report-overview-label"><Sparkles size={13} /> Executive summary</div>
           <p>{document.overview}</p>
         </div>
       )}
@@ -337,7 +320,7 @@ function ReportResult({ document, run }: { document: ReportDocument; run?: Repor
       </div>
       {trace.length > 0 && (
         <details className="chat-detail">
-          <summary><Waypoints size={13} /> Quá trình thực hiện · {trace.length} bước</summary>
+          <summary><Waypoints size={13} /> Agent trace · {trace.length} steps</summary>
           <ol className="trace-list">
             {trace.map((step) => (
               <li className={step.status} key={step.stage}><strong>{stageLabel(step.stage)}</strong><span>{step.summary}</span></li>
@@ -349,21 +332,21 @@ function ReportResult({ document, run }: { document: ReportDocument; run?: Repor
   )
 }
 
-function ReportAssistantMessage({ entry }: { entry: ReportTranscriptEntry }) {
+function ReportAssistantMessage({ entry, onStop, cancelling }: { entry: ReportTranscriptEntry; onStop?: () => void; cancelling: boolean }) {
   if (entry.document) return <ReportResult document={entry.document} run={entry.run} />
   if (entry.error) {
     return <article className="chat-message assistant blocked"><span>Report Agent</span><p>{entry.error}</p></article>
   }
   if (!entry.run) {
-    return <article className="chat-message assistant pending"><span>Report Agent</span><p><Clock size={13} /> Đang khởi tạo báo cáo…</p></article>
+    return <article className="chat-message assistant pending"><span>Report Agent</span><p><Clock size={13} /> Starting report…</p></article>
   }
   if (entry.run.status === 'failed') {
-    return <article className="chat-message assistant blocked"><span>Report Agent · thất bại</span><p>{entry.run.error || 'Không thể tạo báo cáo.'}</p></article>
+    return <article className="chat-message assistant blocked"><span>Report Agent · failed</span><p>{entry.run.error || 'Could not create report.'}</p></article>
   }
   if (entry.run.status === 'cancelled') {
-    return <article className="chat-message assistant cancelled"><span>Report Agent · đã dừng</span><p>Report đã được dừng theo yêu cầu.</p></article>
+    return <article className="chat-message assistant cancelled"><span>Report Agent · cancelled</span><p>Report stopped at your request.</p></article>
   }
-  return <ReportProgress run={entry.run} />
+  return <ReportProgress run={entry.run} onStop={onStop} cancelling={cancelling} />
 }
 
 export function ReportPanel({ active }: { active: boolean }) {
@@ -423,11 +406,11 @@ export function ReportPanel({ active }: { active: boolean }) {
         }
         getReportDocument(completedRun.run_id)
           .then((document) => updateEntry(localId, { document }))
-          .catch((reason: Error) => updateEntry(localId, { error: reason.message || 'Không tải được báo cáo.' }))
+          .catch((reason: Error) => updateEntry(localId, { error: reason.message || 'Could not load report.' }))
           .finally(() => setPending(false))
       })
     } catch (reason) {
-      updateEntry(localId, { error: reason instanceof Error ? reason.message : 'Không thể tạo báo cáo.' })
+      updateEntry(localId, { error: reason instanceof Error ? reason.message : 'Could not create report.' })
       setPending(false)
     }
   }
@@ -451,40 +434,37 @@ export function ReportPanel({ active }: { active: boolean }) {
           <div className="chat-heading">
             <div className="chat-heading-title"><FileText size={16} /><span>Report Agent</span></div>
             <div className="chat-heading-actions">
-              {entries.length > 0 && <button type="button" onClick={() => setEntries([])} disabled={pending}>Xóa</button>}
+              {entries.length > 0 && <button type="button" onClick={() => setEntries([])} disabled={pending}>Clear chat</button>}
             </div>
           </div>
           <div className="chat-transcript" ref={transcriptRef} aria-live="polite">
             {entries.length === 0 && (
               <div className="chat-empty">
                 <span><Sparkles size={20} /></span>
-                <h2>Tạo báo cáo</h2>
-                <p>Đặt một câu hỏi, ví dụ "phân tích tình hình gian lận thẻ", hoặc dùng báo cáo tổng quan điều hành. Agent sẽ tự chia thành nhiều câu hỏi con, chạy SQL tuần tự, rồi tổng hợp thành một báo cáo có thể tải về dạng PDF.</p>
+                <h2>Create a report</h2>
+                <p>Describe what you want to analyze, or choose a preset report. Review the plan and follow each section as your report is created.</p>
               </div>
             )}
             {entries.map((entry, index) => entry.role === 'user' ? (
-              <article className="chat-message user" key={index}><span>Bạn</span><p>{entry.content}</p></article>
+              <article className="chat-message user" key={index}><span>You</span><p>{entry.content}</p></article>
             ) : (
-              <div className="pending-row" key={entry.localId ?? index}>
-                <ReportAssistantMessage entry={entry} />
-                {pending && index === entries.length - 1 && (
-                  <button type="button" className="stop-query" onClick={stopActiveRun} disabled={cancelling} aria-label={cancelling ? 'Đang dừng…' : 'Dừng'}><Square size={12} /></button>
-                )}
-              </div>
+              <ReportAssistantMessage key={entry.localId ?? index} entry={entry} cancelling={cancelling}
+                onStop={pending && entry.run?.run_id === activeRunRef.current ? stopActiveRun : undefined} />
             ))}
           </div>
           <form className="chat-composer" onSubmit={submit}>
             <label>
-              <span className="sr-only">Yêu cầu báo cáo</span>
+              <span className="sr-only">Report request</span>
               <textarea
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }}
-                placeholder="Đặt câu hỏi hoặc mô tả báo cáo bạn cần…"
+                placeholder="Describe the report you need…"
                 rows={2}
               />
             </label>
-            <button type="submit" disabled={!input.trim() || pending} aria-label="Tạo báo cáo"><Send size={17} /></button>
+
+            {!pending && <button type="submit" disabled={!input.trim()} aria-label="Create report"><Send size={17} /></button>}
           </form>
         </section>
 
