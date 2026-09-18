@@ -197,7 +197,7 @@ class _StubProvider(GenerationProvider):
     name = "stub"
     model = "customer-scope-fixture"
 
-    def generate(self, schema_name, prompt, output_model):
+    def generate(self, schema_name, prompt, output_model, **kwargs):
         if output_model is QueryPlanAndSQL:
             return QueryPlanAndSQL(
                 intent="Look up my own balance",
@@ -262,7 +262,7 @@ class _CountingProvider(GenerationProvider):
         self.calls: list[str] = []
         self.prompts: list[tuple[str, str]] = []
 
-    def generate(self, schema_name, prompt, output_model):
+    def generate(self, schema_name, prompt, output_model, **kwargs):
         self.calls.append(schema_name)
         self.prompts.append((schema_name, prompt))
         if output_model is QueryPlanAndSQL:
@@ -370,6 +370,68 @@ def test_plan_cache_is_not_shared_across_orchestrator_instances(two_customer_dat
     second_orchestrator.chat(ChatRequest(message="What is my balance?", customer_id="2"))
 
     assert second_provider.calls.count("query_plan") == 1
+
+
+# --- Spec 031: plan-cache hit skips the embedding call only when safe to do so ---------
+
+
+class _CountingEmbedder:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        return [[0.0, 0.0] for _ in texts]
+
+
+class _DecliningProvider(GenerationProvider):
+    """A cached, out-of-scope decline: requires_query=False, so the semantic_answer
+    branch still needs the full grounding context on a cache hit."""
+
+    name = "declining"
+    model = "customer-scope-fixture"
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def generate(self, schema_name, prompt, output_model, **kwargs):
+        self.calls.append(schema_name)
+        if output_model is QueryPlanAndSQL:
+            return QueryPlanAndSQL(intent="Out of scope", requires_query=False)
+        if output_model is AnswerPayload:
+            return AnswerPayload(answer="Xin lỗi, câu hỏi này nằm ngoài phạm vi câu trả lời của tôi.")
+        raise AssertionError(schema_name)
+
+
+def test_plan_cache_hit_skips_embedding_for_a_query_executing_question(two_customer_database: Path):
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    embedder = _CountingEmbedder()
+    retriever = SemanticRetriever(bundle, embedder=embedder)
+    embedder.calls = 0  # discard the one-time document-indexing call made at construction
+    provider = _CountingProvider()
+    orchestrator = ChatOrchestrator(bundle, retriever, two_customer_database, _settings(two_customer_database), provider)
+
+    orchestrator.chat(ChatRequest(message="What is my balance?", customer_id="1"))
+    orchestrator.chat(ChatRequest(message="What is my balance?", customer_id="2"))
+
+    assert provider.calls.count("query_plan") == 1
+    assert embedder.calls == 1  # only the cache-miss first turn embedded the query
+
+
+def test_plan_cache_hit_still_embeds_for_an_out_of_scope_decline(two_customer_database: Path):
+    bundle = load_validated_bundle(DEFAULT_BUNDLE)
+    embedder = _CountingEmbedder()
+    retriever = SemanticRetriever(bundle, embedder=embedder)
+    embedder.calls = 0
+    provider = _DecliningProvider()
+    orchestrator = ChatOrchestrator(bundle, retriever, two_customer_database, _settings(two_customer_database), provider)
+
+    orchestrator.chat(ChatRequest(message="What is the branch's total deposits?", customer_id="1"))
+    orchestrator.chat(ChatRequest(message="What is the branch's total deposits?", customer_id="2"))
+
+    assert provider.calls.count("query_plan") == 1  # still a cache hit on the second turn
+    assert provider.calls.count("semantic_answer") == 2
+    assert embedder.calls == 2  # both turns need full grounding context for semantic_answer
 
 
 # --- Spec 028: loan balance/maturity grounding objects are customer-visible ------------

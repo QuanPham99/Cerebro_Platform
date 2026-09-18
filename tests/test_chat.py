@@ -33,9 +33,11 @@ class ChatProvider(GenerationProvider):
 
     def __init__(self):
         self.prompts: list[tuple[str, str]] = []
+        self.call_kwargs: list[dict] = []
 
-    def generate(self, schema_name, prompt, output_model):
+    def generate(self, schema_name, prompt, output_model, **kwargs):
         self.prompts.append((schema_name, prompt))
+        self.call_kwargs.append(kwargs)
         if output_model is QueryPlanAndSQL:
             return QueryPlanAndSQL(
                 intent="Count customers by gender",
@@ -129,6 +131,9 @@ def test_chat_runs_validated_read_only_query(bank_database: Path, caplog: pytest
     # turn makes exactly 2 model calls total (merged query_plan, then database_answer)
     # instead of 3.
     assert [schema for schema, _ in provider.prompts] == ["query_plan", "database_answer"]
+    # spec 031: database_answer runs with reduced reasoning and a tighter token cap;
+    # query_plan is called exactly as before (no thinking/max_output_tokens override).
+    assert provider.call_kwargs == [{}, {"thinking": False, "max_output_tokens": 512}]
     planning_prompt = provider.prompts[0][1]
     assert '"available_metadata"' in planning_prompt
     assert '"live_table_schema_count": 10' in planning_prompt
@@ -168,8 +173,9 @@ def test_chat_sql_repair_runs_once_after_guardrail_rejection(bank_database: Path
     bundle = load_validated_bundle(DEFAULT_BUNDLE)
 
     class RepairingProvider(ChatProvider):
-        def generate(self, schema_name, prompt, output_model):
+        def generate(self, schema_name, prompt, output_model, **kwargs):
             self.prompts.append((schema_name, prompt))
+            self.call_kwargs.append(kwargs)
             if output_model is QueryPlanAndSQL:
                 return QueryPlanAndSQL(
                     intent="Count customers by gender",
@@ -193,6 +199,7 @@ def test_chat_sql_repair_runs_once_after_guardrail_rejection(bank_database: Path
     ).chat(ChatRequest(message="How many customers are there by gender?"))
     assert response.status == "answered"
     assert [schema for schema, _ in provider.prompts] == ["query_plan", "sql_repair", "database_answer"]
+    assert provider.call_kwargs == [{}, {}, {"thinking": False, "max_output_tokens": 512}]
 
 
 def test_chat_clarification_makes_exactly_one_model_call(bank_database: Path):

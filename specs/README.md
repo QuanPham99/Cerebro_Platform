@@ -45,6 +45,8 @@ Phase 2 consumes the Phase 1 bundle as read-only input and does not modify it.
 11. [027 — Trim and cache the customer self-service chat query-plan step](027-customer-chat-plan-cache.md)
 12. [028 — Make every customer self-service preset question answerable](028-customer-question-answerability.md)
 13. [029 — Vietnamese-aware lexical retrieval for the customer workspace](029-vietnamese-lexical-retrieval.md)
+14. [030 — Repeatable live-validation loop for customer self-service Q&A](030-customer-qna-live-validation-loop.md)
+15. [031 — Reduce chat-answer latency via per-call reasoning control and a plan-cache grounding skip](031-chat-answer-latency-reduction.md)
 
 ### Operations and deployment
 

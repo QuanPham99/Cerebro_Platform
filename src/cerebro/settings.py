@@ -50,6 +50,15 @@ class Settings:
         return bool(self.llm_api_key and self.llm_model)
 
     @property
+    def llm_supports_reasoning_control(self) -> bool:
+        """True only for a provider deployment confirmed to accept GLM-5.2's
+        non-standard `thinking` extra-body field (spec 031). Gated explicitly
+        rather than attempted-and-ignored: an unfamiliar OpenAI-compatible
+        provider might reject an unrecognized top-level body field instead of
+        silently ignoring it."""
+        return self.llm_provider_id == "greennode-glm"
+
+    @property
     def basic_auth_enabled(self) -> bool:
         return bool(self.basic_auth_user and self.basic_auth_password)
 

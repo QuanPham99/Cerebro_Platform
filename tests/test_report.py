@@ -63,7 +63,7 @@ class ReportChatProvider(GenerationProvider):
         self.clarify_marker = clarify_marker
         self.calls: list[tuple[str, str]] = []
 
-    def generate(self, schema_name, prompt, output_model):
+    def generate(self, schema_name, prompt, output_model, **kwargs):
         self.calls.append((schema_name, output_model.__name__))
         if output_model is ReportPlan:
             return self.plan

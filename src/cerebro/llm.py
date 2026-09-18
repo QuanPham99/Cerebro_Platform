@@ -132,7 +132,24 @@ class OpenAICompatibleGateway:
         assert last_exc is not None  # pragma: no cover - loop always returns or raises
         raise last_exc
 
-    def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
+    def _extra_body(self, thinking: bool) -> dict[str, object]:
+        """GLM-5.2's non-standard reasoning toggle (spec 031). Omitted entirely
+        unless the caller explicitly asks for reduced reasoning AND the
+        configured provider is confirmed to accept the field — every other
+        call stays byte-identical to before this parameter existed."""
+        if thinking or not self.settings.llm_supports_reasoning_control:
+            return {}
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+
+    def generate(
+        self,
+        schema_name: str,
+        prompt: str,
+        output_model: type[OutputT],
+        *,
+        thinking: bool = True,
+        max_output_tokens: int | None = None,
+    ) -> OutputT:
         modes = [self.settings.llm_response_mode]
         if modes[0] == "auto":
             modes = ["json_schema", "json_object"]
@@ -168,7 +185,8 @@ class OpenAICompatibleGateway:
                         {"role": "user", "content": user_prompt},
                     ],
                     response_format=response_format,
-                    max_tokens=self.settings.llm_max_output_tokens,
+                    max_tokens=max_output_tokens if max_output_tokens is not None else self.settings.llm_max_output_tokens,
+                    **self._extra_body(thinking),
                 )
                 content = response.choices[0].message.content
                 if not content:
@@ -180,7 +198,10 @@ class OpenAICompatibleGateway:
             except Exception as exc:
                 last_error = exc
                 if index + 1 == len(modes) and content and isinstance(exc, (json.JSONDecodeError, ValidationError)):
-                    return self._repair_json(schema_name, content, output_model, exc)
+                    return self._repair_json(
+                        schema_name, content, output_model, exc,
+                        thinking=thinking, max_output_tokens=max_output_tokens,
+                    )
                 if index + 1 == len(modes) or not self._response_format_error(exc):
                     if content and isinstance(exc, (json.JSONDecodeError, ValidationError)):
                         raise GenerationOutputError(schema_name) from exc
@@ -193,6 +214,9 @@ class OpenAICompatibleGateway:
         invalid_content: str,
         output_model: type[OutputT],
         validation_error: Exception,
+        *,
+        thinking: bool = True,
+        max_output_tokens: int | None = None,
     ) -> OutputT:
         try:
             response = self._call_with_retry(
@@ -215,7 +239,8 @@ class OpenAICompatibleGateway:
                     },
                 ],
                 response_format={"type": "json_object"},
-                max_tokens=self.settings.llm_max_output_tokens,
+                max_tokens=max_output_tokens if max_output_tokens is not None else self.settings.llm_max_output_tokens,
+                **self._extra_body(thinking),
             )
             content = response.choices[0].message.content
             if not content:

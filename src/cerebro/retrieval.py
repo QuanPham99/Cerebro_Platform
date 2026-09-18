@@ -174,11 +174,18 @@ class SemanticRetriever:
             scored.append((object_id, score))
         return sorted(scored, key=lambda item: (-item[1], item[0]))
 
-    def search(self, query: str, limit: int = 10, types: set[str] | None = None) -> list[RankedResult]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        types: set[str] | None = None,
+        *,
+        skip_vector: bool = False,
+    ) -> list[RankedResult]:
         if not query.strip():
             return []
         lexical = self.lexical_rank(query)
-        vector = self._vector_rank(query)
+        vector = [] if skip_vector else self._vector_rank(query)
         fused: dict[str, float] = defaultdict(float)
         evidence: dict[str, list[str]] = defaultdict(list)
         for rank, (object_id, _, reasons) in enumerate(lexical, 1):
@@ -321,8 +328,10 @@ class SemanticRetriever:
         question: str,
         limit: int = 10,
         allowed_object_ids: frozenset[str] | None = None,
+        *,
+        skip_vector: bool = False,
     ) -> GroundingResponse:
-        ranked = self.search(question, limit=limit)
+        ranked = self.search(question, limit=limit, skip_vector=skip_vector)
         if allowed_object_ids is not None:
             ranked = [item for item in ranked if item.id in allowed_object_ids]
         selected_ids = self._progressive_grounding_ids(question, ranked)

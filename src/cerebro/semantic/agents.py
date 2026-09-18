@@ -18,7 +18,15 @@ class GenerationProvider(ABC):
     model: str
 
     @abstractmethod
-    def generate(self, schema_name: str, prompt: str, output_model: type[OutputT]) -> OutputT:
+    def generate(
+        self,
+        schema_name: str,
+        prompt: str,
+        output_model: type[OutputT],
+        *,
+        thinking: bool = True,
+        max_output_tokens: int | None = None,
+    ) -> OutputT:
         """Return validated structured output without receiving source rows."""
 
 

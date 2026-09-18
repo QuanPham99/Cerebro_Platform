@@ -88,6 +88,45 @@ def test_gateway_auto_falls_back_when_schema_response_fails_validation():
     assert gateway.resolved_response_mode == "json_object"
 
 
+def test_gateway_sends_no_extra_body_by_default():
+    settings = _settings("json_schema")
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    gateway = OpenAICompatibleGateway(settings, client=client)
+
+    assert gateway.generate("answer", "hello", AnswerPayload).answer == "ok"
+    assert "extra_body" not in completions.calls[0]
+    assert completions.calls[0]["max_tokens"] == settings.llm_max_output_tokens
+
+
+def test_gateway_disables_thinking_when_requested_and_supported():
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    gateway = OpenAICompatibleGateway(_settings("json_schema"), client=client)  # provider_id="greennode-glm"
+
+    assert gateway.generate("answer", "hello", AnswerPayload, thinking=False).answer == "ok"
+    assert completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_gateway_omits_thinking_field_for_unsupported_provider():
+    settings = Settings(**{**_settings("json_schema").__dict__, "llm_provider_id": "openai-compatible"})
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    gateway = OpenAICompatibleGateway(settings, client=client)
+
+    assert gateway.generate("answer", "hello", AnswerPayload, thinking=False).answer == "ok"
+    assert "extra_body" not in completions.calls[0]
+
+
+def test_gateway_uses_supplied_max_output_tokens_override():
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    gateway = OpenAICompatibleGateway(_settings("json_schema"), client=client)
+
+    assert gateway.generate("answer", "hello", AnswerPayload, max_output_tokens=512).answer == "ok"
+    assert completions.calls[0]["max_tokens"] == 512
+
+
 def test_gateway_repairs_malformed_json_once_after_compatibility_fallback():
     completions = FakeCompletions(content=['"wrong-shape"', '{"answer" "broken"}', '{"answer":"repaired"}'])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))

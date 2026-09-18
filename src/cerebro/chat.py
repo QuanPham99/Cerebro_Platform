@@ -37,6 +37,10 @@ from .settings import Settings
 
 logger = logging.getLogger("uvicorn.error.cerebro.chat")
 
+# database_answer only narrates an already-executed result into one sentence; it makes
+# no new decisions, so it never needs the full default output budget (spec 031).
+_DATABASE_ANSWER_MAX_OUTPUT_TOKENS = 512
+
 
 class SQLSafetyError(ValueError):
     pass
@@ -567,6 +571,9 @@ class ChatOrchestrator:
         prompt: str,
         output_model: Any,
         cancellation: ChatCancellation | None,
+        *,
+        thinking: bool | None = None,
+        max_output_tokens: int | None = None,
     ) -> Any:
         if cancellation is not None:
             cancellation.checkpoint()
@@ -580,8 +587,13 @@ class ChatOrchestrator:
             getattr(self.provider, "name", "unknown"),
             getattr(self.provider, "model", "unknown"),
         )
+        provider_kwargs: dict[str, Any] = {}
+        if thinking is not None:
+            provider_kwargs["thinking"] = thinking
+        if max_output_tokens is not None:
+            provider_kwargs["max_output_tokens"] = max_output_tokens
         try:
-            result = self.provider.generate(schema_name, prompt, output_model)
+            result = self.provider.generate(schema_name, prompt, output_model, **provider_kwargs)
         except Exception as error:
             logger.exception(
                 "chat.llm.failed request_id=%s stage=%s elapsed_ms=%d error_type=%s",
@@ -657,9 +669,29 @@ class ChatOrchestrator:
                     ),
                 ],
             )
+        # The customer workspace is a closed set of preset questions, and the row-level
+        # filter is applied deterministically after generation (never by the model), so a
+        # repeated first-turn customer question always yields the same plan+SQL (spec
+        # 027). Scope the cache strictly to that property: never for the open-ended
+        # internal path, and never when history could change what the question means.
+        # Looked up before grounding (rather than after, as spec 027 originally did) so a
+        # hit whose branch never consumes the grounding context can skip the embedding
+        # call entirely (spec 031).
+        cache_key: tuple[str, str] | None = None
+        if request.customer_id is not None and not request.history:
+            cache_key = (self.bundle.version, canonicalize_question(request.message))
+        cached_plan = self._plan_cache.get(cache_key) if cache_key is not None else None
+        # A cached decline (`requires_query=False`) still falls into the no-query
+        # `semantic_answer` branch below, which needs the full grounding context; a cached
+        # clarification or query-executing plan never reads `context` again.
+        cache_hit_needs_full_grounding = (
+            cached_plan is not None and not cached_plan.clarification and not cached_plan.requires_query
+        )
+        skip_vector = cached_plan is not None and not cache_hit_needs_full_grounding
         grounding = self.retriever.grounding(
             request.message,
             allowed_object_ids=CUSTOMER_SCOPE_OBJECT_IDS if request.customer_id else None,
+            skip_vector=skip_vector,
         )
         checkpoint()
         evidence_ids = [item.id for item in grounding.ranking_evidence]
@@ -727,15 +759,8 @@ class ChatOrchestrator:
             "functions, restricted columns, or raw confidential columns.\n"
             + json.dumps({"question": request.message, "history": history, "grounding": context}, default=str)
         )
-        # The customer workspace is a closed set of preset questions, and the row-level
-        # filter is applied deterministically after generation (never by the model), so a
-        # repeated first-turn customer question always yields the same plan+SQL (spec
-        # 027). Scope the cache strictly to that property: never for the open-ended
-        # internal path, and never when history could change what the question means.
-        cache_key: tuple[str, str] | None = None
-        if request.customer_id is not None and not request.history:
-            cache_key = (self.bundle.version, canonicalize_question(request.message))
-        cached_plan = self._plan_cache.get(cache_key) if cache_key is not None else None
+        # cache_key/cached_plan were already looked up above, before grounding, so a hit
+        # could skip the embedding call (spec 031).
         if cached_plan is not None:
             plan = cached_plan.model_copy()
             logger.info(
@@ -858,6 +883,8 @@ class ChatOrchestrator:
             + json.dumps({"question": request.message, "sql": safe_sql, "columns": columns, "rows": rows, "truncated": truncated}, default=str),
             AnswerPayload,
             cancellation,
+            thinking=False,
+            max_output_tokens=_DATABASE_ANSWER_MAX_OUTPUT_TOKENS,
         )
         checkpoint()
         trace.append(AgentTrace(agent="orchestrator", status="completed", summary="Synthesized the governed result"))
