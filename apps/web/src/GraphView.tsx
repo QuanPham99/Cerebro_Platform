@@ -166,9 +166,12 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
   // Always holds the freshest visibility-recompute closure; both the visibleIds
   // effect and the zoom handler call through it so display state has one writer.
   const applyVisibilityRef = useRef<() => void>(() => {})
-  // onExpand is read through a ref inside the mount effect below so double-click
-  // wiring doesn't force a full Cytoscape rebuild whenever the caller's callback
-  // identity changes (the mount effect only re-runs on graph/onSelect changes).
+  // onSelect/onExpand are read through refs inside the mount effect below so tap
+  // wiring doesn't force a full Cytoscape rebuild (fresh random layout) whenever
+  // the caller's callback identity changes - the caller's select callback changes
+  // on every selection, so depending on it made each node click re-layout the graph.
+  const onSelectRef = useRef(onSelect)
+  onSelectRef.current = onSelect
   const onExpandRef = useRef(onExpand)
   onExpandRef.current = onExpand
 
@@ -251,7 +254,7 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
     } else {
       setComputingLayout(false)
     }
-    cy.on('tap', 'node', (event) => onSelect(event.target.id()))
+    cy.on('tap', 'node', (event) => onSelectRef.current(event.target.id()))
     cy.on('dbltap', 'node', (event) => onExpandRef.current?.(event.target.id()))
     cy.on('mouseover', 'node', (event) => event.target.addClass('hovered'))
     cy.on('mouseout', 'node', (event) => event.target.removeClass('hovered'))
@@ -267,7 +270,7 @@ export const GraphView = forwardRef<GraphHandle, GraphViewProps>(function GraphV
       cy.destroy()
       core.current = null
     }
-  }, [graph, onSelect])
+  }, [graph])
 
   useEffect(() => {
     applyVisibilityRef.current = () => {

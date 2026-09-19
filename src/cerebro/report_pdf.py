@@ -48,9 +48,11 @@ _TEMPLATE = """
   .toc strong { display: block; margin-bottom: 0.4em; font-size: 10pt; }
   .toc ol { margin: 0; padding-left: 1.2em; }
   .toc a { color: #2f6fed; text-decoration: none; }
-  .section { margin-bottom: 1.6em; page-break-inside: avoid; }
+  .section { margin-bottom: 1.6em; }
+  .section-head { page-break-inside: avoid; page-break-after: avoid; }
   .section h2 { font-size: 13pt; border-bottom: 1px solid #ddd; padding-bottom: 0.2em; bookmark-level: 2; bookmark-label: content(); }
   .section-status { display: flex; align-items: center; gap: 0.5em; font-size: 9pt; color: #888; margin-bottom: 0.4em; }
+  table tr { page-break-inside: avoid; }
   .badge { display: inline-block; padding: 0.15em 0.6em; border-radius: 999px; font-size: 8pt; font-weight: 600; }
   .badge-answered, .badge-completed { background: #e3f6ec; color: #1f9d6c; }
   .badge-clarification, .badge-partial { background: #fdf1df; color: #b5790a; }
@@ -86,10 +88,12 @@ _TEMPLATE = """
   {% endif %}
   {% for section in document.sections %}
   <div class="section" id="{{ section.id }}">
-    <h2>{{ loop.index }}. {{ section.title }}</h2>
-    <div class="section-status">
-      <span class="badge {{ section_status_badge_class(section.status) }}">{{ section_status_label(section.status) }}</span>
-      <span>{{ section.question }}</span>
+    <div class="section-head">
+      <h2>{{ loop.index }}. {{ section.title }}</h2>
+      <div class="section-status">
+        <span class="badge {{ section_status_badge_class(section.status) }}">{{ section_status_label(section.status) }}</span>
+        <span>{{ section.question }}</span>
+      </div>
     </div>
     <div class="answer">{{ section.answer }}</div>
     {% if section.status == "answered" %}
