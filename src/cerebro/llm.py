@@ -16,6 +16,9 @@ OutputT = TypeVar("OutputT", bound=BaseModel)
 # Reasons a request can fail for that are worth retrying with backoff. Anything else
 # (bad request, auth, unsupported response_format, invalid JSON) will not improve on retry.
 _RETRYABLE_REASONS = {"timeout", "rate_limited", "server_error", "connection_error"}
+# How much wider the one retry after a budget-truncated reply asks for (spec 032),
+# always clamped to the configured CEREBRO_LLM_MAX_OUTPUT_TOKENS ceiling.
+_TRUNCATION_RETRY_MULTIPLIER = 4
 
 
 def classify_llm_error(exc: Exception) -> str:
@@ -141,6 +144,15 @@ class OpenAICompatibleGateway:
             return {}
         return {"extra_body": {"thinking": {"type": "disabled"}}}
 
+    def _truncated(self, response: object) -> bool:
+        """True when the provider stopped because it hit the output-token budget
+        (spec 032). Such a reply carries JSON that stops mid-token, which is a
+        spent budget rather than a model that cannot follow the schema."""
+        try:
+            return getattr(response.choices[0], "finish_reason", None) == "length"  # type: ignore[attr-defined]
+        except (AttributeError, IndexError):  # pragma: no cover - provider shape guard
+            return False
+
     def generate(
         self,
         schema_name: str,
@@ -172,24 +184,43 @@ class OpenAICompatibleGateway:
                 user_prompt = prompt
                 if mode == "json_object":
                     user_prompt += "\n\nReturn JSON matching this schema:\n" + json.dumps(output_model.model_json_schema())
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "Return only concise, syntactically valid JSON matching the requested schema. "
+                        "Escape quotes inside strings. Never request credentials or hidden data. Be direct and "
+                        "efficient: do not restate the input or add unrequested commentary, since large inputs "
+                        "must still complete within the request timeout.",
+                    },
+                    {"role": "user", "content": user_prompt},
+                ]
+                ceiling = self.settings.llm_max_output_tokens
+                budget = max_output_tokens if max_output_tokens is not None else ceiling
                 response = self._call_with_retry(
                     model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Return only concise, syntactically valid JSON matching the requested schema. "
-                            "Escape quotes inside strings. Never request credentials or hidden data. Be direct and "
-                            "efficient: do not restate the input or add unrequested commentary, since large inputs "
-                            "must still complete within the request timeout.",
-                        },
-                        {"role": "user", "content": user_prompt},
-                    ],
+                    messages=messages,
                     response_format=response_format,
-                    max_tokens=max_output_tokens if max_output_tokens is not None else self.settings.llm_max_output_tokens,
+                    max_tokens=budget,
                     **self._extra_body(thinking),
                 )
+                # A reply cut off at the budget carries JSON that stops mid-token.
+                # Decoding it would report a schema failure for what is really a
+                # spent allowance, so buy one wider retry instead (spec 032).
+                if self._truncated(response) and budget < ceiling:
+                    budget = min(budget * _TRUNCATION_RETRY_MULTIPLIER, ceiling)
+                    logger.warning(
+                        "LLM reply for %s was truncated at the output budget; retrying once with %d tokens",
+                        schema_name, budget,
+                    )
+                    response = self._call_with_retry(
+                        model=self.model,
+                        messages=messages,
+                        response_format=response_format,
+                        max_tokens=budget,
+                        **self._extra_body(thinking),
+                    )
                 content = response.choices[0].message.content
-                if not content:
+                if not content or self._truncated(response):
                     raise GenerationOutputError(schema_name)
                 self.resolved_response_mode = mode
                 return output_model.model_validate(_decode_json_content(content))
