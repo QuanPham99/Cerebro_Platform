@@ -309,10 +309,13 @@ def compile_candidate_bundle(
             if table_name in table_links:
                 table_links[table_name].add(object_id)
 
+    domain_ids = {_stable_id("domain", raw.id) for raw in proposal.business.domains}
     entity_ids = {_stable_id("entity", raw.id) for raw in proposal.business.entities}
     dimension_ids = {_stable_id("dimension", raw.id) for raw in proposal.business.dimensions}
     structured_metric_ids = {_stable_id("metric", raw.id) for raw in proposal.query.structured_measures}
     rule_ids = {_stable_id("rule", raw.id) for raw in proposal.query.rules}
+    for raw in proposal.business.domains:
+        register_id(_stable_id("domain", raw.id), "domains")
     for raw in proposal.business.entities:
         register_id(_stable_id("entity", raw.id), "entities")
     for raw in proposal.business.dimensions:
@@ -333,6 +336,7 @@ def compile_candidate_bundle(
                 index[alias] = canonical
         return index
 
+    domain_id_by_raw = reference_index("domain", proposal.business.domains)
     entity_id_by_raw = reference_index("entity", proposal.business.entities)
     dimension_id_by_raw = reference_index("dimension", proposal.business.dimensions)
     metric_id_by_raw = reference_index("metric", proposal.query.structured_measures)
@@ -368,6 +372,11 @@ def compile_candidate_bundle(
             dimension_id = normalize_reference("dimension", value)
             metrics_by_dimension.setdefault(dimension_id, set()).add(metric_id)
 
+    domains: list[dict[str, Any]] = []
+    for raw in proposal.business.domains:
+        object_id = _stable_id("domain", raw.id)
+        domains.append({**raw.model_dump(mode="json"), "id": object_id})
+
     entities: list[dict[str, Any]] = []
     for raw in proposal.business.entities:
         object_id = _stable_id("entity", raw.id)
@@ -385,9 +394,20 @@ def compile_candidate_bundle(
                         code="invalid_entity_key", message=f"{object_id} references unknown key {table}.{key}",
                         path=f"entities/{object_id.split('.', 1)[1]}.md",
                     ))
+        domain_ref: str | None = None
+        if raw.domain:
+            domain_ref = domain_id_by_raw.get(raw.domain) or normalize_reference("domain", raw.domain)
+            if domain_ref not in domain_ids:
+                semantic_issues.append(ValidationIssue(
+                    code="invalid_entity_domain_reference",
+                    message=f"{object_id} references unknown domain {domain_ref}",
+                    path=f"entities/{object_id.split('.', 1)[1]}.md",
+                ))
+                domain_ref = None
         entities.append({
             **raw.model_dump(mode="json"), "id": object_id,
             "physical_mapping": {"table": table, "key": raw.physical_mapping.key},
+            "domain": domain_ref,
         })
 
     dimensions: list[dict[str, Any]] = []
@@ -675,10 +695,28 @@ def compile_candidate_bundle(
             },
             "# Generated data handling\n\nRestricted fields must never be returned to a model.",
         )
+    for domain in domains:
+        object_id = str(domain["id"])
+        name = str(domain["name"])
+        description = str(domain["description"])
+        _write_doc(
+            root / "domains" / f"{object_id.split('.', 1)[1]}.md",
+            {
+                "type": "Domain", "id": object_id, "name": name, "title": name,
+                "description": description, "status": "draft",
+                "generated": generated,
+                "provenance": {"origin": "ai_proposed", "source": proposal.provider},
+                "cerebro": {
+                    "kind": "domain", "classification": domain["classification"],
+                    "owner": domain.get("owner"), "warnings": domain.get("warnings", []),
+                },
+            },
+            f"# {name}\n\n{description}",
+        )
     for entity in entities:
         object_id = str(entity["id"])
         table = str(entity["physical_mapping"]["table"])
-        links = [table]
+        links = [table] + ([entity["domain"]] if entity.get("domain") else [])
         _write_doc(root / "entities" / f"{object_id.split('.', 1)[1]}.md", {
             "type": "Entity", "id": object_id, "name": entity["name"], "title": entity["name"],
             "description": entity["description"], "status": "draft", "aliases": entity.get("aliases", []),
@@ -687,6 +725,7 @@ def compile_candidate_bundle(
             "cerebro": {
                 "kind": "entity", "classification": entity["classification"],
                 "physical_mapping": entity["physical_mapping"], "grain": entity["grain"],
+                "domain": entity.get("domain"),
                 "warnings": entity.get("warnings", []),
             },
         }, f"# {entity['name']}\n\n{entity['description']}")
@@ -743,7 +782,7 @@ def compile_candidate_bundle(
                 "warnings": rule.get("warnings", []),
             },
         }, f"# {rule['name']}\n\n{rule['description']}\n\n{rule['logic']}")
-    for folder in ("datasets", "tables", "relationships", "concepts", "entities", "dimensions", "metrics", "rules", "policies"):
+    for folder in ("datasets", "tables", "relationships", "concepts", "domains", "entities", "dimensions", "metrics", "rules", "policies"):
         if (root / folder).is_dir():
             (root / folder / "index.md").write_text(f"# {folder.title()}\n", encoding="utf-8")
     report = BundleValidator().validate(BundleLoader().load(root))

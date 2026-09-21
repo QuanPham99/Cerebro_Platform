@@ -5,6 +5,7 @@ from cerebro.enrichment import GenerationProvider, SemanticEnricher
 from cerebro.models import (
     BusinessSemantics,
     ConceptCandidate,
+    DomainCandidate,
     MetricCandidate,
     PolicyCandidate,
     QuerySemantics,
@@ -26,12 +27,17 @@ class MockProvider(GenerationProvider):
         if output_model is BusinessSemantics:
             return BusinessSemantics(
                 table_purposes={"accounts": "Accounts"},
+                domains=[{
+                    "id": "retail-banking", "name": "Retail Banking",
+                    "description": "Accounts and transactions for retail customers.",
+                    "classification": "internal", "owner": "Retail Banking", "warnings": [],
+                }],
                 entities=[{
                     "id": "transaction", "name": "Transaction", "description": "A posted transaction.",
                     "aliases": [], "classification": "confidential",
                     "physical_mapping": {"table": "transactions", "key": ["transaction_id"]},
                     "grain": {"type": "event", "description": "One transaction", "key": ["transaction_id"]},
-                    "warnings": [],
+                    "domain": "retail-banking", "warnings": [],
                 }],
                 dimensions=[{
                     "id": "transaction-channel", "name": "Transaction channel",
@@ -96,6 +102,7 @@ def test_three_structured_enrichment_stages_are_catalog_only(bank_source_config)
     assert "Pooja Garcia" not in prompts
     assert "customer0@mailbank.com" not in prompts
     assert len(proposal.business.policies) == 1
+    assert len(proposal.business.domains) == 1
     assert len(proposal.business.entities) == 1
     assert len(proposal.business.dimensions) == 1
     assert len(proposal.query.structured_measures) == 1
@@ -139,6 +146,7 @@ def test_semantic_inventory_agent_makes_one_typed_catalog_only_call(bank_source_
     assert "SemanticInventoryAgent" in prompt
     assert "accounts" in prompt
     assert "Set compatible_metrics to an empty list" in prompt
+    assert "propose a small set of business domains" in prompt
     assert str(snapshot.database_path) not in prompt
     assert "database_path" not in prompt
 
@@ -260,9 +268,24 @@ def test_emitted_semantics_require_targets(model, payload, field):
     assert field in str(exc.value)
 
 
+def test_domain_candidate_requires_core_fields_and_rejects_unknown_fields():
+    with pytest.raises(ValidationError, match="classification"):
+        DomainCandidate.model_validate({
+            "id": "retail-banking", "name": "Retail Banking",
+            "description": "Retail banking domain.",
+        })
+    with pytest.raises(ValidationError, match="unexpected"):
+        DomainCandidate.model_validate({
+            "id": "retail-banking", "name": "Retail Banking",
+            "description": "Retail banking domain.", "classification": "internal",
+            "unexpected": "nope",
+        })
+
+
 def test_whole_semantic_categories_may_be_empty():
     business = BusinessSemantics(table_purposes={}, concepts=[], policies=[], classifications={})
     query = QuerySemantics(grains={}, dimensions=[], measures=[], joins=[], guidance=[], warnings=[])
+    assert business.domains == []
     assert business.concepts == business.entities == business.dimensions == business.policies == []
     assert query.measures == query.structured_measures == query.rules == []
 

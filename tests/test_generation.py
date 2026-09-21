@@ -133,20 +133,25 @@ def _connected_proposal() -> SemanticProposal:
         business=BusinessSemantics(
             table_purposes={},
             classifications={},
+            domains=[{
+                "id": "retail-banking", "name": "Retail Banking",
+                "description": "Accounts and transactions for retail customers.",
+                "classification": "internal", "owner": "Retail Banking", "warnings": [],
+            }],
             entities=[
                 {
                     "id": "account", "name": "Account", "description": "A banking account.",
                     "aliases": [], "classification": "confidential",
                     "physical_mapping": {"table": "accounts", "key": ["account_id"]},
                     "grain": {"type": "entity", "description": "One account", "key": ["account_id"]},
-                    "warnings": [],
+                    "domain": "retail-banking", "warnings": [],
                 },
                 {
                     "id": "transaction", "name": "Transaction", "description": "A posted transaction.",
                     "aliases": [], "classification": "confidential",
                     "physical_mapping": {"table": "transactions", "key": ["transaction_id"]},
                     "grain": {"type": "event", "description": "One transaction", "key": ["transaction_id"]},
-                    "warnings": [],
+                    "domain": "retail-banking", "warnings": [],
                 },
             ],
             dimensions=[{
@@ -199,13 +204,20 @@ def test_compiler_preserves_connected_ai_semantics(bank_database, tmp_path: Path
     snapshot = DuckDBSource(
         tmp_path / "unused.yaml", bank_database, source_mode="database_only", schema="main"
     ).scan()
-    bundle = load_validated_bundle(
-        compile_candidate_bundle(snapshot, _connected_proposal(), tmp_path / "connected")
-    )
+    candidate_root = compile_candidate_bundle(snapshot, _connected_proposal(), tmp_path / "connected")
+    bundle = load_validated_bundle(candidate_root)
     by_id = bundle.by_id()
     assert by_id["entity.account"].cerebro["physical_mapping"] == {
         "table": "table.accounts", "key": ["account_id"]
     }
+    assert by_id["entity.account"].cerebro["domain"] == "domain.retail-banking"
+    assert by_id["entity.account"].links == ["table.accounts", "domain.retail-banking"]
+    domain = by_id["domain.retail-banking"]
+    assert domain.profile_kind == "domain"
+    assert domain.cerebro["classification"] == "internal"
+    assert domain.cerebro["owner"] == "Retail Banking"
+    assert sum(item.profile_kind == "domain" for item in bundle.objects) == 1
+    assert (candidate_root / "domains" / "index.md").is_file()
     assert by_id["dimension.transaction-channel"].cerebro["entity"] == "entity.transaction"
     assert by_id["metric.transaction-volume"].cerebro["dependencies"] == ["table.transactions"]
     assert by_id["metric.transaction-volume"].cerebro["formula"] == "SUM(transactions.amount)"
@@ -227,8 +239,11 @@ def test_compiler_canonicalizes_underscore_and_prefixed_semantic_ids(bank_databa
         tmp_path / "unused.yaml", bank_database, source_mode="database_only", schema="main"
     ).scan()
     proposal = _connected_proposal()
+    proposal.business.domains[0].id = "domain.retail_banking"
     proposal.business.entities[0].id = "entity_account"
+    proposal.business.entities[0].domain = "retail_banking"
     proposal.business.entities[1].id = "entity.entity_transaction"
+    proposal.business.entities[1].domain = "domain.retail_banking"
     proposal.business.dimensions[0].id = "dimension.transaction_channel"
     proposal.business.dimensions[0].entity = "entity_transaction"
     proposal.business.dimensions[0].compatible_metrics = ["metric.transaction_volume"]
@@ -249,6 +264,9 @@ def test_compiler_canonicalizes_underscore_and_prefixed_semantic_ids(bank_databa
 
     assert "entity.entity-account" in by_id
     assert "entity.entity-transaction" in by_id
+    assert "domain.retail-banking" in by_id
+    assert by_id["entity.entity-account"].cerebro["domain"] == "domain.retail-banking"
+    assert by_id["entity.entity-transaction"].cerebro["domain"] == "domain.retail-banking"
     assert by_id["dimension.transaction-channel"].cerebro["entity"] == "entity.entity-transaction"
     assert by_id["dimension.transaction-channel"].cerebro["compatible_metrics"] == [
         "metric.transaction-volume"
@@ -376,3 +394,37 @@ def test_compiler_rejects_duplicate_semantic_ids(bank_database, tmp_path: Path):
     proposal.business.entities.append(proposal.business.entities[0].model_copy(deep=True))
     with pytest.raises(ValueError, match="duplicate_semantic_id"):
         compile_candidate_bundle(snapshot, proposal, tmp_path / "duplicate-semantic-id")
+
+
+def test_compiler_rejects_unresolved_entity_domain_reference(bank_database, tmp_path: Path):
+    snapshot = DuckDBSource(
+        tmp_path / "unused.yaml", bank_database, source_mode="database_only", schema="main"
+    ).scan()
+    proposal = _connected_proposal()
+    proposal.business.entities[0].domain = "missing-domain"
+    with pytest.raises(ValueError, match="invalid_entity_domain_reference"):
+        compile_candidate_bundle(snapshot, proposal, tmp_path / "invalid-entity-domain")
+
+
+def test_compiler_rejects_duplicate_domain_ids(bank_database, tmp_path: Path):
+    snapshot = DuckDBSource(
+        tmp_path / "unused.yaml", bank_database, source_mode="database_only", schema="main"
+    ).scan()
+    proposal = _connected_proposal()
+    proposal.business.domains.append(proposal.business.domains[0].model_copy(deep=True))
+    with pytest.raises(ValueError, match="duplicate_semantic_id"):
+        compile_candidate_bundle(snapshot, proposal, tmp_path / "duplicate-domain-id")
+
+
+def test_entity_without_a_domain_still_compiles(bank_database, tmp_path: Path):
+    snapshot = DuckDBSource(
+        tmp_path / "unused.yaml", bank_database, source_mode="database_only", schema="main"
+    ).scan()
+    proposal = _connected_proposal()
+    proposal.business.entities[0].domain = None
+    bundle = load_validated_bundle(
+        compile_candidate_bundle(snapshot, proposal, tmp_path / "domain-less-entity")
+    )
+    account = bundle.by_id()["entity.account"]
+    assert account.links == ["table.accounts"]
+    assert account.cerebro.get("domain") is None

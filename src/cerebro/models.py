@@ -165,6 +165,7 @@ class EntityCandidate(BaseModel):
     classification: Classification
     physical_mapping: EntityPhysicalMapping
     grain: GrainDefinition
+    domain: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -247,6 +248,7 @@ class BusinessSemantics(BaseModel):
 
     table_purposes: dict[str, str] = Field(default_factory=dict)
     concepts: list[ConceptCandidate] = Field(default_factory=list)
+    domains: list[DomainCandidate] = Field(default_factory=list)
     entities: list[EntityCandidate] = Field(default_factory=list)
     dimensions: list[DimensionCandidate] = Field(default_factory=list)
     policies: list[PolicyCandidate] = Field(default_factory=list)
